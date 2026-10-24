@@ -126,6 +126,10 @@ pub struct SnapshotCell {
     pub flags: CellFlags,
     /// Session-local id resolved through [`crate::Session::hyperlink`].
     pub hyperlink: Option<u32>,
+    /// Start offset into [`Snapshot::combining`] for zero-width marks.
+    pub combining_start: u32,
+    /// Number of zero-width marks stored for this cell.
+    pub combining_len: u8,
 }
 
 impl Default for SnapshotCell {
@@ -136,6 +140,8 @@ impl Default for SnapshotCell {
             bg: Color::Named(NamedColor::Background),
             flags: CellFlags::empty(),
             hyperlink: None,
+            combining_start: 0,
+            combining_len: 0,
         }
     }
 }
@@ -183,6 +189,8 @@ pub struct Snapshot {
     pub rows: usize,
     /// Viewport cells in row-major order, `cols * rows` entries. Wide-character spacers are kept.
     pub cells: Vec<SnapshotCell>,
+    /// Zero-width chars (combining marks) referenced by [`SnapshotCell::combining_start`].
+    pub combining: Vec<char>,
     pub cursor: Cursor,
     pub selection: Vec<SelectionSpan>,
     pub display_offset: usize,
@@ -207,5 +215,12 @@ impl Snapshot {
             return None;
         }
         self.cells.get(row * self.cols + col)
+    }
+
+    /// Zero-width marks that belong to `cell`.
+    pub fn zero_width(&self, cell: &SnapshotCell) -> &[char] {
+        let start = cell.combining_start as usize;
+        let end = start.saturating_add(cell.combining_len as usize);
+        self.combining.get(start..end).unwrap_or(&[])
     }
 }

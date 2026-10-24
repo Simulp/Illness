@@ -17,7 +17,9 @@ glyph atlas: hinted, pixel-snapped, nearest-sampled, with no subpixel smearing.
 ## Symptoms
 
 - Custom frameless window with a real tab strip, profile accents and native caption buttons.
-- Mica by default; Acrylic or Solid in Settings. Windows 10 falls back to Solid.
+- Mica by default; Acrylic or Solid in Settings. Windows 10 falls back to Solid. Mica and
+  Acrylic render a blurred wallpaper backdrop inside the window, because the GPU surface does
+  not expose native DWM transparency.
 - Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and a live Settings sheet
   (`Ctrl+,`).
 - Seven themes: Illness Dark, Campbell, One Half Dark, Nord, Gruvbox Dark, Solarized Dark, Light.
@@ -26,9 +28,9 @@ glyph atlas: hinted, pixel-snapped, nearest-sampled, with no subpixel smearing.
 - Full xterm key and mouse encoding, bracketed paste, IME commit, focus reporting and DECSCUSR.
 - 10,000 lines of scrollback, smooth wheel scrolling, word/line selection and a jump-to-bottom pill.
 - A session that ends stays readable; Restart is one click away.
-- Pixel-snapped, hinted Cascadia Mono on a nearest-sampled physical-pixel atlas. Like
-  Windows Terminal's transparent/Mica path, it uses grayscale antialiasing; ClearType-style
-  subpixel fringing would need a per-channel compositor.
+- Pixel-snapped, hinted Cascadia Mono on a nearest-sampled physical-pixel atlas. The grid is
+  composited in software with per-channel RGB coverage, so text gets ClearType-style subpixel
+  fringing while backgrounds, selection, search hits and the cursor stay pixel-exact.
 
 ## Dosage
 
@@ -44,7 +46,8 @@ Release build:
 cargo build --release -p illness
 ```
 
-The binary is `target\release\illness.exe`.
+The binary is `target\release\illness.exe`. Release builds use the Windows GUI subsystem, so
+double-clicking it opens Illness directly instead of hosting a console in Windows Terminal.
 
 ## Prescription
 
@@ -68,7 +71,9 @@ detected from the shells installed on the machine: PowerShell 7, Windows PowerSh
 Prompt and WSL.
 
 Known limitations in this dose: no split panes, no sixel/kitty graphics, no vi mode, and no
-tested Unix build. The VT core is Alacritty's, so the usual escape-sequence coverage applies.
+tested Unix build. Mica/Acrylic are an in-window approximation of the system materials rather
+than OS-composited DWM blur. The VT core is Alacritty's, so the usual escape-sequence coverage
+applies.
 
 ## Prognosis
 

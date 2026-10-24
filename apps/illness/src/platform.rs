@@ -15,7 +15,8 @@ use raw_window_handle::RawWindowHandle;
 use windows_sys::Win32::Foundation::HWND;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DwmExtendFrameIntoClientArea,
+    DwmSetWindowAttribute,
 };
 
 /// Fallback attribute used by Windows 10 builds that predate the documented dark-mode id.
@@ -77,6 +78,20 @@ fn apply_dwm(hwnd: HWND, dark: bool) {
     }
     let corners = u32::try_from(DWMWA_WINDOW_CORNER_PREFERENCE).unwrap_or(33);
     let _ = set_attribute(hwnd, corners, DWMWCP_ROUND);
+
+    // Let DWM composite the system backdrop through the whole client area.
+    // Without this, DWMWA_SYSTEMBACKDROP_TYPE only paints under the frame.
+    let margins = windows_sys::Win32::UI::Controls::MARGINS {
+        cxLeftWidth: -1,
+        cxRightWidth: -1,
+        cyTopHeight: -1,
+        cyBottomHeight: -1,
+    };
+    // Safety: hwnd is live for the duration of this call; `margins` is a
+    // correctly laid out MARGINS owned by this stack frame.
+    unsafe {
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+    }
 }
 
 /// Set one 32-bit DWM attribute. Returns `true` when the compositor accepted it.

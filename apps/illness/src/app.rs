@@ -16,7 +16,7 @@ use illness_ui::terminal::SearchState;
 use illness_ui::{TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas};
 use raw_window_handle::HasWindowHandle;
 
-use crate::platform;
+use crate::{backdrop, platform};
 
 const DEFAULT_FONT_SIZE: f32 = 14.0;
 const INITIAL_COLS: usize = 120;
@@ -57,6 +57,8 @@ pub struct IllnessApp {
     applied_line_height: f32,
     applied_material: Material,
     window_title: String,
+    backdrop: egui::TextureHandle,
+
     window_focused: bool,
     last_search: Option<(String, bool)>,
     bell_flash_until: f64,
@@ -100,6 +102,7 @@ impl IllnessApp {
         );
         atlas.set_line_height(config.line_height);
         let line_height = config.line_height;
+        let backdrop = backdrop::build(&ctx, theme);
 
         let mut app = Self {
             ctx,
@@ -118,6 +121,7 @@ impl IllnessApp {
             applied_line_height: line_height,
             applied_material: Material::Mica,
             window_title: "Illness".to_string(),
+            backdrop,
             window_focused: false,
             last_search: None,
             bell_flash_until: 0.0,
@@ -272,7 +276,10 @@ impl IllnessApp {
         let dark = !self.theme.is_light();
         let requested = self.config.material;
         if let Err(error) = platform::apply(window, requested, dark) {
-            log::warn!("{} material unavailable: {error}", material_name(requested));
+            log::warn!(
+                "window material {} (dark={dark}) failed: {error}",
+                material_name(requested)
+            );
             self.config.material = Material::Solid;
             if let Err(error) = platform::apply(window, Material::Solid, dark) {
                 log::warn!("solid material unavailable: {error}");
@@ -281,6 +288,11 @@ impl IllnessApp {
                 "{} is unavailable here; using Solid",
                 material_name(requested)
             ));
+        } else {
+            log::info!(
+                "window material {} (dark={dark}) applied",
+                material_name(requested)
+            );
         }
         self.applied_material = self.config.material;
     }
@@ -293,6 +305,7 @@ impl IllnessApp {
             design::install(&self.ctx, theme, &self.config);
             self.theme = theme;
             self.tokens = Tokens::from_theme(theme);
+            self.backdrop = backdrop::build(&self.ctx, theme);
             self.applied_theme = theme.name.to_string();
             self.pending_material = true;
         }
@@ -755,7 +768,6 @@ impl IllnessApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        let has_selection = self.selection_text().is_some();
         let candidates: Vec<(Key, Modifiers)> = ctx.input(|input| {
             input
                 .events
@@ -771,6 +783,12 @@ impl IllnessApp {
                 })
                 .collect()
         });
+        // Only the unshifted Ctrl+C shortcut depends on selection, so avoid
+        // copying the selection string on every frame for every other key.
+        let needs_selection = candidates.iter().any(|(key, modifiers)| {
+            *key == Key::C && !modifiers.shift && (modifiers.ctrl || modifiers.command)
+        });
+        let has_selection = needs_selection && self.selection_text().is_some();
 
         let mut shortcuts: Vec<Shortcut> = candidates
             .iter()
@@ -845,6 +863,31 @@ impl eframe::App for IllnessApp {
         }
 
         ui.spacing_mut().item_spacing = Vec2::ZERO;
+
+        if self.config.material != Material::Solid {
+            let screen = ui.max_rect();
+            ui.painter().image(
+                self.backdrop.id(),
+                screen,
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            let tint = match self.config.material {
+                Material::Mica => 90,
+                Material::Acrylic => 50,
+                Material::Solid => 255,
+            };
+            ui.painter().rect_filled(
+                screen,
+                0.0,
+                Color32::from_rgba_unmultiplied(
+                    self.theme.bg.r,
+                    self.theme.bg.g,
+                    self.theme.bg.b,
+                    tint,
+                ),
+            );
+        }
 
         self.drain_events();
         self.sync_tabs();
@@ -1041,10 +1084,7 @@ impl eframe::App for IllnessApp {
     }
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        match self.config.material {
-            Material::Solid => design::color(self.theme.bg).to_normalized_gamma_f32(),
-            Material::Mica | Material::Acrylic => [0.0, 0.0, 0.0, 0.0],
-        }
+        design::color(self.theme.bg).to_normalized_gamma_f32()
     }
 
     fn on_exit(&mut self) {

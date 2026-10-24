@@ -568,18 +568,25 @@ fn show_settings(
     profiles: &[Profile],
 ) -> Vec<Action> {
     let screen = ctx.content_rect();
-    if backdrop(ctx, "illness_settings_backdrop", SHEET_BACKDROP_ALPHA) {
+    let top = tokens.titlebar_h.max(40.0) + 6.0;
+    let dim_rect = settings_dim_rect(screen);
+    if dim(
+        ctx,
+        "illness_settings_backdrop",
+        dim_rect,
+        SHEET_BACKDROP_ALPHA,
+    ) {
         state.close();
         return Vec::new();
     }
 
-    let top = screen.top() + tokens.titlebar_h;
-    let height = (screen.height() - tokens.titlebar_h).max(120.0);
+    let height = (screen.bottom() - top - 18.0).max(120.0);
+
     let mut close = false;
     let mut changed = false;
 
     Area::new(Id::unique("illness_settings"))
-        .order(Order::Foreground)
+        .order(Order::Tooltip)
         .fixed_pos(Pos2::new(screen.right() - SETTINGS_WIDTH, top))
         .sense(Sense::click())
         .show(ctx, |ui| {
@@ -591,6 +598,7 @@ fn show_settings(
                 .show(ui, |ui| {
                     ui.set_width(SETTINGS_WIDTH - 32.0);
                     ui.set_min_height(height - 32.0);
+                    ui.set_max_height(height - 32.0);
 
                     ui.horizontal(|ui| {
                         ui.label(
@@ -953,14 +961,27 @@ fn show_context_menu(
 }
 
 fn backdrop(ctx: &Context, id: &str, alpha: u8) -> bool {
-    let rect = ctx.content_rect();
+    dim(ctx, id, ctx.content_rect(), alpha)
+}
+
+/// Dim the whole content area. The settings sheet is painted in
+/// `Order::Tooltip` after this backdrop, so the sheet itself stays undarkened
+/// while clicks anywhere outside it close the overlay.
+fn settings_dim_rect(screen: Rect) -> Rect {
+    screen
+}
+
+fn dim(ctx: &Context, id: &str, area: Rect, alpha: u8) -> bool {
+    if area.width() <= 0.0 || area.height() <= 0.0 {
+        return false;
+    }
     let mut clicked = false;
     Area::new(Id::unique(id))
         .order(Order::Foreground)
-        .fixed_pos(rect.min)
+        .fixed_pos(area.min)
         .interactable(true)
         .show(ctx, |ui| {
-            let (rect, response) = ui.allocate_exact_size(rect.size(), Sense::click());
+            let (rect, response) = ui.allocate_exact_size(area.size(), Sense::click());
             ui.painter()
                 .rect_filled(rect, 0.0, Color32::from_black_alpha(alpha));
             clicked = response.clicked();
@@ -1385,5 +1406,20 @@ mod tests {
         assert_eq!(state.kind, OverlayKind::Palette);
         assert!(handle_escape(&mut state, true));
         assert_eq!(state.kind, OverlayKind::None);
+    }
+
+    #[test]
+    fn settings_dim_covers_window_behind_sheet() {
+        let screen = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1180.0, 760.0));
+        let top = 46.0;
+        let dim = settings_dim_rect(screen);
+        let sheet = Rect::from_min_max(Pos2::new(screen.right() - SETTINGS_WIDTH, top), screen.max);
+        assert_eq!(dim, screen);
+        assert!(
+            dim.contains_rect(sheet),
+            "dim {:?} must cover the window behind sheet {:?}",
+            dim,
+            sheet
+        );
     }
 }

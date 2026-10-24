@@ -5,7 +5,7 @@ use egui::{
 };
 use illness_core::{Material, Profile, Rgb};
 
-use crate::design::Tokens;
+use crate::design::{self, Tokens};
 use crate::icons::{self, Icon};
 use crate::overlays::SearchRequest;
 
@@ -24,8 +24,6 @@ const CLOSE_SIZE: f32 = 16.0;
 const MENU_WIDTH: f32 = 228.0;
 const EMPTY_BAR: usize = usize::MAX;
 const WINDOW_CLOSE_HOVER: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
-const MICA_BAR_ALPHA: u8 = 244;
-const ACRYLIC_BAR_ALPHA: u8 = 236;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TabInfo {
@@ -125,8 +123,14 @@ pub fn show(
     };
     let captions = caption_rects(bar.right(), bar.top(), caption_width, bar_height);
     let captions_left = captions[0].left();
-    let plus_left = (captions_left - PLUS_WIDTH - CHEVRON_WIDTH - 6.0).max(bar.left());
     let tabs_left = bar.left() + TAB_START_X;
+    // Lay the tabs out against the whole strip first, then park the new-tab
+    // button immediately after the content (or at the strip's right edge when
+    // the tabs overflow).
+    let strip_right = (captions_left - PLUS_WIDTH - CHEVRON_WIDTH - 6.0).max(tabs_left);
+    let slots = layout_tabs(strip_right - tabs_left, tabs.len());
+    let content_width = tabs_content_width(&slots);
+    let plus_left = plus_position(tabs_left, content_width, strip_right);
     let tabs_right = (plus_left - 4.0).max(tabs_left);
     let tab_viewport = Rect::from_min_max(
         Pos2::new(tabs_left, bar.top()),
@@ -139,8 +143,6 @@ pub fn show(
     };
     let tab_y = bar.bottom() - tab_height;
 
-    let slots = layout_tabs(tab_viewport.width(), tabs.len());
-    let content_width = tabs_content_width(&slots);
     let max_scroll = (content_width - tab_viewport.width()).max(0.0);
     let pointer = ctx.input(|i| i.pointer.hover_pos());
     let now = ctx.input(|i| i.time);
@@ -223,7 +225,7 @@ pub fn show(
         let is_active = index == active;
         let hovered = hovered_index == Some(index);
         let fill = if is_active {
-            tokens.bg
+            active_tab_fill(tokens, material)
         } else if hovered {
             tokens.hover
         } else {
@@ -241,15 +243,19 @@ pub fn show(
             );
         }
 
-        let dot_color = if tab.exited {
+        let icon_color = if tab.exited {
             tokens.danger
         } else {
             crate::design::color(tab.accent)
         };
-        tabs_painter.circle_filled(
-            Pos2::new(rect.left() + 13.0, rect.center().y),
-            3.0,
-            dot_color,
+        icons::paint_icon(
+            &tabs_painter,
+            Rect::from_min_size(
+                Pos2::new(rect.left() + 8.0, rect.center().y - 6.0),
+                Vec2::splat(12.0),
+            ),
+            Icon::Terminal,
+            icon_color,
         );
 
         let close_rect = Rect::from_center_size(
@@ -261,7 +267,7 @@ pub fn show(
             state.hover_close = Some(index);
         }
         let show_close = is_active || hovered || close_hovered;
-        let title_left = rect.left() + 23.0;
+        let title_left = rect.left() + 24.0;
         let title_right = (close_rect.left() - 4.0).max(title_left);
         let title_color = if tab.exited {
             tokens.text_dim
@@ -384,7 +390,7 @@ pub fn show(
                     Pos2::new(visible.right(), bar.bottom()),
                 ),
                 0,
-                tokens.bg,
+                active_tab_fill(tokens, material),
             );
         }
     }
@@ -484,40 +490,38 @@ pub fn show(
     }
 
     let mut empty_regions = Vec::new();
+    // Gutter left of the tab strip.
     empty_regions.push(Rect::from_min_max(
         bar.min,
         Pos2::new(tabs_left, bar.bottom()),
     ));
-    if tabs.is_empty() && plus_left > tabs_left {
+    // Strip above the tabs, new-tab button and chevron.
+    if tab_y > bar.top() {
         empty_regions.push(Rect::from_min_max(
             Pos2::new(tabs_left, bar.top()),
+            Pos2::new(captions_left, tab_y),
+        ));
+    }
+    // Gap between the last visible tab and the new-tab button. This also
+    // covers the clipped edge when the tab strip overflows.
+    if plus_left > tabs_left {
+        empty_regions.push(Rect::from_min_max(
+            Pos2::new(tab_viewport.right(), tab_y),
             Pos2::new(plus_left, bar.bottom()),
         ));
-    } else if !tabs.is_empty() {
-        if tab_y > bar.top() {
-            empty_regions.push(Rect::from_min_max(
-                Pos2::new(tabs_left, bar.top()),
-                Pos2::new(tabs_right, tab_y),
-            ));
-        }
-        let content_right = tab_viewport.left() + content_width - scroll;
-        if content_right < plus_left {
-            empty_regions.push(Rect::from_min_max(
-                Pos2::new(content_right, tab_y),
-                Pos2::new(plus_left, bar.bottom()),
-            ));
-        }
     }
-    if plus_rect.top() > bar.top() {
+    // Strip below the tabs, new-tab button and chevron.
+    if plus_rect.bottom() < bar.bottom() {
         empty_regions.push(Rect::from_min_max(
-            Pos2::new(tabs_right, bar.top()),
-            Pos2::new(captions_left, plus_rect.top()),
+            Pos2::new(tab_viewport.right(), plus_rect.bottom()),
+            Pos2::new(captions_left, bar.bottom()),
         ));
     }
+    // Everything right of the chevron still drags the window.
     if chevron_rect.right() < captions_left {
         empty_regions.push(Rect::from_min_max(
             Pos2::new(chevron_rect.right(), plus_rect.top()),
-            Pos2::new(captions_left, bar.bottom()),
+            Pos2::new(captions_left, plus_rect.bottom()),
         ));
     }
 
@@ -643,16 +647,35 @@ fn top_tab_radius(tokens: &Tokens) -> CornerRadius {
     }
 }
 
-/// Opaque for Solid, lightly translucent over Mica/Acrylic so the bar reads as
-/// elevated while the window material still shows through.
+/// Opaque for Solid, translucent over Mica/Acrylic so the window material
+/// shows through while the bar stays readable.
 fn bar_fill(tokens: &Tokens, material: Material) -> Color32 {
     let color = tokens.bg_elev;
-    let alpha = match material {
-        Material::Solid => return color,
-        Material::Mica => MICA_BAR_ALPHA,
-        Material::Acrylic => ACRYLIC_BAR_ALPHA,
-    };
-    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    let alpha = design::material_alpha(material);
+    if alpha == 255 {
+        color
+    } else {
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
+    }
+}
+
+/// The active tab shares the terminal's material alpha so it does not punch an
+/// opaque block through Mica/Acrylic.
+fn active_tab_fill(tokens: &Tokens, material: Material) -> Color32 {
+    let alpha = design::material_alpha(material);
+    if alpha == 255 {
+        tokens.bg
+    } else {
+        Color32::from_rgba_unmultiplied(tokens.bg.r(), tokens.bg.g(), tokens.bg.b(), alpha)
+    }
+}
+
+/// Left edge of the new-tab button. `strip_right` is the space reserved before
+/// the chevron and caption buttons, so overflowing tabs keep their clip edge.
+fn plus_position(tabs_left: f32, content_width: f32, strip_right: f32) -> f32 {
+    (tabs_left + content_width + 4.0)
+        .min(strip_right)
+        .max(tabs_left)
 }
 
 /// Left edge for the new-tab menu: its right edge sits on the chevron's right
@@ -942,15 +965,41 @@ mod tests {
         let tokens = Tokens::default();
         assert_eq!(bar_fill(&tokens, Material::Solid), tokens.bg_elev);
         let [red, green, blue, alpha] = bar_fill(&tokens, Material::Mica).to_srgba_unmultiplied();
-        assert_eq!(alpha, 244);
+        assert_eq!(alpha, 210);
         assert_eq!(
             (red, green, blue),
             (tokens.bg_elev.r(), tokens.bg_elev.g(), tokens.bg_elev.b())
         );
         assert_eq!(
             bar_fill(&tokens, Material::Acrylic).to_srgba_unmultiplied()[3],
-            236
+            185
         );
+        assert_eq!(
+            active_tab_fill(&tokens, Material::Mica).to_srgba_unmultiplied()[3],
+            210
+        );
+        assert_eq!(active_tab_fill(&tokens, Material::Solid), tokens.bg);
+    }
+
+    #[test]
+    fn plus_sits_after_tab_content() {
+        let tabs = layout_tabs(600.0, 2);
+        let content = tabs_content_width(&tabs);
+        let strip_right = 800.0;
+        let plus = plus_position(8.0, content, strip_right);
+        assert!((plus - (8.0 + content + 4.0)).abs() < f32::EPSILON);
+        assert!(plus < strip_right);
+    }
+
+    #[test]
+    fn plus_pins_to_strip_right_when_tabs_overflow() {
+        let tabs = layout_tabs(600.0, 8);
+        let content = tabs_content_width(&tabs);
+        assert!(content > 600.0);
+        let plus = plus_position(8.0, content, 608.0);
+        assert!((plus - 608.0).abs() < f32::EPSILON);
+        // The chevron follows the plus and still clears the caption buttons.
+        assert!(plus + PLUS_WIDTH + CHEVRON_WIDTH <= 660.0);
     }
 
     #[test]

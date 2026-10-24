@@ -28,9 +28,9 @@ eframe = { version = "0.37", features = ["wgpu"] }
 swash = "0.2.10"
 fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] }
 window-vibrancy = "0.8.1"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls"] }
 raw-window-handle = "0.6"
-image = { version = "0.25", default-features = false, features = ["png", "ico"] }
+image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

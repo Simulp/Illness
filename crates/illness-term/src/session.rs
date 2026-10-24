@@ -261,6 +261,7 @@ impl Session {
             } = term.renderable_content();
 
             let mut cells = Vec::with_capacity(cols.saturating_mul(rows));
+            let mut combining = Vec::new();
             for indexed in display_iter {
                 let cell = indexed.cell;
                 let hyperlink = cell.hyperlink().map(|link| {
@@ -268,12 +269,20 @@ impl Session {
                     hyperlinks.push((id, link.uri().to_owned()));
                     id
                 });
+                let marks = cell.zerowidth().unwrap_or(&[]);
+                let combining_start = u32::try_from(combining.len()).unwrap_or(u32::MAX);
+                let combining_len = u8::try_from(marks.len()).unwrap_or(u8::MAX);
+                if !marks.is_empty() {
+                    combining.extend(marks.iter().take(usize::from(combining_len)));
+                }
                 cells.push(SnapshotCell {
                     ch: cell.c,
                     fg: cell.fg,
                     bg: cell.bg,
                     flags: cell.flags.into(),
                     hyperlink,
+                    combining_start,
+                    combining_len,
                 });
             }
             cells.resize(cols.saturating_mul(rows), SnapshotCell::default());
@@ -292,6 +301,7 @@ impl Session {
                 cols,
                 rows,
                 cells,
+                combining,
                 cursor,
                 selection: selection_spans(selection, display_offset, cols, rows),
                 display_offset,
@@ -845,6 +855,22 @@ mod tests {
         assert_eq!(session.search("aXb", true), None);
         assert_eq!(session.search("world", true), Some((0, 10, 0, 14)));
         assert_eq!(session.search("", true), None);
+    }
+
+    #[test]
+    fn snapshot_preserves_combining_marks() {
+        let session = session(20, 3);
+        session.feed_for_test("e\u{301}".as_bytes());
+
+        let snapshot = session.snapshot();
+        let cell = snapshot.cell(0, 0).expect("cell");
+        assert_eq!(cell.ch, 'e');
+        assert_eq!(snapshot.zero_width(cell), ['\u{301}']);
+        assert!(
+            snapshot
+                .zero_width(snapshot.cell(1, 0).expect("empty cell"))
+                .is_empty()
+        );
     }
 
     #[test]

@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use egui::{
-    Color32, CursorIcon, Event, ImeEvent, Key as EguiKey, Modifiers, MouseWheelUnit, PointerButton,
-    Pos2, Rect, Sense, Stroke, Ui, ViewportCommand, pos2, vec2,
+    Color32, ColorImage, CursorIcon, Event, ImeEvent, Key as EguiKey, Modifiers, MouseWheelUnit,
+    PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, ViewportCommand,
+    pos2, vec2,
 };
 use illness_core::{Config, CursorKind, Theme};
 use illness_term::snapshot::CellFlags;
@@ -14,6 +16,20 @@ use illness_term::{
 
 use crate::design::{self, Tokens};
 use crate::glyph::{CellMetrics, GlyphAtlas, GlyphStyle};
+use crate::soft::{self, SurfaceSpec};
+
+/// Unique texture names, since every tab owns its own cached surface.
+static NEXT_SOFT_TEXTURE: AtomicU64 = AtomicU64::new(0);
+
+/// `TextureHandle` has no `Debug` implementation; keep `TerminalView` debuggable.
+#[derive(Default)]
+struct SoftTexture(Option<TextureHandle>);
+
+impl std::fmt::Debug for SoftTexture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SoftTexture")
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalAction {
@@ -50,6 +66,12 @@ pub struct TerminalView {
     blink_epoch: f64,
     wheel_accum: f32,
     selecting: bool,
+    /// CPU-composited surface and its GPU texture, reused until the grid changes.
+    soft_texture: SoftTexture,
+    soft_size: Option<[usize; 2]>,
+    soft_key: Option<u64>,
+    soft_last_render: f64,
+    soft_texture_name: String,
 }
 
 impl TerminalView {
@@ -97,8 +119,6 @@ impl TerminalView {
             vec2(metrics.width * cols as f32, metrics.height * rows as f32),
         );
 
-        painter.rect_filled(rect, 0.0, design::color(theme.bg));
-
         let origin = grid_rect.min;
         let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|input| input.time);
@@ -112,27 +132,45 @@ impl TerminalView {
             .map(|row| row_text(&snapshot, row, cols))
             .collect();
 
-        paint_backgrounds(&painter, &snapshot, theme, origin, &metrics, cols, rows);
-        paint_selection(&painter, &selection, origin, &metrics, tokens);
-        paint_search(
-            &painter,
-            &row_texts,
-            self.search.as_ref(),
-            origin,
-            &metrics,
-            tokens,
-        );
-        paint_cells(
-            &painter, atlas, &snapshot, theme, origin, &metrics, cols, rows, ppp,
-        );
-
         let blinking = config.cursor_blink && snapshot.cursor.blinking;
         let show_cursor =
             snapshot.cursor.visible && (!blinking || blink_phase(now - self.blink_epoch) < 0.53);
-        if show_cursor {
-            paint_cursor(
+
+        let search = self.search.clone();
+        let spec = SurfaceSpec {
+            cols,
+            rows,
+            rect,
+            ppp,
+            padding,
+            material: config.material,
+            show_cursor,
+            search: search.as_ref(),
+            theme,
+            tokens,
+            font_size: config.font_size,
+            line_height: config.line_height,
+        };
+        if !self.paint_soft(ui, &painter, atlas, &snapshot, &spec) {
+            painter.rect_filled(rect, 0.0, design::color(theme.bg));
+            paint_backgrounds(&painter, &snapshot, theme, origin, &metrics, cols, rows);
+            paint_selection(&painter, &selection, origin, &metrics, tokens);
+            paint_search(
+                &painter,
+                &row_texts,
+                search.as_ref(),
+                origin,
+                &metrics,
+                tokens,
+            );
+            paint_cells(
                 &painter, atlas, &snapshot, theme, origin, &metrics, cols, rows, ppp,
             );
+            if show_cursor {
+                paint_cursor(
+                    &painter, atlas, &snapshot, theme, origin, &metrics, cols, rows, ppp,
+                );
+            }
         }
         if blinking && snapshot.cursor.visible {
             // Wake up when the cursor needs to flip.
@@ -353,6 +391,74 @@ impl TerminalView {
         }
     }
 
+    /// Paints the cached software surface, re-rendering only when its
+    /// fingerprint changes. Returns `false` when the mesh fallback should run.
+    fn paint_soft(
+        &mut self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        atlas: &mut GlyphAtlas,
+        snapshot: &Snapshot,
+        spec: &SurfaceSpec<'_>,
+    ) -> bool {
+        let key = soft::fingerprint(snapshot, spec);
+        let size = soft::surface_size(spec.rect, spec.ppp);
+        let needs_render =
+            self.soft_key != Some(key) || self.soft_size != size || self.soft_texture.0.is_none();
+        if needs_render {
+            let now = ui.ctx().input(|input| input.time);
+            // Coalesce bursts of PTY output: a full software composite is
+            // several milliseconds, so never do more than one per frame.
+            if self.soft_texture.0.is_some() && now - self.soft_last_render < 1.0 / 60.0 {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            } else {
+                match soft::render_surface(atlas, snapshot, spec) {
+                    Some(image) => {
+                        self.soft_key = Some(key);
+                        self.soft_size = Some(image.size);
+                        self.soft_last_render = now;
+                        self.upload_soft(ui.ctx(), image);
+                    }
+                    None => {
+                        self.soft_key = None;
+                        self.soft_size = None;
+                        self.soft_texture.0 = None;
+                    }
+                }
+            }
+        }
+
+        let Some(texture) = self.soft_texture.0.as_ref() else {
+            return false;
+        };
+        painter.image(
+            texture.id(),
+            spec.rect,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        );
+        true
+    }
+
+    fn upload_soft(&mut self, ctx: &egui::Context, image: ColorImage) {
+        if self.soft_texture_name.is_empty() {
+            self.soft_texture_name = format!(
+                "illness-terminal-soft-{}",
+                NEXT_SOFT_TEXTURE.fetch_add(1, Ordering::Relaxed)
+            );
+        }
+        if let Some(texture) = self.soft_texture.0.as_mut() {
+            texture.set(image, TextureOptions::NEAREST);
+        } else {
+            self.soft_texture.0 = Some(ctx.load_texture(
+                self.soft_texture_name.clone(),
+                image,
+                TextureOptions::NEAREST,
+            ));
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse(
         &mut self,
@@ -554,8 +660,13 @@ impl TerminalView {
                     if let Some(key) = map_key(key) {
                         bytes.extend_from_slice(&encode_key(KeyInput::new(key, mods, None), modes));
                     } else if mods.ctrl
+                        && (!mods.alt || !has_text)
                         && let Some(ch) = printable_char(key)
                     {
+                        // Ctrl+Alt is AltGr on many layouts. When it produces a
+                        // text event, that event carries the composed
+                        // character and encoding the physical key here would
+                        // double it.
                         bytes.extend_from_slice(&encode_key(
                             KeyInput::new(Key::Char(ch), mods, None),
                             modes,
@@ -888,6 +999,11 @@ fn paint_cells(
             if let Some(glyph) = atlas.glyph(cell.ch, style) {
                 atlas.paint_glyph(painter, rect.min, &glyph, fg);
             }
+            for &mark in snapshot.zero_width(cell) {
+                if let Some(glyph) = atlas.glyph(mark, style) {
+                    atlas.paint_glyph(painter, rect.min, &glyph, fg);
+                }
+            }
             if flags.intersects(CellFlags::ALL_UNDERLINES) {
                 paint_line(painter, rect, ppp, fg, false);
             }
@@ -939,6 +1055,11 @@ fn paint_cursor(
                     && let Some(glyph) = atlas.glyph(cell.ch, glyph_style(flags))
                 {
                     atlas.paint_glyph(painter, rect.min, &glyph, design::color(theme.bg));
+                    for &mark in snapshot.zero_width(cell) {
+                        if let Some(glyph) = atlas.glyph(mark, glyph_style(flags)) {
+                            atlas.paint_glyph(painter, rect.min, &glyph, design::color(theme.bg));
+                        }
+                    }
                 }
             }
         }
@@ -964,7 +1085,7 @@ fn paint_cursor(
     }
 }
 
-fn cell_colors(cell: &SnapshotCell, theme: &Theme) -> (Color32, Color32) {
+pub(crate) fn cell_colors(cell: &SnapshotCell, theme: &Theme) -> (Color32, Color32) {
     let mut fg = resolve_color(cell.fg, theme);
     let mut bg = resolve_color(cell.bg, theme);
     if cell.flags.contains(CellFlags::INVERSE) {
@@ -1044,7 +1165,7 @@ fn blend_toward(color: Color32, target: Color32, amount: f32) -> Color32 {
     )
 }
 
-fn glyph_style(flags: CellFlags) -> GlyphStyle {
+pub(crate) fn glyph_style(flags: CellFlags) -> GlyphStyle {
     match (
         flags.contains(CellFlags::BOLD),
         flags.contains(CellFlags::ITALIC),
@@ -1056,7 +1177,7 @@ fn glyph_style(flags: CellFlags) -> GlyphStyle {
     }
 }
 
-fn dim(color: Color32) -> Color32 {
+pub(crate) fn dim(color: Color32) -> Color32 {
     Color32::from_rgb(
         (f32::from(color.r()) * 0.6) as u8,
         (f32::from(color.g()) * 0.6) as u8,
@@ -1113,7 +1234,11 @@ fn side_at(pos: Pos2, rect: Rect, metrics: &CellMetrics) -> Side {
     }
 }
 
-fn selection_ranges(snapshot: &Snapshot, cols: usize, rows: usize) -> Vec<(usize, usize, usize)> {
+pub(crate) fn selection_ranges(
+    snapshot: &Snapshot,
+    cols: usize,
+    rows: usize,
+) -> Vec<(usize, usize, usize)> {
     let mut ranges = selection_ranges_from_spans(&snapshot.selection, cols, rows);
     for (row, start, end) in &mut ranges {
         if *start > 0
@@ -1175,13 +1300,16 @@ fn selection_ranges_from_spans(
     out
 }
 
-fn row_text(snapshot: &Snapshot, row: usize, cols: usize) -> String {
+pub(crate) fn row_text(snapshot: &Snapshot, row: usize, cols: usize) -> String {
     let mut text = String::with_capacity(cols);
     for col in 0..cols {
         match snapshot.cell(col, row) {
             Some(cell) if !cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) => {
                 text.push(cell.ch);
             }
+            // A spacer is still one grid column. Pushing a placeholder keeps
+            // char indices aligned with columns so search highlights and hit
+            // testing stay correct on rows containing wide characters.
             _ => text.push(' '),
         }
     }
@@ -1270,7 +1398,7 @@ fn is_url_terminator(ch: char) -> bool {
         )
 }
 
-fn find_matches(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+pub(crate) fn find_matches(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
     let haystack: Vec<char> = text.chars().collect();
     let needle: Vec<char> = needle.chars().collect();
     if needle.is_empty() || needle.len() > haystack.len() {
@@ -1283,8 +1411,10 @@ fn find_matches(text: &str, needle: &str, case_sensitive: bool) -> Vec<(usize, u
             let got = haystack[i + offset];
             if case_sensitive {
                 got == *wanted
-            } else {
+            } else if got.is_ascii() && wanted.is_ascii() {
                 got.eq_ignore_ascii_case(wanted)
+            } else {
+                got.to_lowercase().eq(wanted.to_lowercase())
             }
         });
         if matched {
@@ -1580,6 +1710,21 @@ mod tests {
         assert_eq!(
             take_input_with(vec![key_event(EguiKey::C, alt)]),
             Some(vec![0x1b, 0x03])
+        );
+    }
+
+    #[test]
+    fn altgr_text_is_not_double_encoded() {
+        let altgr = Modifiers {
+            alt: true,
+            ..ctrl_mods()
+        };
+        assert_eq!(
+            take_input_with(vec![
+                key_event(EguiKey::Q, altgr),
+                Event::Text("@".to_string())
+            ]),
+            Some(b"@".to_vec())
         );
     }
 

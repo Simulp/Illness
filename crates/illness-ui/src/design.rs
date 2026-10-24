@@ -1,11 +1,22 @@
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Vec2, Visuals};
-use illness_core::{Config, Rgb, Theme};
+use illness_core::{Config, Material, Rgb, Theme};
 
 use crate::fonts;
 
 /// Convert a terminal theme colour into an egui colour.
 pub fn color(rgb: Rgb) -> Color32 {
     Color32::from_rgb(rgb.r, rgb.g, rgb.b)
+}
+
+/// Alpha for chrome surfaces painted over the window material. Opaque for
+/// Solid, and progressively more translucent for Mica and Acrylic so the
+/// compositor backdrop actually shows through.
+pub fn material_alpha(material: Material) -> u8 {
+    match material {
+        Material::Solid => 255,
+        Material::Mica => 210,
+        Material::Acrylic => 185,
+    }
 }
 
 /// Mix `amount` of `other` into `base` (sRGB-space interpolation).
@@ -312,5 +323,12 @@ mod tests {
         let tokens = Tokens::from_theme(Theme::by_name("nord"));
         assert_eq!(tokens.accent, Color32::from_rgb(0x88, 0xC0, 0xD0));
         assert_eq!(tokens.danger, Color32::from_rgb(0xE5, 0x53, 0x4B));
+    }
+
+    #[test]
+    fn material_alpha_gets_more_translucent() {
+        assert_eq!(material_alpha(Material::Solid), 255);
+        assert_eq!(material_alpha(Material::Mica), 210);
+        assert_eq!(material_alpha(Material::Acrylic), 185);
     }
 }

@@ -13,6 +13,7 @@
 //! atlas stays color-agnostic.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use egui::{
     Color32, ColorImage, Mesh, Pos2, Rect, TextureHandle, TextureId, TextureOptions, Vec2,
@@ -123,6 +124,35 @@ pub struct Glyph {
     pub wide: bool,
 }
 
+/// A glyph rasterized into CPU memory for subpixel software compositing.
+///
+/// Mask glyphs store three bytes per pixel of linear RGB coverage, so each
+/// channel can be blended independently (ClearType). Color glyphs (emoji)
+/// store premultiplied RGBA and ignore the foreground color.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SoftGlyph {
+    pub width: u32,
+    pub height: u32,
+    pub left: i32,
+    pub top: i32,
+    /// RGB coverage (3 bytes/pixel) or premultiplied RGBA (4 bytes/pixel).
+    pub data: Vec<u8>,
+    pub color: bool,
+}
+
+impl SoftGlyph {
+    fn empty() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            left: 0,
+            top: 0,
+            data: Vec::new(),
+            color: false,
+        }
+    }
+}
+
 /// Font data and face index of a system fallback face.
 struct FallbackFace {
     data: Vec<u8>,
@@ -173,6 +203,7 @@ pub struct GlyphAtlas {
     options: TextureOptions,
     metrics: CellMetrics,
     cache: HashMap<(char, GlyphStyle), Glyph>,
+    soft_cache: HashMap<(char, GlyphStyle), Arc<SoftGlyph>>,
     scale: ScaleContext,
     font: Option<FontRef<'static>>,
     fallback_faces: Vec<FallbackFace>,
@@ -212,6 +243,7 @@ impl GlyphAtlas {
             options: TextureOptions::NEAREST,
             metrics,
             cache: HashMap::new(),
+            soft_cache: HashMap::new(),
             scale: ScaleContext::new(),
             font,
             fallback_faces: Vec::new(),
@@ -390,6 +422,63 @@ impl GlyphAtlas {
         Some(glyph)
     }
 
+    /// Rasterizes and caches a glyph for software subpixel compositing.
+    ///
+    /// Mask glyphs use swash's `Format::Subpixel` and therefore come back as
+    /// `Content::SubpixelMask`. swash/zeno store that mask as four bytes per
+    /// pixel (RGBX, alpha unused), so it is compacted to the three bytes per
+    /// pixel exposed by [`SoftGlyph`].
+    pub fn soft_glyph(&mut self, ch: char, style: GlyphStyle) -> Option<Arc<SoftGlyph>> {
+        let key = (ch, style);
+        if let Some(glyph) = self.soft_cache.get(&key) {
+            return Some(Arc::clone(glyph));
+        }
+
+        let primary = self.font?;
+        let mut glyph_id = primary.charmap().map(ch);
+        let mut fallback_index = None;
+
+        if glyph_id == 0
+            && let Some(index) = self.find_fallback(ch)
+            && let Some(font) = self
+                .fallback_faces
+                .get(index)
+                .and_then(|face| FontRef::from_index(&face.data, face.index))
+        {
+            let id = font.charmap().map(ch);
+            if id != 0 {
+                glyph_id = id;
+                fallback_index = Some(index);
+            }
+        }
+
+        let physical_size = self.physical_size;
+        let ppp = self.ppp;
+        let image = {
+            let source_font = fallback_index
+                .and_then(|index| self.fallback_faces.get(index))
+                .and_then(|face| FontRef::from_index(&face.data, face.index))
+                .unwrap_or(primary);
+            rasterize_subpixel(
+                &mut self.scale,
+                source_font,
+                glyph_id,
+                style,
+                physical_size,
+                ppp,
+            )
+        };
+
+        let glyph = image
+            .as_ref()
+            .filter(|image| image.placement.width > 0 && image.placement.height > 0)
+            .map(soft_from_image)
+            .unwrap_or_else(SoftGlyph::empty);
+        let glyph = Arc::new(glyph);
+        self.soft_cache.insert(key, Arc::clone(&glyph));
+        Some(glyph)
+    }
+
     /// The atlas texture to sample from in custom meshes.
     pub fn texture(&self) -> TextureId {
         self.texture.id()
@@ -463,6 +552,7 @@ impl GlyphAtlas {
     /// Drops cached glyphs and makes the atlas fully transparent again.
     pub fn reset(&mut self) {
         self.cache.clear();
+        self.soft_cache.clear();
         self.allocator.reset();
         self.texture.set(
             ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
@@ -567,6 +657,55 @@ fn rasterize_with(
     ppp: f32,
     options: RasterOptions,
 ) -> Option<Image> {
+    rasterize_format(
+        scale,
+        font,
+        glyph_id,
+        style,
+        physical_size,
+        ppp,
+        options,
+        Format::Alpha,
+    )
+}
+
+/// Rasterizes one glyph as three-channel subpixel coverage.
+fn rasterize_subpixel(
+    scale: &mut ScaleContext,
+    font: FontRef<'_>,
+    glyph_id: GlyphId,
+    style: GlyphStyle,
+    physical_size: f32,
+    ppp: f32,
+) -> Option<Image> {
+    let weight = if style.is_bold() {
+        BOLD_WEIGHT
+    } else {
+        REGULAR_WEIGHT
+    };
+    rasterize_format(
+        scale,
+        font,
+        glyph_id,
+        style,
+        physical_size,
+        ppp,
+        RasterOptions { hint: true, weight },
+        Format::Subpixel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rasterize_format(
+    scale: &mut ScaleContext,
+    font: FontRef<'_>,
+    glyph_id: GlyphId,
+    style: GlyphStyle,
+    physical_size: f32,
+    ppp: f32,
+    options: RasterOptions,
+    format: Format,
+) -> Option<Image> {
     let weight_axis = font.attributes().has_weight_variation();
     let mut builder = scale.builder(font).size(physical_size).hint(options.hint);
     if weight_axis {
@@ -575,7 +714,7 @@ fn rasterize_with(
     let mut scaler = builder.build();
 
     let mut render = Render::new(&SOURCES);
-    render.format(Format::Alpha);
+    render.format(format);
     if style.is_italic() {
         render.transform(Some(Transform::skew(Angle::from_radians(0.2), Angle::ZERO)));
     }
@@ -646,6 +785,63 @@ fn build_tile(image: &Image, tile_width: usize, tile_height: usize) -> (Vec<Colo
     }
 
     (pixels, (coverage, max_alpha))
+}
+
+/// Converts a swash image into the CPU glyph representation.
+fn soft_from_image(image: &Image) -> SoftGlyph {
+    let width = image.placement.width;
+    let height = image.placement.height;
+    let count = width as usize * height as usize;
+    let color = image.content == Content::Color;
+    let mut data = Vec::new();
+
+    if color {
+        data.reserve(count * 4);
+        let straight_alpha = matches!(image.source, Source::ColorBitmap(_));
+        let mut source = image.data.as_chunks::<4>().0.iter();
+        for _ in 0..count {
+            let mut pixel = [0u8; 4];
+            if let Some(chunk) = source.next() {
+                pixel.copy_from_slice(chunk);
+            }
+            if straight_alpha {
+                data.push(premultiply(pixel[0], pixel[3]));
+                data.push(premultiply(pixel[1], pixel[3]));
+                data.push(premultiply(pixel[2], pixel[3]));
+                data.push(pixel[3]);
+            } else {
+                data.extend_from_slice(&pixel);
+            }
+        }
+    } else if image.data.len() >= count * 4 {
+        // swash's SubpixelMask is RGBX: four bytes per pixel, alpha unused.
+        data.reserve(count * 3);
+        for pixel in image.data.as_chunks::<4>().0.iter().take(count) {
+            data.extend_from_slice(&pixel[..3]);
+        }
+    } else if image.data.len() >= count * 3 {
+        data.extend_from_slice(&image.data[..count * 3]);
+    } else {
+        // Grayscale fallback: replicate one coverage byte across all channels.
+        data.reserve(count * 3);
+        for index in 0..count {
+            let coverage = image.data.get(index).copied().unwrap_or(0);
+            data.extend_from_slice(&[coverage, coverage, coverage]);
+        }
+    }
+
+    SoftGlyph {
+        width,
+        height,
+        left: image.placement.left,
+        top: image.placement.top,
+        data,
+        color,
+    }
+}
+
+fn premultiply(value: u8, alpha: u8) -> u8 {
+    ((u16::from(value) * u16::from(alpha) + 127) / 255) as u8
 }
 
 /// Gamma-corrects dark-mode coverage: `2c - c²` in 0..=255 integer space.
@@ -759,6 +955,66 @@ mod tests {
         let second = atlas.glyph('M', GlyphStyle::Regular).expect("M glyph");
         assert_eq!(first, second);
         assert_eq!(first.uv, second.uv);
+    }
+
+    #[test]
+    fn test_soft_glyph_subpixel_fringes() {
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        let glyph = atlas
+            .soft_glyph('H', GlyphStyle::Regular)
+            .expect("H soft glyph");
+        assert!(!glyph.color, "outline glyph should be a mask");
+        assert!(glyph.width > 0 && glyph.height > 0);
+        assert_eq!(
+            glyph.data.len(),
+            glyph.width as usize * glyph.height as usize * 3
+        );
+        assert!(glyph.data.iter().any(|&value| value > 0));
+        assert!(
+            glyph
+                .data
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
+            "expected per-channel ClearType fringes"
+        );
+    }
+
+    #[test]
+    fn test_soft_glyph_cache_and_reset() {
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        let first = atlas
+            .soft_glyph('H', GlyphStyle::Regular)
+            .expect("H soft glyph");
+        let second = atlas
+            .soft_glyph('H', GlyphStyle::Regular)
+            .expect("H soft glyph");
+        assert!(Arc::ptr_eq(&first, &second));
+
+        atlas.reset();
+        let third = atlas
+            .soft_glyph('H', GlyphStyle::Regular)
+            .expect("H soft glyph");
+        assert!(!Arc::ptr_eq(&first, &third));
+    }
+
+    #[test]
+    fn test_soft_color_emoji_rgba() {
+        if !emoji_font_present() {
+            eprintln!("skipping soft color-glyph assertion: no emoji system font");
+            return;
+        }
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        let glyph = atlas
+            .soft_glyph('\u{1f600}', GlyphStyle::Regular)
+            .expect("emoji");
+        assert!(glyph.color);
+        assert_eq!(
+            glyph.data.len(),
+            glyph.width as usize * glyph.height as usize * 4
+        );
+        assert!(glyph.data.iter().any(|&value| value > 0));
     }
 
     #[test]
