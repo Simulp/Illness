@@ -1,0 +1,16 @@
+Illness
+Copyright (c) 2026
+
+This product includes software developed by the Alacritty project
+(https://github.com/alacritty/alacritty), licensed under the Apache License 2.0.
+The terminal emulation core is the `alacritty_terminal` crate, version 0.26.0.
+
+This product includes software developed by the egui project
+(https://github.com/emilk/egui), licensed under MIT OR Apache-2.0.
+
+This product bundles Cascadia Mono (https://github.com/microsoft/cascadia-code),
+Copyright (c) Microsoft Corporation, licensed under the SIL Open Font License 1.1.
+See assets/fonts/LICENSE-Cascadia.txt.
+
+This product bundles Inter (https://github.com/rsms/inter), Copyright (c) Rasmus Andersson,
+licensed under the SIL Open Font License 1.1. See assets/fonts/LICENSE-Inter.txt.

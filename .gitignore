@@ -1,0 +1,11 @@
+/target
+/.superlite
+/docs
+*.pdb
+*.ilk
+.DS_Store
+
+# superlite: dependency, build and cache folders
+Thumbs.db
+.idea/
+*.swp
