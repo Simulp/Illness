@@ -5,32 +5,35 @@
 A Windows-first terminal emulator built on Alacritty's VT core and egui, for people who think
 Alacritty's UI is a war crime.
 
-Illness keeps the parts of Alacritty that are actually good — the parser, grid, scrollback,
-selection and ConPTY — and replaces the window you have to look at with a clean, dark, tabbed
+Illness keeps the parts of Alacritty that are actually good - the parser, grid, scrollback,
+selection and ConPTY - and replaces the window you have to look at with a clean, dark, tabbed
 shell inspired by Windows Terminal. It renders terminal text through its own physical-pixel
-glyph atlas: hinted, pixel-snapped, nearest-sampled, with no subpixel smearing.
+glyph atlas: hinted, pixel-snapped, nearest-sampled, with ClearType-style subpixel fringing.
 
 ![Illness](assets/screenshot.png)
 
 ![Illness command palette](assets/palette.png)
 
+![Illness settings tab](assets/settings.png)
+
 ## Symptoms
 
 - Custom frameless window with a real tab strip, profile accents and native caption buttons.
-- Mica by default; Acrylic or Solid in Settings. Windows 10 falls back to Solid. Mica and
-  Acrylic render a blurred wallpaper backdrop inside the window, because the GPU surface does
-  not expose native DWM transparency.
-- Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and a live Settings sheet
-  (`Ctrl+,`).
+- Settings opens as its own tab, with right-aligned dropdowns, an editable shell profile list,
+  an installed-font picker (Nerd Fonts included), and background controls.
+- Mica by default; Acrylic or Solid in Settings. Windows 10 falls back to Solid. Desktop mode
+  uses the live Windows wallpaper, with custom images and an opacity slider; true DWM
+  behind-window blur is not available through the current wgpu surface.
+- Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and Settings (`Ctrl+,`).
 - Seven themes: Illness Dark, Campbell, One Half Dark, Nord, Gruvbox Dark, Solarized Dark, Light.
-- Crisp Cascadia Mono grid with system fallback for CJK and emoji; wide cells, combining marks,
+- Crisp terminal grid with system fallback for CJK and emoji; wide cells, combining marks,
   underline/strikethrough, OSC 8 hyperlinks and all cursor shapes.
 - Full xterm key and mouse encoding, bracketed paste, IME commit, focus reporting and DECSCUSR.
 - 10,000 lines of scrollback, smooth wheel scrolling, word/line selection and a jump-to-bottom pill.
 - A session that ends stays readable; Restart is one click away.
-- Pixel-snapped, hinted Cascadia Mono on a nearest-sampled physical-pixel atlas. The grid is
-  composited in software with per-channel RGB coverage, so text gets ClearType-style subpixel
-  fringing while backgrounds, selection, search hits and the cursor stay pixel-exact.
+- Pixel-snapped, hinted glyphs on a nearest-sampled physical-pixel atlas. Glyphs are drawn on
+  the GPU from a subpixel atlas, while backgrounds, selection, search hits and the cursor stay
+  pixel-exact; the CPU ClearType compositor remains as a fallback.
 
 ## Dosage
 

@@ -17,9 +17,9 @@ Illness is a Windows-first terminal emulator: Alacritty's VT core plus an egui s
 - `crates/illness-term`: `Session` owns the ConPTY and `alacritty_terminal::Term`; `snapshot`
   is the immutable per-frame grid; `input` is xterm key/mouse/paste encoding.
 - `crates/illness-ui`: `design` tokens/visuals, `fonts`, vector `icons`, `glyph` swash atlas,
-  `soft` ClearType compositor, `terminal` grid view, `chrome` titlebar/tabs,
-  `overlays` palette/search/settings.
-- `apps/illness`: eframe app, shortcuts, event drain, blurred material backdrop, Win32
+  `soft` ClearType compositor, `gpu` wgpu glyph compositor, `terminal` grid view, `chrome`
+  titlebar/tabs, `overlays` palette/search/settings.
+- `apps/illness`: eframe app, shortcuts, event drain, blurred background image, Win32
   material (`platform.rs`).
 
 ## Rules
