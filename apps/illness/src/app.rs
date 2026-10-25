@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{
     self, Align2, Color32, Event, FontId, Id, Key, Modifiers, Order, Rect, RichText, Sense, Stroke,
@@ -29,9 +29,20 @@ const INITIAL_ROWS: usize = 30;
 const BELL_FLASH_SECS: f64 = 0.18;
 /// Coalesce settings writes; live values still apply immediately.
 const SAVE_DEBOUNCE_MS: u64 = 300;
-/// Retry a native material after an apply failure without hammering it on
-/// every focus/theme notification.
-const MATERIAL_RETRY_BACKOFF_SECS: f64 = 2.0;
+/// Base delay before retrying a native material after an apply failure. Each
+/// consecutive failure doubles it (2s, 4s, 8s...), and automatic retries stop
+/// after [`MATERIAL_RETRY_CAP`] failures.
+const MATERIAL_RETRY_BASE: Duration = Duration::from_secs(2);
+/// Consecutive apply failures after which automatic retries stop. Only an
+/// explicit material choice, a real availability transition, or a successful
+/// apply resets the streak.
+const MATERIAL_RETRY_CAP: u32 = 3;
+/// A warm running longer than this is treated as stuck (for example a dead UNC
+/// path) and may be superseded by a later rebuild.
+const WARM_STUCK_AFTER: Duration = Duration::from_secs(30);
+/// Background warm failures are retried at most this many times automatically.
+const WARM_RETRY_CAP: u32 = 3;
+const WARM_RETRY_BASE: Duration = Duration::from_secs(2);
 
 /// Pending delayed config write. A pointer release flushes immediately so a
 /// click never waits for the timer.
@@ -57,6 +68,66 @@ impl SaveDebounce {
             false
         }
     }
+}
+
+/// Bounded automatic retry of a native material whose apply failed.
+///
+/// The retry deadline uses host `Instant`s rather than egui's last-frame input
+/// time, so arming after idle still waits the full backoff. Consecutive
+/// failures abort when they reach [`MATERIAL_RETRY_CAP`]; every automatic retry
+/// is also just a confusing repeated toast, so the app only surfaces the first.
+#[derive(Debug, Default)]
+struct MaterialRetryState {
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+impl MaterialRetryState {
+    fn reset(&mut self) {
+        self.failures = 0;
+        self.retry_at = None;
+    }
+
+    fn note_failure(&mut self, now: Instant, available: bool, requested: Material) {
+        self.failures = self.failures.saturating_add(1);
+        self.retry_at = if available && requested != Material::Solid {
+            material_retry_backoff(self.failures).and_then(|delay| now.checked_add(delay))
+        } else {
+            None
+        };
+    }
+
+    fn retry_due(
+        &self,
+        fallback: bool,
+        available: bool,
+        requested: Material,
+        now: Instant,
+    ) -> bool {
+        fallback
+            && available
+            && requested != Material::Solid
+            && !self.exhausted()
+            && self.retry_at.is_none_or(|at| now >= at)
+    }
+
+    fn exhausted(&self) -> bool {
+        self.failures >= MATERIAL_RETRY_CAP
+    }
+
+    #[cfg(test)]
+    fn first_failure(&self) -> bool {
+        self.failures == 1
+    }
+
+    fn clear_deadline(&mut self) {
+        self.retry_at = None;
+    }
+}
+
+fn material_retry_backoff(failures: u32) -> Option<Duration> {
+    (failures > 0 && failures < MATERIAL_RETRY_CAP)
+        .then(|| MATERIAL_RETRY_BASE * 2u32.pow(failures.saturating_sub(1)))
 }
 /// DECSET 1004 focus reports.
 const FOCUS_IN: &[u8] = b"\x1b[I";
@@ -94,7 +165,21 @@ struct BackdropWarmResult {
     request: u64,
     mode: BackgroundMode,
     path: String,
-    result: Result<(), String>,
+    result: Result<backdrop::WarmOutcome, String>,
+}
+
+/// One in-flight background backdrop warm.
+struct BackdropWarm {
+    request: u64,
+    mode: BackgroundMode,
+    path: String,
+    started: Instant,
+}
+
+impl BackdropWarm {
+    fn is_stuck(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= WARM_STUCK_AFTER
+    }
 }
 
 /// The winit/egui application shell and all cross-module state.
@@ -135,15 +220,19 @@ pub struct IllnessApp {
     backdrop_warm_tx: Sender<BackdropWarmResult>,
     backdrop_warm_rx: Receiver<BackdropWarmResult>,
     /// The `(request id, mode, path)` currently warming on a detached thread.
-    backdrop_warming: Option<(u64, BackgroundMode, String)>,
+    backdrop_warming: Option<BackdropWarm>,
     /// Monotonic id for backdrop warm requests.
     backdrop_warm_seq: u64,
     /// Cancellation handle for the current warm. Superseded requests exit
     /// before opening or decoding a file.
     backdrop_warm_token: backdrop::WarmToken,
-    /// When a failed native material may be retried. `None` means no retry is
-    /// armed (Solid request or native transparency unavailable).
-    material_retry_at: Option<f64>,
+    /// Consecutive backdrop warm failures and the next automatic retry. The
+    /// retry stops after [`WARM_RETRY_CAP`] so a deleted/dead source cannot
+    /// loop forever.
+    backdrop_warm_failures: u32,
+    backdrop_warm_retry_at: Option<Instant>,
+    /// Bounded automatic retry of a failed native material.
+    material_retry: MaterialRetryState,
     /// Family whose load failed, so the toast is not repeated every change.
     font_failure: Option<String>,
     /// GPU glyph compositor, when a wgpu device and `gpu_text` are available.
@@ -254,7 +343,9 @@ impl IllnessApp {
             backdrop_warming: None,
             backdrop_warm_seq: 0,
             backdrop_warm_token: backdrop::WarmToken::new(),
-            material_retry_at: None,
+            backdrop_warm_failures: 0,
+            backdrop_warm_retry_at: None,
+            material_retry: MaterialRetryState::default(),
             font_failure: None,
             gpu_text,
             window_title: "Illness".to_string(),
@@ -283,7 +374,7 @@ impl IllnessApp {
                 self.active = index;
             }
             Err(error) => {
-                self.overlays.toast = Some(error);
+                self.overlays.set_toast(error);
             }
         }
     }
@@ -463,27 +554,57 @@ impl IllnessApp {
         let requested = self.config.material;
         let attempted_native = requested != Material::Solid;
         let unavailable = attempted_native && !self.native_transparency;
-        let mut effective = material_for_surface(requested, self.native_transparency, false);
+        let was_fallback = self.material_fallback;
+        // A theme change or other pending apply while the failure streak is
+        // exhausted must stay on Solid; only an explicit selection or a real
+        // availability transition may start a new native attempt.
+        let exhausted_fallback = self.material_fallback && self.material_retry.exhausted();
+        let mut effective =
+            material_for_surface(requested, self.native_transparency, exhausted_fallback);
         if unavailable {
             self.material_fallback = true;
-            self.overlays.toast = Some("Native materials unavailable; using Solid".to_string());
-            log::warn!(
-                "surface alpha or Windows transparency effects unavailable; {} forced to Solid",
-                material_name(requested)
-            );
-        }
-        if let Err(error) = platform::apply(window, effective, dark, theme_bg, opacity) {
-            log::warn!(
-                "window material {} (dark={dark}) failed: {error}",
-                material_name(effective)
-            );
-            if effective != Material::Solid {
-                effective = Material::Solid;
-                self.material_fallback = true;
-                self.overlays.toast = Some(format!(
-                    "{} is unavailable here; using Solid",
+            if !was_fallback {
+                self.overlays
+                    .set_toast("Native materials unavailable; using Solid");
+                log::warn!(
+                    "surface alpha or Windows transparency effects unavailable; {} forced to Solid",
                     material_name(requested)
-                ));
+                );
+            } else {
+                log::debug!(
+                    "{} still unavailable; Solid fallback remains",
+                    material_name(requested)
+                );
+            }
+        }
+        let now = Instant::now();
+        if let Err(error) = platform::apply(window, effective, dark, theme_bg, opacity) {
+            if effective != Material::Solid {
+                let first = self.material_retry.failures == 0;
+                self.material_fallback = true;
+                self.material_retry
+                    .note_failure(now, self.native_transparency, requested);
+                if first {
+                    log::warn!(
+                        "window material {} (dark={dark}) failed: {error}",
+                        material_name(effective)
+                    );
+                    self.overlays.set_toast(format!(
+                        "{} is unavailable here; using Solid",
+                        material_name(requested)
+                    ));
+                } else {
+                    log::debug!(
+                        "window material {} retry {} failed: {error}",
+                        material_name(effective),
+                        self.material_retry.failures
+                    );
+                }
+                effective = Material::Solid;
+            } else {
+                // A failed Solid apply cannot be improved by another attempt.
+                log::warn!("solid material unavailable: {error}");
+                self.material_retry.reset();
             }
             if let Err(error) = platform::apply(window, Material::Solid, dark, theme_bg, opacity) {
                 log::warn!("solid material unavailable: {error}");
@@ -493,19 +614,24 @@ impl IllnessApp {
                 "window material {} (dark={dark}) applied",
                 material_name(effective)
             );
-            if effective != Material::Solid {
+            // Only a successful native apply (or an explicit Solid request)
+            // ends the failure streak; applying the fallback Solid must not
+            // reset the retry cap.
+            if effective != Material::Solid || !attempted_native {
                 self.material_fallback = false;
+                self.material_retry.reset();
             }
         }
         if !attempted_native {
             self.material_fallback = false;
+            self.material_retry.reset();
         }
         self.applied_material = effective;
         self.applied_requested_material = requested;
         if self.material_fallback {
             self.arm_material_retry();
         } else {
-            self.material_retry_at = None;
+            self.material_retry.clear_deadline();
         }
         // A fallback to Solid leaves any prewarmed texture unused; drop it
         // without decoding or toasting. Acrylic+Desktop keeps its texture.
@@ -533,19 +659,25 @@ impl IllnessApp {
     /// them back on retries the requested Mica/Acrylic without a restart.
     ///
     /// A failed apply can leave `available == true` unchanged, so focus/theme
-    /// notifications still retry after [`MATERIAL_RETRY_BACKOFF_SECS`] rather
-    /// than returning early forever.
+    /// notifications still retry after the bounded backoff rather than
+    /// returning early forever. Only a real availability transition resets the
+    /// failure streak; unchanged availability keeps counting toward the cap.
     pub fn set_native_transparency(&mut self, available: bool) -> bool {
-        let now = self.ctx.input(|input| input.time);
-        let retry = material_retry_due(
+        let now = Instant::now();
+        let transition = self.native_transparency != available;
+        let retry = self.material_retry.retry_due(
             self.material_fallback,
             available,
             self.config.material,
             now,
-            self.material_retry_at,
         );
-        if self.native_transparency == available && !retry {
+        if !transition && !retry {
             return false;
+        }
+        if transition {
+            self.material_retry.reset();
+        } else {
+            self.material_retry.clear_deadline();
         }
         self.native_transparency = available;
         // A stale fallback must not block a retry when effects return.
@@ -558,43 +690,40 @@ impl IllnessApp {
         true
     }
 
-    /// Arm the next automatic retry of a native material that failed to apply.
+    /// Schedule a repaint for the retry deadline `note_failure` computed.
     /// Effects being off means availability, not apply failure, is the cause;
     /// recovering waits for the host's transparency re-check instead.
     fn arm_material_retry(&mut self) {
-        if self.native_transparency && self.config.material != Material::Solid {
-            let now = self.ctx.input(|input| input.time);
-            self.material_retry_at = Some(now + MATERIAL_RETRY_BACKOFF_SECS);
+        if let Some(at) = self.material_retry.retry_at {
             self.ctx
-                .request_repaint_after(Duration::from_secs_f64(MATERIAL_RETRY_BACKOFF_SECS));
-        } else {
-            self.material_retry_at = None;
+                .request_repaint_after(at.saturating_duration_since(Instant::now()));
         }
     }
 
     /// Retry a fallback material once its backoff expires. This covers sessions
-    /// where no focus/theme event follows the failure, without polling.
+    /// where no focus/theme event follows the failure, without polling. Stops
+    /// permanently once the consecutive-failure cap is reached.
     fn maybe_retry_material(&mut self) {
         if !self.material_fallback
             || !self.native_transparency
             || self.config.material == Material::Solid
+            || self.material_retry.exhausted()
         {
-            self.material_retry_at = None;
+            self.material_retry.clear_deadline();
             return;
         }
-        let Some(at) = self.material_retry_at else {
-            self.pending_material = true;
-            return;
-        };
-        let now = self.ctx.input(|input| input.time);
-        if now >= at {
-            self.pending_material = true;
-            // Pre-arm so a frame that cannot apply immediately does not queue
-            // another retry; a failed apply re-arms from its own timestamp.
-            self.material_retry_at = Some(now + MATERIAL_RETRY_BACKOFF_SECS);
-        } else {
-            self.ctx
-                .request_repaint_after(Duration::from_secs_f64(at - now));
+        match self.material_retry.retry_at {
+            Some(at) => {
+                let now = Instant::now();
+                if now >= at {
+                    self.material_retry.clear_deadline();
+                    self.pending_material = true;
+                } else {
+                    self.ctx.request_repaint_after(at - now);
+                }
+            }
+            // A fallback without an armed deadline retries immediately.
+            None => self.pending_material = true,
         }
     }
 
@@ -610,7 +739,7 @@ impl IllnessApp {
             &mut self.material_fallback,
             requested,
         );
-        self.material_retry_at = None;
+        self.material_retry.reset();
         self.pending_material = true;
         self.sync_backdrop_for_material(false);
     }
@@ -627,16 +756,32 @@ impl IllnessApp {
     /// texture and starts no warm: a backdrop that never paints is never
     /// decoded. Acrylic+Desktop keeps/warms only for a later switch.
     fn rebuild_backdrop(&mut self) {
+        self.rebuild_backdrop_inner(true);
+    }
+
+    /// `revalidate` schedules an mtime/existence check even when the path-only
+    /// cache already produced a texture. Warm-result rebuilds pass `false` so an
+    /// unchanged revalidation does not validate itself forever.
+    fn rebuild_backdrop_inner(&mut self, revalidate: bool) {
         let mode = self.config.background;
         let path = self.config.background_path.clone();
         let material = self.effective_material();
         let plan = backdrop_plan(material, mode);
-        let stale_warm =
-            self.backdrop_warming
-                .as_ref()
-                .is_some_and(|(_, warming_mode, warming_path)| {
-                    *warming_mode != mode || *warming_path != path
-                });
+        if revalidate {
+            self.backdrop_warm_failures = 0;
+            self.backdrop_warm_retry_at = None;
+        }
+        // Resolve the live wallpaper sources once for this rebuild. The warm
+        // thread resolves its own copy; the UI lookup stays path-only.
+        let desktop = if mode == BackgroundMode::Desktop {
+            backdrop::desktop_candidates()
+        } else {
+            Vec::new()
+        };
+        let stale_warm = self
+            .backdrop_warming
+            .as_ref()
+            .is_some_and(|warming| warming.mode != mode || warming.path != path);
         if plan == BackdropPlan::Drop || stale_warm {
             self.cancel_backdrop_warm();
         }
@@ -660,7 +805,7 @@ impl IllnessApp {
                 // only pays the upload.
                 self.applied_background = Some((mode, path.clone()));
                 self.applied_background_opacity = self.config.background_opacity;
-                self.start_backdrop_warm(mode, path);
+                self.start_backdrop_warm_with(mode, path, false, &desktop);
                 self.ctx.request_repaint();
                 log::debug!("backdrop kept for {material:?}+{mode:?}: not painted");
                 return;
@@ -668,28 +813,38 @@ impl IllnessApp {
             BackdropPlan::Build => {}
         }
 
-        let started = std::time::Instant::now();
-        match backdrop::build(&self.ctx, self.theme, mode, &path) {
+        let started = Instant::now();
+        match backdrop::build_with(&self.ctx, self.theme, mode, &path, &desktop) {
             backdrop::BackdropBuild::Ready(backdrop) => {
+                let from_image = backdrop
+                    .as_ref()
+                    .is_some_and(|backdrop| backdrop.from_image);
                 self.backdrop = backdrop;
                 if self.backdrop.is_none() && mode == BackgroundMode::Image {
-                    self.overlays.toast = Some(if path.trim().is_empty() {
+                    self.overlays.set_toast(if path.trim().is_empty() {
                         "Choose a background image".to_string()
                     } else {
                         format!("Could not load background \"{}\"", path)
                     });
                 }
                 // A lower-priority Desktop hit still needs its preferred
-                // wallpaper warmed; Image and gradient hits are complete.
-                self.start_backdrop_warm(mode, path.clone());
+                // wallpaper warmed; Image and gradient hits are complete. A
+                // cached image is revalidated off-thread so an in-place
+                // wallpaper replacement at the same path becomes visible.
+                self.start_backdrop_warm_with(
+                    mode,
+                    path.clone(),
+                    revalidate && from_image,
+                    &desktop,
+                );
             }
             backdrop::BackdropBuild::Warming => {
                 self.backdrop = None;
-                self.start_backdrop_warm(mode, path.clone());
+                self.start_backdrop_warm_with(mode, path.clone(), false, &desktop);
             }
             backdrop::BackdropBuild::Failed(error) => {
                 self.backdrop = None;
-                self.overlays.toast = Some(error);
+                self.overlays.set_toast(error);
             }
         }
 
@@ -712,23 +867,41 @@ impl IllnessApp {
     /// native material/theme until the warm result uploads. Solid/fallback and
     /// None never reach this method with a request that would decode.
     fn start_backdrop_warm(&mut self, mode: BackgroundMode, path: String) {
+        let desktop = if mode == BackgroundMode::Desktop {
+            backdrop::desktop_candidates()
+        } else {
+            Vec::new()
+        };
+        self.start_backdrop_warm_with(mode, path, false, &desktop);
+    }
+
+    fn start_backdrop_warm_with(
+        &mut self,
+        mode: BackgroundMode,
+        path: String,
+        revalidate: bool,
+        desktop: &[std::path::PathBuf],
+    ) {
         if mode == BackgroundMode::None {
             return;
         }
         if mode == BackgroundMode::Image && path.trim().is_empty() {
             return;
         }
-        if self
-            .backdrop_warming
-            .as_ref()
-            .is_some_and(|(_, warming_mode, warming_path)| {
-                *warming_mode == mode && *warming_path == path
-            })
-        {
+        if !revalidate && !backdrop::needs_warm_with(mode, &path, desktop) {
             return;
         }
-        if !backdrop::needs_warm(mode, &path) {
-            return;
+        if let Some(warming) = &self.backdrop_warming
+            && warming.mode == mode
+            && warming.path == path
+        {
+            let now = Instant::now();
+            let elapsed = now.saturating_duration_since(warming.started);
+            if !warming.is_stuck(now) {
+                self.ctx.request_repaint_after(WARM_STUCK_AFTER - elapsed);
+                return;
+            }
+            log::warn!("backdrop warm {mode:?} has been running for {elapsed:?}; superseding it");
         }
         // A different request supersedes the old one. Cancelling lets its
         // worker exit before opening another file instead of decoding work the
@@ -743,12 +916,22 @@ impl IllnessApp {
         let ctx = self.ctx.clone();
         let tx = self.backdrop_warm_tx.clone();
         let worker_path = path.clone();
-        self.backdrop_warming = Some((request, mode, path));
+        self.backdrop_warming = Some(BackdropWarm {
+            request,
+            mode,
+            path: path.clone(),
+            started: Instant::now(),
+        });
         let spawned = std::thread::Builder::new()
             .name("illness-backdrop-warm".to_string())
             .spawn(move || {
-                let started = std::time::Instant::now();
-                let result = backdrop::warm_cache(theme, mode, &worker_path, &token);
+                let started = Instant::now();
+                // A panic in the decoder must not leave the pair marked as
+                // warming forever; turn it into a normal error result.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    backdrop::warm_cache(theme, mode, &worker_path, &token)
+                }))
+                .unwrap_or_else(|_| Err("Background warm failed unexpectedly".to_string()));
                 log::debug!(
                     "backdrop warm {mode:?} finished in {:?}: {result:?}",
                     started.elapsed()
@@ -764,6 +947,13 @@ impl IllnessApp {
         if let Err(error) = spawned {
             log::warn!("could not start the backdrop warm thread: {error}");
             self.backdrop_warming = None;
+            self.note_backdrop_warm_failure(
+                mode,
+                &path,
+                format!("Could not start the background load: {error}"),
+            );
+        } else {
+            self.ctx.request_repaint_after(WARM_STUCK_AFTER);
         }
     }
 
@@ -774,18 +964,102 @@ impl IllnessApp {
         }
     }
 
+    /// Supersede a warm that has outlived [`WARM_STUCK_AFTER`], so a dead UNC
+    /// path cannot keep a pair marked as warming forever. The old worker is
+    /// cancelled and its result ignored; a still-missing source can start over.
+    fn poll_backdrop_warm(&mut self) {
+        let Some(warming) = &self.backdrop_warming else {
+            return;
+        };
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(warming.started);
+        if !warming.is_stuck(now) {
+            self.ctx.request_repaint_after(WARM_STUCK_AFTER - elapsed);
+            return;
+        }
+        let mode = warming.mode;
+        let path = warming.path.clone();
+        log::warn!("backdrop warm {mode:?} timed out after {elapsed:?}; retrying");
+        self.cancel_backdrop_warm();
+        let desktop = if mode == BackgroundMode::Desktop {
+            backdrop::desktop_candidates()
+        } else {
+            Vec::new()
+        };
+        if paints_backdrop(self.effective_material(), mode) {
+            self.start_backdrop_warm_with(mode, path, false, &desktop);
+        }
+    }
+
+    /// Retry a failed background warm a bounded number of times. A deleted
+    /// image or unreachable UNC is retried after a short delay, then left
+    /// alone until the user rebuilds the background.
+    fn maybe_retry_backdrop_warm(&mut self) {
+        let Some(at) = self.backdrop_warm_retry_at else {
+            return;
+        };
+        if self.backdrop_warming.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        if now < at {
+            self.ctx.request_repaint_after(at - now);
+            return;
+        }
+        self.backdrop_warm_retry_at = None;
+        let mode = self.config.background;
+        if !paints_backdrop(self.effective_material(), mode) {
+            return;
+        }
+        let desktop = if mode == BackgroundMode::Desktop {
+            backdrop::desktop_candidates()
+        } else {
+            Vec::new()
+        };
+        self.start_backdrop_warm_with(mode, self.config.background_path.clone(), false, &desktop);
+    }
+
+    fn note_backdrop_warm_failure(&mut self, mode: BackgroundMode, path: &str, error: String) {
+        // A warm for a material that will render Solid must not toast an image
+        // error the user cannot see, nor keep retrying unseen work.
+        if !paints_backdrop(self.effective_material(), mode) {
+            log::debug!("backdrop warm {mode:?} failed while unpainted: {error}");
+            return;
+        }
+        self.backdrop_warm_failures = self.backdrop_warm_failures.saturating_add(1);
+        if self.backdrop_warm_failures == 1 {
+            log::warn!("backdrop warm {mode:?} for \"{path}\" failed: {error}");
+            warm_error_toast(&self.ctx, &mut self.overlays, error);
+        } else {
+            log::debug!(
+                "backdrop warm {mode:?} retry {} failed: {error}",
+                self.backdrop_warm_failures
+            );
+        }
+        self.backdrop_warm_retry_at = if self.backdrop_warm_failures < WARM_RETRY_CAP {
+            Some(
+                Instant::now()
+                    + WARM_RETRY_BASE * 2u32.pow(self.backdrop_warm_failures.saturating_sub(1)),
+            )
+        } else {
+            None
+        };
+        if let Some(at) = self.backdrop_warm_retry_at {
+            self.ctx
+                .request_repaint_after(at.saturating_duration_since(Instant::now()));
+        }
+    }
+
     /// Apply finished detached warm results. A matching result uploads the
     /// warmed texture; a stale result is ignored because the background or
     /// material changed while it ran.
     fn drain_backdrop_warm(&mut self) {
         while let Ok(result) = self.backdrop_warm_rx.try_recv() {
-            let current = self.backdrop_warming.as_ref().is_some_and(
-                |(request, warming_mode, warming_path)| {
-                    *request == result.request
-                        && *warming_mode == result.mode
-                        && *warming_path == result.path
-                },
-            );
+            let current = self.backdrop_warming.as_ref().is_some_and(|warming| {
+                warming.request == result.request
+                    && warming.mode == result.mode
+                    && warming.path == result.path
+            });
             if current {
                 self.backdrop_warming = None;
             }
@@ -796,23 +1070,39 @@ impl IllnessApp {
                 continue;
             }
             match result.result {
-                Ok(()) => {
-                    if paints_backdrop(self.effective_material(), result.mode) {
-                        self.rebuild_backdrop();
+                Ok(outcome) => {
+                    self.backdrop_warm_failures = 0;
+                    self.backdrop_warm_retry_at = None;
+                    // A cold build painted no texture while another warm filled
+                    // the cache, so upload even when the decode was unchanged.
+                    if paints_backdrop(self.effective_material(), result.mode)
+                        && (outcome.changed || self.backdrop.is_none())
+                    {
+                        self.rebuild_backdrop_inner(false);
                     }
                 }
                 Err(error) if error == backdrop::WARM_CANCELLED => {
                     // A superseded leader can hand this live request a
-                    // cancellation; take over rather than toasting it.
+                    // cancellation; take over rather than toasting it. If the
+                    // cancelled leader still cached its completed decode,
+                    // upload that instead of decoding again.
                     if paints_backdrop(self.effective_material(), result.mode) {
-                        self.start_backdrop_warm(result.mode, result.path.clone());
+                        if backdrop::needs_warm(result.mode, &result.path) {
+                            self.start_backdrop_warm(result.mode, result.path.clone());
+                        } else {
+                            self.rebuild_backdrop_inner(false);
+                        }
                     }
                 }
                 Err(error) => {
-                    // A warm for a material that will render Solid must not
-                    // toast an image error the user cannot see.
                     if paints_backdrop(self.effective_material(), result.mode) {
-                        warm_error_toast(&self.ctx, &mut self.overlays, error);
+                        if result.mode == BackgroundMode::Image {
+                            // The cached image was evicted by the failed
+                            // revalidation; do not keep painting a deleted or
+                            // corrupt wallpaper.
+                            self.backdrop = None;
+                        }
+                        self.note_backdrop_warm_failure(result.mode, &result.path, error);
                     }
                 }
             }
@@ -916,7 +1206,7 @@ impl IllnessApp {
                 None => {
                     let family = self.config.font_family.clone();
                     if self.font_failure.as_deref() != Some(family.as_str()) {
-                        self.overlays.toast = Some(format!(
+                        self.overlays.set_toast(format!(
                             "Font \"{family}\" is unavailable; keeping {}",
                             self.applied_font_family
                         ));
@@ -961,10 +1251,11 @@ impl IllnessApp {
 
         if self.config.material != self.applied_requested_material {
             self.pending_material = true;
-            // An explicit new request abandons any earlier session fallback;
-            // `apply_material_to` re-establishes it if the request still fails.
+            // An explicit new request abandons any earlier session fallback and
+            // its bounded retry streak; `apply_material_to` re-establishes the
+            // failure state if the request still fails.
             self.material_fallback = false;
-            self.material_retry_at = None;
+            self.material_retry.reset();
             // Acrylic+Desktop has no painted in-window backdrop, so switching
             // to Mica or Image must load one now. A warmed texture is uploaded,
             // and a simultaneous background change is not rebuilt twice.
@@ -988,11 +1279,24 @@ impl IllnessApp {
                 // Do not leave the slider looking live when the tint cannot be
                 // reapplied: fall back exactly like a failed material apply.
                 // The request stays Acrylic and is retried on a healthy launch.
-                log::warn!("failed to re-apply the acrylic tint: {error}");
+                let first = self.material_retry.failures == 0;
                 self.material_fallback = true;
                 self.pending_material = true;
-                self.overlays.toast =
-                    Some("Acrylic tint is unavailable here; using Solid".to_string());
+                self.material_retry.note_failure(
+                    Instant::now(),
+                    self.native_transparency,
+                    self.config.material,
+                );
+                if first {
+                    log::warn!("failed to re-apply the acrylic tint: {error}");
+                    self.overlays
+                        .set_toast("Acrylic tint is unavailable here; using Solid");
+                } else {
+                    log::debug!(
+                        "acrylic tint retry {} failed: {error}",
+                        self.material_retry.failures
+                    );
+                }
                 self.arm_material_retry();
                 self.sync_backdrop_for_material(false);
             }
@@ -1026,7 +1330,8 @@ impl IllnessApp {
         }
         if let Err(error) = self.save_config() {
             log::warn!("failed to save config: {error}");
-            self.overlays.toast = Some(format!("Could not save config: {error}"));
+            self.overlays
+                .set_toast(format!("Could not save config: {error}"));
         }
     }
 
@@ -1130,7 +1435,7 @@ impl IllnessApp {
                 }
             }
             Err(error) => {
-                self.overlays.toast = Some(error);
+                self.overlays.set_toast(error);
             }
         }
     }
@@ -1162,7 +1467,8 @@ impl IllnessApp {
         let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) => text,
             Err(error) => {
-                self.overlays.toast = Some(format!("Clipboard unavailable: {error}"));
+                self.overlays
+                    .set_toast(format!("Clipboard unavailable: {error}"));
                 return;
             }
         };
@@ -1178,7 +1484,8 @@ impl IllnessApp {
 
     fn open_link(&mut self, url: &str) {
         if let Err(error) = open::that(url) {
-            self.overlays.toast = Some(format!("Could not open link: {error}"));
+            self.overlays
+                .set_toast(format!("Could not open link: {error}"));
         }
     }
 
@@ -1246,7 +1553,8 @@ impl IllnessApp {
 
         let found = tab.session.search(&query, request.forward);
         if found.is_none() {
-            self.overlays.toast = Some(format!("No matches for \"{query}\""));
+            self.overlays
+                .set_toast(format!("No matches for \"{query}\""));
         }
         if let Some((start_row, _, _, _)) = found
             && let Some(delta) = search_scroll_delta(start_row, snapshot.rows)
@@ -1357,9 +1665,11 @@ impl IllnessApp {
                     &mut self.material_fallback,
                     chosen,
                 );
-                self.material_retry_at = None;
+                self.material_retry.reset();
+                // The end-of-frame pending apply chooses the effective
+                // material and then syncs the backdrop once, so a toggle never
+                // uploads/drops a texture for the superseded material.
                 self.pending_material = true;
-                self.sync_backdrop_for_material(false);
                 self.persist();
             }
             Action::Copy => self.copy_selection(),
@@ -1381,7 +1691,7 @@ impl IllnessApp {
     }
 
     fn flash_bell(&mut self) {
-        self.overlays.toast = Some("Terminal bell".to_string());
+        self.overlays.set_toast("Terminal bell");
         let now = self.ctx.input(|input| input.time);
         self.bell_flash_until = now + BELL_FLASH_SECS;
         self.ctx.request_repaint_after(Duration::from_millis(200));
@@ -1614,6 +1924,8 @@ impl IllnessApp {
 impl IllnessApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.poll_backdrop_warm();
+        self.maybe_retry_backdrop_warm();
         self.maybe_retry_material();
 
         let ppp = ctx.pixels_per_point();
@@ -1938,20 +2250,9 @@ fn material_for_surface(
     }
 }
 
-/// Whether a failed native material may be retried now.
-fn material_retry_due(
-    fallback: bool,
-    available: bool,
-    requested: Material,
-    now: f64,
-    retry_at: Option<f64>,
-) -> bool {
-    fallback && available && requested != Material::Solid && retry_at.is_none_or(|at| now >= at)
-}
-
 /// Surface a warm failure even when no cursor blink or other repaint is due.
 fn warm_error_toast(ctx: &egui::Context, overlays: &mut OverlayState, error: String) {
-    overlays.toast = Some(error);
+    overlays.set_toast(error);
     ctx.request_repaint();
 }
 
@@ -2986,36 +3287,138 @@ mod tests {
 
     #[test]
     fn fallback_material_retry_waits_for_backoff_and_availability() {
+        let now = Instant::now();
+        let mut retry = MaterialRetryState::default();
+        retry.note_failure(now, true, Material::Mica);
+        assert_eq!(retry.failures, 1);
+        assert!(retry.first_failure(), "only the first failure toasts");
+        assert_eq!(retry.retry_at, now.checked_add(Duration::from_secs(2)));
         assert!(
-            !material_retry_due(true, true, Material::Mica, 1.0, Some(3.0)),
+            !retry.retry_due(true, true, Material::Mica, now + Duration::from_secs(1)),
             "a fresh failure must not be retried on every focus event"
         );
-        assert!(material_retry_due(
-            true,
-            true,
-            Material::Mica,
-            3.0,
-            Some(3.0)
-        ));
+        assert!(retry.retry_due(true, true, Material::Mica, now + Duration::from_secs(2)));
+        retry.clear_deadline();
         assert!(
-            material_retry_due(true, true, Material::Mica, 4.0, None),
+            retry.retry_due(true, true, Material::Mica, now),
             "a fallback without an armed deadline retries immediately"
         );
-        assert!(!material_retry_due(false, true, Material::Mica, 4.0, None));
+        assert!(!retry.retry_due(false, true, Material::Mica, now));
         assert!(
-            !material_retry_due(true, false, Material::Mica, 4.0, None),
+            !retry.retry_due(true, false, Material::Mica, now),
             "transparency effects off is not an apply-failure retry"
         );
         assert!(
-            !material_retry_due(true, true, Material::Solid, 4.0, None),
+            !retry.retry_due(true, true, Material::Solid, now),
             "an explicit Solid request never retries"
         );
     }
 
     #[test]
-    fn warm_error_toast_requests_a_repaint() {
+    fn material_retry_backoff_caps_after_consecutive_failures() {
+        let now = Instant::now();
+        let mut retry = MaterialRetryState::default();
+
+        retry.note_failure(now, true, Material::Mica);
+        assert_eq!(retry.retry_at, now.checked_add(Duration::from_secs(2)));
+        retry.note_failure(now, true, Material::Mica);
+        assert_eq!(retry.retry_at, now.checked_add(Duration::from_secs(4)));
+        retry.note_failure(now, true, Material::Mica);
+
+        assert!(
+            retry.exhausted(),
+            "the third consecutive failure must reach the cap"
+        );
+        assert_eq!(retry.retry_at, None, "the cap arms no further deadline");
+        assert!(
+            !retry.retry_due(true, true, Material::Mica, now + Duration::from_secs(3600)),
+            "a permanent apply failure must stop retrying forever"
+        );
+        assert!(!retry.first_failure(), "retries never re-toast");
+    }
+
+    #[test]
+    fn explicit_solid_resets_the_material_retry_streak() {
+        let now = Instant::now();
+        let mut retry = MaterialRetryState::default();
+        for _ in 0..MATERIAL_RETRY_CAP {
+            retry.note_failure(now, true, Material::Mica);
+        }
+        assert!(retry.exhausted());
+
+        // The user explicitly chooses Solid: reset and never arm another retry.
+        retry.reset();
+        assert!(!retry.exhausted());
+        assert_eq!(retry.retry_at, None);
+        retry.note_failure(now, true, Material::Solid);
+        assert_eq!(retry.retry_at, None);
+        assert!(
+            !retry.retry_due(true, true, Material::Solid, now),
+            "explicit Solid never schedules a native retry"
+        );
+
+        // An explicit native selection clears the old failed streak too.
+        retry.reset();
+        retry.note_failure(now, true, Material::Mica);
+        assert!(
+            retry.first_failure(),
+            "a new streak toasts its first failure"
+        );
+        assert_eq!(retry.failures, 1);
+    }
+
+    #[test]
+    fn retry_deadlines_use_host_time_not_last_frame_input() {
+        let armed_at = Instant::now();
+        let mut retry = MaterialRetryState::default();
+        retry.note_failure(armed_at, true, Material::Acrylic);
+
+        // Simulate an idle pause before a focus/theme event: the deadline is an
+        // absolute Instant, so the retry still waits the full backoff.
+        assert!(!retry.retry_due(
+            true,
+            true,
+            Material::Acrylic,
+            armed_at + Duration::from_millis(1)
+        ));
+        assert!(retry.retry_due(
+            true,
+            true,
+            Material::Acrylic,
+            armed_at + Duration::from_secs(2)
+        ));
+    }
+
+    #[test]
+    fn stuck_warm_can_be_superseded_after_the_timeout() {
+        let now = Instant::now();
+        let fresh = BackdropWarm {
+            request: 1,
+            mode: BackgroundMode::Image,
+            path: "slow.png".to_string(),
+            started: now - Duration::from_secs(1),
+        };
+        assert!(!fresh.is_stuck(now));
+
+        let stuck = BackdropWarm {
+            request: 2,
+            mode: BackgroundMode::Image,
+            path: "unc-slow.png".to_string(),
+            started: now - WARM_STUCK_AFTER - Duration::from_secs(1),
+        };
+        assert!(
+            stuck.is_stuck(now),
+            "a dead UNC warm must not block its pair forever"
+        );
+    }
+
+    #[test]
+    fn warm_error_toast_requests_a_repaint_and_restarts_its_deadline() {
         let ctx = egui::Context::default();
-        let mut overlays = OverlayState::default();
+        let mut overlays = OverlayState {
+            toast_deadline: Some(0.0),
+            ..OverlayState::default()
+        };
 
         warm_error_toast(&ctx, &mut overlays, "Could not decode image".to_string());
 
@@ -3023,6 +3426,10 @@ mod tests {
             overlays.toast.as_deref(),
             Some("Could not decode image"),
             "the warm failure must remain visible"
+        );
+        assert_eq!(
+            overlays.toast_deadline, None,
+            "a replaced toast must get a fresh deadline so it survives the frame"
         );
         assert!(
             ctx.has_requested_repaint(),

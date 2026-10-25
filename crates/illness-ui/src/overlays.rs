@@ -69,6 +69,13 @@ impl OverlayState {
     pub fn close(&mut self) {
         self.kind = OverlayKind::None;
     }
+
+    /// Show `message` and restart its lifetime. Replacing a toast must clear the
+    /// old deadline; otherwise the new message can expire on its first frame.
+    pub fn set_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(message.into());
+        self.toast_deadline = None;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1010,7 +1017,7 @@ fn background_image_row(
                         cleanup_imported_background(&previous, &path);
                         changed = true;
                     }
-                    Err(error) => state.toast = Some(error),
+                    Err(error) => state.set_toast(error),
                 }
             }
         });
@@ -1304,8 +1311,7 @@ fn profiles_section(
                         if duplicate {
                             // Reject the keystroke instead of deleting a profile
                             // from `Config::sanitized` later.
-                            state.toast =
-                                Some(format!("Profile name \"{trimmed}\" is already used"));
+                            state.set_toast(format!("Profile name \"{trimmed}\" is already used"));
                         } else {
                             let new_name = name.clone();
                             profile.name = new_name.clone();
@@ -1320,7 +1326,7 @@ fn profiles_section(
                     {
                         if profile.name.trim().is_empty() {
                             profile.name = start_name;
-                            state.toast = Some("Profile name cannot be empty".to_string());
+                            state.set_toast("Profile name cannot be empty".to_string());
                             changed = true;
                         }
                         state.profile_name_edit = None;
@@ -1361,8 +1367,10 @@ fn profiles_section(
                     }
                     let program = program.on_hover_text(&profile.program);
                     if program.lost_focus() && profile.program.trim().is_empty() {
-                        state.toast =
-                            Some(format!("Profile \"{}\" needs a program path", profile.name));
+                        state.set_toast(format!(
+                            "Profile \"{}\" needs a program path",
+                            profile.name
+                        ));
                     }
 
                     let browse =
@@ -1429,7 +1437,7 @@ fn profiles_section(
             args: Vec::new(),
             accent: Rgb::new(tokens.accent.r(), tokens.accent.g(), tokens.accent.b()),
         });
-        state.toast = Some(format!("Added \"{name}\"; choose its program"));
+        state.set_toast(format!("Added \"{name}\"; choose its program"));
         changed = true;
     }
 
@@ -1450,14 +1458,14 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
         "Alacritty",
         "https://github.com/alacritty/alacritty",
     ) {
-        state.toast = Some("Copied Alacritty link".to_string());
+        state.set_toast("Copied Alacritty link".to_string());
     }
     if link_row(ui, tokens, "egui", "https://github.com/emilk/egui") {
-        state.toast = Some("Copied egui link".to_string());
+        state.set_toast("Copied egui link".to_string());
     }
     if text_button(ui, tokens, "Copy license", false, Vec2::new(96.0, 24.0)).clicked() {
         ui.ctx().copy_text("MIT OR Apache-2.0".to_string());
-        state.toast = Some("Copied license".to_string());
+        state.set_toast("Copied license".to_string());
     }
 }
 
@@ -1925,6 +1933,20 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn replacing_a_toast_restarts_its_deadline() {
+        let mut state = OverlayState::default();
+
+        state.set_toast("first");
+        state.toast_deadline = Some(3.0);
+        state.set_toast("second");
+        assert_eq!(state.toast.as_deref(), Some("second"));
+        assert_eq!(
+            state.toast_deadline, None,
+            "a replacement must not inherit the old expiry"
+        );
     }
 
     #[test]

@@ -31,6 +31,11 @@ pub const MAX_BACKDROP_PIXELS: u64 = 32_000_000;
 /// loop without masking a wallpaper that becomes available later.
 const DESKTOP_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 
+/// At most this many wallpapers decode at once. A rapid sequence of unique
+/// picks queues behind the active decodes instead of starting every decode in
+/// parallel; queued requests that are cancelled exit before opening a file.
+const MAX_CONCURRENT_DECODES: usize = 2;
+
 /// Error string returned when a superseded warm exits. The app treats it as
 /// stale rather than a user-visible image failure.
 pub const WARM_CANCELLED: &str = "background warm cancelled";
@@ -51,6 +56,21 @@ pub enum BackdropBuild {
     Warming,
     /// The image is unusable and `String` is the user-facing reason.
     Failed(String),
+}
+
+/// What a detached warm did to the cache.
+///
+/// `changed` is true when the cache now holds a different decode or a new
+/// fallback. Revalidation warms usually report `false`, which lets the app skip
+/// a redundant texture upload for an unchanged file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WarmOutcome {
+    pub changed: bool,
+}
+
+impl WarmOutcome {
+    const UNCHANGED: Self = Self { changed: false };
+    const CHANGED: Self = Self { changed: true };
 }
 
 /// Cancellation handle for one detached warm.
@@ -102,10 +122,29 @@ pub fn tint_alpha(material: Material, opacity: f32) -> u8 {
 /// only reported as ready when there is no wallpaper source, or every reported
 /// source failed recently. Image mode is cache-only: a warmed image uploads in
 /// a few milliseconds, a cold one warms in the background.
+///
+/// Test/small-caller wrapper that resolves the Desktop candidates itself. The
+/// app resolves them once per rebuild and calls [`build_with`].
+#[cfg(test)]
 pub fn build(ctx: &Context, theme: &Theme, mode: BackgroundMode, path: &str) -> BackdropBuild {
+    if mode == BackgroundMode::Desktop {
+        return build_with(ctx, theme, mode, path, &desktop_candidates());
+    }
+    build_with(ctx, theme, mode, path, &[])
+}
+
+/// [`build`] with the Desktop candidate list resolved by the caller once per
+/// rebuild. `desktop` is ignored for non-Desktop modes.
+pub fn build_with(
+    ctx: &Context,
+    theme: &Theme,
+    mode: BackgroundMode,
+    path: &str,
+    desktop: &[PathBuf],
+) -> BackdropBuild {
     match mode {
         BackgroundMode::None => BackdropBuild::Ready(None),
-        BackgroundMode::Desktop => build_desktop(ctx, theme, &desktop_candidates()),
+        BackgroundMode::Desktop => build_desktop(ctx, theme, desktop),
         BackgroundMode::Image => {
             let trimmed = path.trim();
             if trimmed.is_empty() {
@@ -124,7 +163,7 @@ fn build_desktop(ctx: &Context, theme: &Theme, candidates: &[PathBuf]) -> Backdr
         return BackdropBuild::Ready(Some(upload(ctx, image, true)));
     }
     if candidates.is_empty() {
-        let image = gradient(theme);
+        let image = desktop_gradient(theme);
         cache_put(gradient_key(theme), image.clone());
         return BackdropBuild::Ready(Some(upload(ctx, image, false)));
     }
@@ -132,11 +171,8 @@ fn build_desktop(ctx: &Context, theme: &Theme, candidates: &[PathBuf]) -> Backdr
         // Every reported wallpaper source failed recently. The gradient is a
         // real fallback now; it must not short-circuit a cache lookup above.
         let key = gradient_key(theme);
-        let image = cached_key(&key).unwrap_or_else(|| {
-            let image = gradient(theme);
-            cache_put(key, image.clone());
-            image
-        });
+        let image = cached_key(&key).unwrap_or_else(|| desktop_gradient(theme));
+        cache_put(key, image.clone());
         return BackdropBuild::Ready(Some(upload(ctx, image, false)));
     }
     BackdropBuild::Warming
@@ -153,17 +189,18 @@ fn upload(ctx: &Context, image: ColorImage, from_image: bool) -> Backdrop {
 ///
 /// This is the detached-thread warm used only for a backdrop that actually
 /// paints (Mica+Desktop/Image cold switch) or the Acrylic+Desktop cache-only
-/// prewarm. Different paths warm concurrently; duplicate requests for one path
-/// join a single flight, so no process-wide lock spans I/O. `theme` is used for
-/// the gradient fallback when Desktop reports no usable wallpaper.
+/// prewarm. Different paths warm concurrently up to the decode cap; duplicate
+/// requests for one path join a single flight, so no process-wide lock spans
+/// I/O. `theme` is used for the gradient fallback when Desktop reports no
+/// usable wallpaper.
 pub fn warm_cache(
     theme: &Theme,
     mode: BackgroundMode,
     path: &str,
     token: &WarmToken,
-) -> Result<(), String> {
+) -> Result<WarmOutcome, String> {
     if mode == BackgroundMode::None {
-        return Ok(());
+        return Ok(WarmOutcome::UNCHANGED);
     }
     if token.is_cancelled() {
         return Err(WARM_CANCELLED.to_string());
@@ -176,32 +213,44 @@ pub fn warm_cache(
             if trimmed.is_empty() {
                 return Err("Choose a background image".to_string());
             }
-            load_blurred(Path::new(trimmed), token).map(|_| ())
+            load_blurred(Path::new(trimmed), token).map(|loaded| WarmOutcome {
+                changed: loaded.changed,
+            })
         }
-        BackgroundMode::None => Ok(()),
+        BackgroundMode::None => Ok(WarmOutcome::UNCHANGED),
     }
 }
 
-fn warm_desktop(theme: &Theme, candidates: &[PathBuf], token: &WarmToken) -> Result<(), String> {
+fn warm_desktop(
+    theme: &Theme,
+    candidates: &[PathBuf],
+    token: &WarmToken,
+) -> Result<WarmOutcome, String> {
     if candidates.is_empty() {
         cache_gradient(theme);
-        return Ok(());
+        return Ok(WarmOutcome::CHANGED);
     }
 
     // Try highest priority first. If a lower-priority transcoded copy is cached
     // but the reported wallpaper is not, this still refreshes the preferred
     // candidate before falling back to the cached copy.
+    let mut saw_failure = false;
     for candidate in candidates {
         if token.is_cancelled() {
             return Err(WARM_CANCELLED.to_string());
         }
         match load_blurred(candidate, token) {
-            Ok(_) => {
+            Ok(loaded) => {
                 clear_desktop_failure(candidates, candidate);
-                return Ok(());
+                return Ok(WarmOutcome {
+                    // A failed preferred source means the UI may still paint
+                    // the old one; report a change so it switches to this one.
+                    changed: loaded.changed || saw_failure,
+                });
             }
             Err(error) if error == WARM_CANCELLED => return Err(error),
             Err(error) => {
+                saw_failure = true;
                 record_desktop_failure(candidates, candidate);
                 log::debug!("background {} unavailable: {error}", candidate.display());
             }
@@ -214,7 +263,7 @@ fn warm_desktop(theme: &Theme, candidates: &[PathBuf], token: &WarmToken) -> Res
     // has become available.
     record_desktop_attempt_failed(candidates);
     cache_gradient(theme);
-    Ok(())
+    Ok(WarmOutcome::CHANGED)
 }
 
 /// Whether a detached warm is needed for this pair.
@@ -223,9 +272,17 @@ fn warm_desktop(theme: &Theme, candidates: &[PathBuf], token: &WarmToken) -> Res
 /// higher-priority source than the cached one (or any source when nothing is
 /// cached) is due for a retry.
 pub fn needs_warm(mode: BackgroundMode, path: &str) -> bool {
+    if mode == BackgroundMode::Desktop {
+        return needs_warm_with(mode, path, &desktop_candidates());
+    }
+    needs_warm_with(mode, path, &[])
+}
+
+/// [`needs_warm`] with the Desktop candidate list resolved by the caller.
+pub fn needs_warm_with(mode: BackgroundMode, path: &str, desktop: &[PathBuf]) -> bool {
     match mode {
         BackgroundMode::None => false,
-        BackgroundMode::Desktop => needs_warm_for_candidates(&desktop_candidates()),
+        BackgroundMode::Desktop => needs_warm_for_candidates(desktop),
         BackgroundMode::Image => {
             let trimmed = path.trim();
             !trimmed.is_empty() && cached_image_path(Path::new(trimmed)).is_none()
@@ -237,17 +294,28 @@ fn needs_warm_for_candidates(candidates: &[PathBuf]) -> bool {
     if candidates.is_empty() {
         return false;
     }
+    let mut state = desktop_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sync_failure_candidates(&mut state, candidates);
+    // One attempt tries every candidate. While that attempt's cooldown is
+    // active no candidate is retried, even if an individual failure entry has
+    // aged out.
+    if state.all_failed_at.is_some() {
+        return false;
+    }
+    let failed: Vec<bool> = candidates
+        .iter()
+        .map(|candidate| state.failed.contains_key(candidate))
+        .collect();
+    drop(state);
     let best = candidates
         .iter()
         .position(|candidate| cached_image_path(candidate).is_some());
     match best {
         Some(0) => false,
-        Some(index) => candidates[..index]
-            .iter()
-            .any(|candidate| !candidate_failed_recently(candidates, candidate)),
-        None => candidates
-            .iter()
-            .any(|candidate| !candidate_failed_recently(candidates, candidate)),
+        Some(index) => (0..index).any(|candidate| !failed[candidate]),
+        None => failed.iter().any(|failed| !failed),
     }
 }
 
@@ -277,7 +345,7 @@ fn first_cached_desktop(candidates: &[PathBuf]) -> Option<(ColorImage, usize)> {
         .find_map(|(index, candidate)| cached_image_path(candidate).map(|image| (image, index)))
 }
 
-fn desktop_candidates() -> Vec<PathBuf> {
+pub fn desktop_candidates() -> Vec<PathBuf> {
     let transcoded = std::env::var_os("APPDATA").map(|appdata| {
         PathBuf::from(appdata)
             .join("Microsoft")
@@ -308,28 +376,114 @@ fn desktop_wallpaper_candidates(
     candidates
 }
 
-/// Decode a wallpaper once per `(path, mtime)` and reuse the blurred result.
-///
-/// Warm thread only. Concurrent requests for the same path join one flight;
-/// requests for other paths proceed independently. The flight never holds the
-/// registry lock across open/decode/blur.
-fn load_blurred(path: &Path, token: &WarmToken) -> Result<ColorImage, String> {
+/// Whether a load decoded a fresh image or reused the cache.
+#[derive(Debug)]
+struct LoadedImage {
+    changed: bool,
+}
+
+/// Bounded decode admission. Held across `decode_image` (and the image blur),
+/// never while waiting for another flight.
+struct DecodeSemaphore {
+    slots: Mutex<usize>,
+    ready: Condvar,
+}
+
+impl DecodeSemaphore {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(MAX_CONCURRENT_DECODES),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+static DECODE_SEMAPHORE: OnceLock<DecodeSemaphore> = OnceLock::new();
+
+fn decode_semaphore() -> &'static DecodeSemaphore {
+    DECODE_SEMAPHORE.get_or_init(DecodeSemaphore::new)
+}
+
+struct DecodeSlot {
+    semaphore: &'static DecodeSemaphore,
+}
+
+impl Drop for DecodeSlot {
+    fn drop(&mut self) {
+        let mut slots = self
+            .semaphore
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slots += 1;
+        self.semaphore.ready.notify_one();
+    }
+}
+
+/// Wait for a decode slot, waking often enough that a cancelled request exits
+/// before it opens or decodes a file.
+fn acquire_decode_slot(token: &WarmToken) -> Result<DecodeSlot, String> {
+    let semaphore = decode_semaphore();
+    let mut slots = semaphore
+        .slots
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     loop {
         if token.is_cancelled() {
             return Err(WARM_CANCELLED.to_string());
         }
-        let key = image_key(path);
+        if *slots > 0 {
+            *slots -= 1;
+            return Ok(DecodeSlot { semaphore });
+        }
+        let (next, _) = semaphore
+            .ready
+            .wait_timeout(slots, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots = next;
+    }
+}
+
+/// Decode a wallpaper once per `(path, mtime)` and reuse the blurred result.
+///
+/// Warm thread only. Concurrent requests for the same path join one flight;
+/// requests for other paths decode at most [`MAX_CONCURRENT_DECODES`] at a
+/// time. The flight never holds the registry lock across open/decode/blur.
+fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
+    loop {
+        if token.is_cancelled() {
+            return Err(WARM_CANCELLED.to_string());
+        }
+        let (key, exists) = image_key_state(path);
+        if !exists {
+            evict_image_path(path);
+            return Err(format!("Could not load \"{}\"", path.display()));
+        }
         if let Some(cached) = cached_key(&key) {
-            return Ok(cached);
+            let _ = cached;
+            return Ok(LoadedImage { changed: false });
         }
 
         let warm_key = WarmKey::Image(path.to_path_buf());
         let (flight, leader) = begin_flight(warm_key.clone());
         if !leader {
             match wait_for_flight(&flight, token) {
-                Ok(()) => {
-                    return cached_image_path(path)
-                        .ok_or_else(|| format!("Could not load \"{}\"", path.display()));
+                Ok(outcome) => {
+                    // Never hand a joiner an image cached for another mtime:
+                    // the leader's result is only reusable when the current
+                    // `(path, mtime)` key still matches the cache.
+                    let (key, exists) = image_key_state(path);
+                    if !exists {
+                        evict_image_path(path);
+                        return Err(format!("Could not load \"{}\"", path.display()));
+                    }
+                    if let Some(cached) = cached_key(&key) {
+                        let _ = cached;
+                        return Ok(LoadedImage {
+                            changed: outcome.changed,
+                        });
+                    }
+                    continue;
                 }
                 // The leader was superseded. If this request is still live,
                 // take over instead of surfacing a stale cancellation.
@@ -341,39 +495,77 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<ColorImage, String> {
         let _registration = FlightRegistration { key: warm_key };
         // Re-check after becoming leader: another flight may have completed
         // between the lookup above and registration.
-        let outcome = if let Some(cached) = cached_key(&key) {
-            Ok(cached)
-        } else if token.is_cancelled() {
+        let outcome = if token.is_cancelled() {
             Err(WARM_CANCELLED.to_string())
         } else {
-            #[cfg(test)]
-            DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
-            match decode_image(path) {
-                Ok(image) => {
-                    let image = blurred(image);
-                    if token.is_cancelled() {
-                        Err(WARM_CANCELLED.to_string())
-                    } else {
-                        Ok(image)
+            let (key, exists) = image_key_state(path);
+            if !exists {
+                evict_image_path(path);
+                Err(format!("Could not load \"{}\"", path.display()))
+            } else if let Some(cached) = cached_key(&key) {
+                let _ = cached;
+                Ok(LoadedImage { changed: false })
+            } else {
+                match acquire_decode_slot(token) {
+                    Err(error) => Err(error),
+                    Ok(_slot) => {
+                        // A queued request may have waited long enough for the
+                        // file to change or for another decode to fill the
+                        // cache; re-resolve the mtime and check again.
+                        let (key, exists) = image_key_state(path);
+                        if token.is_cancelled() {
+                            Err(WARM_CANCELLED.to_string())
+                        } else if !exists {
+                            evict_image_path(path);
+                            Err(format!("Could not load \"{}\"", path.display()))
+                        } else if let Some(cached) = cached_key(&key) {
+                            let _ = cached;
+                            Ok(LoadedImage { changed: false })
+                        } else {
+                            #[cfg(test)]
+                            DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
+                            #[cfg(test)]
+                            let _active = ActiveDecode::enter();
+                            match decode_image(path) {
+                                Ok(image) => {
+                                    let image = blurred(image);
+                                    // Cache completed work before honoring
+                                    // cancellation, so a takeover/joiner can
+                                    // reuse it instead of decoding twice.
+                                    cache_put(key, image.clone());
+                                    #[cfg(test)]
+                                    if let Some(hook) = CANCEL_AFTER_DECODE
+                                        .lock()
+                                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                        .take()
+                                    {
+                                        hook.cancel();
+                                    }
+                                    if token.is_cancelled() {
+                                        Err(WARM_CANCELLED.to_string())
+                                    } else {
+                                        Ok(LoadedImage { changed: true })
+                                    }
+                                }
+                                Err(error) => {
+                                    evict_image_path(path);
+                                    Err(error)
+                                }
+                            }
+                        }
                     }
                 }
-                Err(error) => Err(error),
             }
         };
 
-        let result = match outcome {
-            Ok(image) => {
-                cache_put(key, image.clone());
-                Ok(image)
-            }
-            Err(error) => Err(error),
-        };
-        let published = match &result {
-            Ok(_) => Ok(()),
+        let published = match &outcome {
+            Ok(loaded) => Ok(WarmOutcome {
+                changed: loaded.changed,
+            }),
             Err(error) => Err(error.clone()),
         };
         publish_flight(&flight, published);
-        return result;
+        return outcome;
     }
 }
 
@@ -424,7 +616,7 @@ enum CacheKey {
         modified: Option<SystemTime>,
     },
     Gradient {
-        theme: String,
+        theme: &'static str,
     },
 }
 
@@ -439,11 +631,43 @@ const CACHE_CAPACITY: usize = 4;
 static CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
 static WARMS: OnceLock<Mutex<HashMap<WarmKey, Arc<Flight>>>> = OnceLock::new();
 static DESKTOP_FAILURES: OnceLock<Mutex<DesktopFailureState>> = OnceLock::new();
+static DESKTOP_GRADIENT: OnceLock<Mutex<Option<(&'static str, ColorImage)>>> = OnceLock::new();
 
 #[cfg(test)]
 static DECODE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static METADATA_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static ACTIVE_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static PEAK_DECODES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static DECODE_DELAY_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static CANCEL_AFTER_DECODE: Mutex<Option<WarmToken>> = Mutex::new(None);
+
+#[cfg(test)]
+struct ActiveDecode;
+
+#[cfg(test)]
+impl ActiveDecode {
+    fn enter() -> Self {
+        let active = ACTIVE_DECODES.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK_DECODES.fetch_max(active, Ordering::SeqCst);
+        let delay = DECODE_DELAY_MS.load(Ordering::SeqCst);
+        if delay > 0 {
+            std::thread::sleep(Duration::from_millis(delay));
+        }
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ActiveDecode {
+    fn drop(&mut self) {
+        ACTIVE_DECODES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 fn cache() -> &'static Mutex<Vec<CacheEntry>> {
     CACHE.get_or_init(|| Mutex::new(Vec::new()))
@@ -460,7 +684,7 @@ enum WarmKey {
 
 #[derive(Default)]
 struct Flight {
-    result: Mutex<Option<Result<(), String>>>,
+    result: Mutex<Option<Result<WarmOutcome, String>>>,
     ready: Condvar,
 }
 
@@ -492,7 +716,7 @@ fn begin_flight(key: WarmKey) -> (Arc<Flight>, bool) {
     (flight, true)
 }
 
-fn publish_flight(flight: &Flight, result: Result<(), String>) {
+fn publish_flight(flight: &Flight, result: Result<WarmOutcome, String>) {
     let mut slot = flight
         .result
         .lock()
@@ -501,7 +725,7 @@ fn publish_flight(flight: &Flight, result: Result<(), String>) {
     flight.ready.notify_all();
 }
 
-fn wait_for_flight(flight: &Flight, token: &WarmToken) -> Result<(), String> {
+fn wait_for_flight(flight: &Flight, token: &WarmToken) -> Result<WarmOutcome, String> {
     let mut slot = flight
         .result
         .lock()
@@ -566,7 +790,13 @@ fn record_desktop_attempt_failed(candidates: &[PathBuf]) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     sync_failure_candidates(&mut state, candidates);
-    state.all_failed_at = Some(Instant::now());
+    let now = Instant::now();
+    // Re-stamp every candidate so a slow later candidate cannot let an earlier
+    // failure age out mid-attempt and immediately re-warm the same UNC path.
+    for candidate in candidates {
+        state.failed.insert(candidate.clone(), now);
+    }
+    state.all_failed_at = Some(now);
 }
 
 fn clear_desktop_failure(candidates: &[PathBuf], path: &Path) {
@@ -578,14 +808,6 @@ fn clear_desktop_failure(candidates: &[PathBuf], path: &Path) {
     state.all_failed_at = None;
 }
 
-fn candidate_failed_recently(candidates: &[PathBuf], path: &Path) -> bool {
-    let mut state = desktop_failures()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sync_failure_candidates(&mut state, candidates);
-    state.failed.contains_key(path)
-}
-
 fn all_candidates_failed(candidates: &[PathBuf]) -> bool {
     if candidates.is_empty() {
         return false;
@@ -594,35 +816,53 @@ fn all_candidates_failed(candidates: &[PathBuf]) -> bool {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     sync_failure_candidates(&mut state, candidates);
+    // `all_failed_at` is the authority: individual failure timestamps may have
+    // been pruned during a slow multi-candidate attempt. It is cleared by the
+    // cooldown or any candidate-list change.
     state.all_failed_at.is_some()
-        && candidates
-            .iter()
-            .all(|candidate| state.failed.contains_key(candidate))
 }
 
 fn cache_gradient(theme: &Theme) {
     let key = gradient_key(theme);
     if cached_key(&key).is_none() {
-        cache_put(key, gradient(theme));
+        cache_put(key, desktop_gradient(theme));
     }
 }
 
-fn image_key(path: &Path) -> CacheKey {
+fn image_key_state(path: &Path) -> (CacheKey, bool) {
     #[cfg(test)]
     METADATA_COUNT.fetch_add(1, Ordering::Relaxed);
-    let modified = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-    CacheKey::Image {
-        path: path.to_path_buf(),
-        modified,
-    }
+    let metadata = std::fs::metadata(path);
+    let exists = metadata.is_ok();
+    let modified = metadata.ok().and_then(|metadata| metadata.modified().ok());
+    (
+        CacheKey::Image {
+            path: path.to_path_buf(),
+            modified,
+        },
+        exists,
+    )
+}
+
+#[cfg(test)]
+fn image_key(path: &Path) -> CacheKey {
+    image_key_state(path).0
+}
+
+fn evict_image_path(path: &Path) {
+    let mut cache = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| {
+        !matches!(
+            &entry.key,
+            CacheKey::Image { path: cached, .. } if cached == path
+        )
+    });
 }
 
 fn gradient_key(theme: &Theme) -> CacheKey {
-    CacheKey::Gradient {
-        theme: theme.name.to_string(),
-    }
+    CacheKey::Gradient { theme: theme.name }
 }
 
 fn cached_key(key: &CacheKey) -> Option<ColorImage> {
@@ -675,6 +915,24 @@ fn blurred(image: image::DynamicImage) -> ColorImage {
         .to_rgba8();
     let blurred = image::imageops::blur(&small, 9.0);
     ColorImage::from_rgba_unmultiplied([640, 360], blurred.as_raw())
+}
+
+/// Theme gradient reused by Desktop fallbacks. Kept outside the LRU so an
+/// Image/other entry cannot evict it and force a 512×512 regeneration on the UI
+/// thread.
+fn desktop_gradient(theme: &Theme) -> ColorImage {
+    let mut slot = DESKTOP_GRADIENT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((name, image)) = slot.as_ref()
+        && *name == theme.name
+    {
+        return image.clone();
+    }
+    let image = gradient(theme);
+    *slot = Some((theme.name, image.clone()));
+    image
 }
 
 fn gradient(theme: &Theme) -> ColorImage {
@@ -738,6 +996,18 @@ mod tests {
         path
     }
 
+    fn write_solid(dir: &Path, name: &str, color: [u8; 4]) -> PathBuf {
+        let path = dir.join(name);
+        image::RgbaImage::from_pixel(16, 16, image::Rgba(color))
+            .save(&path)
+            .expect("write solid image");
+        path
+    }
+
+    fn dominant(pixel: Color32) -> (u8, u8, u8) {
+        (pixel.r(), pixel.g(), pixel.b())
+    }
+
     #[test]
     fn opacity_zero_is_solid_and_full_keeps_material_strength() {
         for material in [Material::Mica, Material::Acrylic, Material::Solid] {
@@ -782,7 +1052,9 @@ mod tests {
 
         let loaded =
             load_blurred(&path, &WarmToken::new()).expect("extensionless image should decode");
-        assert_eq!(loaded.size, [640, 360]);
+        assert!(loaded.changed, "a fresh decode reports a cache change");
+        let cached = cached_image_path(&path).expect("decoded image should be cached");
+        assert_eq!(cached.size, [640, 360]);
 
         assert!(
             cached_key(&image_key(&path)).is_some(),
@@ -862,8 +1134,8 @@ mod tests {
             Err(WARM_CANCELLED.to_string())
         );
 
-        publish_flight(&flight_a, Ok(()));
-        publish_flight(&flight_b, Ok(()));
+        publish_flight(&flight_a, Ok(WarmOutcome::UNCHANGED));
+        publish_flight(&flight_b, Ok(WarmOutcome::UNCHANGED));
         drop(FlightRegistration {
             key: WarmKey::Image(PathBuf::from("independent-a.png")),
         });
@@ -1143,5 +1415,215 @@ mod tests {
             desktop_wallpaper_candidates(Some(path.clone()), Some(path.clone())),
             vec![path]
         );
+    }
+
+    #[test]
+    fn same_path_wallpaper_change_is_revalidated_and_refreshed() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let theme = Theme::by_name("Illness Dark");
+        let path = write_solid(&dir, "wallpaper.png", [255, 0, 0, 255]);
+        let text = path.to_string_lossy().into_owned();
+
+        warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new()).expect("warm red");
+        let red = cached_image_path(&path).expect("red cached");
+        let (r, _, b) = dominant(red.pixels[0]);
+        assert!(r > 200 && b < 60, "expected red, got {r}/{b}");
+
+        // Rewrite the file in place at the same path (new mtime, same length).
+        std::thread::sleep(Duration::from_millis(30));
+        write_solid(&dir, "wallpaper.png", [0, 0, 255, 255]);
+
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let outcome = warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new())
+            .expect("revalidate changed wallpaper");
+        assert!(outcome.changed, "a new mtime must report a fresh decode");
+        assert!(
+            DECODE_COUNT.load(Ordering::Relaxed) > decodes,
+            "the in-place change must be decoded off-thread"
+        );
+        let blue = cached_image_path(&path).expect("refreshed cache");
+        let (r, _, b) = dominant(blue.pixels[0]);
+        assert!(
+            b > 200 && r < 60,
+            "expected the new blue image, got {r}/{b}"
+        );
+
+        // A second revalidation at the same mtime is a path hit, not a decode.
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let outcome = warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new())
+            .expect("revalidate unchanged wallpaper");
+        assert!(!outcome.changed);
+        assert_eq!(DECODE_COUNT.load(Ordering::Relaxed), decodes);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deleting_the_wallpaper_evicts_the_stale_cache() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let theme = Theme::by_name("Illness Dark");
+        let path = write_solid(&dir, "gone.png", [0, 200, 0, 255]);
+        let text = path.to_string_lossy().into_owned();
+
+        warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new()).expect("warm image");
+        assert!(cached_image_path(&path).is_some());
+
+        std::fs::remove_file(&path).expect("delete wallpaper");
+        let error = warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new())
+            .expect_err("a deleted wallpaper must fail revalidation");
+        assert!(error.contains("Could not load"), "{error}");
+        assert!(
+            cached_image_path(&path).is_none(),
+            "deletion must evict the stale blur instead of painting it forever"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn all_failed_cooldown_survives_a_slow_second_candidate() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let first = dir.join("slow-first.png");
+        let second = dir.join("slow-second.png");
+        let candidates = vec![first.clone(), second.clone()];
+
+        record_desktop_failure(&candidates, &first);
+        record_desktop_attempt_failed(&candidates);
+        assert!(all_candidates_failed(&candidates));
+        assert!(!needs_warm_for_candidates(&candidates));
+
+        // Simulate the first candidate's timestamp ageing out while the second
+        // candidate was still doing slow UNC I/O.
+        {
+            let mut state = desktop_failures()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.failed.insert(
+                first.clone(),
+                Instant::now() - DESKTOP_FAILURE_COOLDOWN - Duration::from_secs(1),
+            );
+        }
+        assert!(
+            all_candidates_failed(&candidates),
+            "the attempt-level cooldown must govern after a slow second candidate"
+        );
+        assert!(
+            !needs_warm_for_candidates(&candidates),
+            "no repeat slow UNC I/O during the cooldown"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cancelled_decode_is_cached_for_a_takeover() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_image(&dir, "cancelled.png", 320, 200);
+        let token = WarmToken::new();
+        *CANCEL_AFTER_DECODE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.clone());
+
+        let error = load_blurred(&path, &token).expect_err("cancellation must be reported");
+        assert_eq!(error, WARM_CANCELLED);
+        assert!(
+            cached_image_path(&path).is_some(),
+            "completed decode work must be cached before cancellation"
+        );
+
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let loaded = load_blurred(&path, &WarmToken::new()).expect("takeover reuses the cache");
+        assert!(!loaded.changed);
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            decodes,
+            "a joiner/takeover must not decode the same wallpaper twice"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn joiner_rejects_a_cache_entry_for_another_mtime() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_solid(&dir, "joined.png", [255, 0, 0, 255]);
+
+        warm_cache(
+            Theme::by_name("Illness Dark"),
+            BackgroundMode::Image,
+            &path.to_string_lossy(),
+            &WarmToken::new(),
+        )
+        .expect("cache red");
+        assert!(cached_image_path(&path).is_some());
+
+        let key = WarmKey::Image(path.clone());
+        let (flight, leader) = begin_flight(key.clone());
+        assert!(leader);
+
+        // The old flight is still "decoding" while the file changes at the
+        // same path; the joiner must not accept the red cache entry for it.
+        std::thread::sleep(Duration::from_millis(30));
+        write_solid(&dir, "joined.png", [0, 0, 255, 255]);
+        let joiner_path = path.clone();
+        let joiner = std::thread::spawn(move || load_blurred(&joiner_path, &WarmToken::new()));
+        std::thread::sleep(Duration::from_millis(25));
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        publish_flight(&flight, Ok(WarmOutcome::UNCHANGED));
+        drop(FlightRegistration { key });
+
+        let loaded = joiner
+            .join()
+            .expect("joiner thread")
+            .expect("joiner must decode the current mtime");
+        assert!(loaded.changed);
+        assert!(DECODE_COUNT.load(Ordering::Relaxed) > decodes);
+        let blue = cached_image_path(&path).expect("current cache");
+        let (r, _, b) = dominant(blue.pixels[0]);
+        assert!(
+            b > 200 && r < 60,
+            "joiner accepted the stale image: {r}/{b}"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn concurrent_unique_decodes_are_capped() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let theme = Theme::by_name("Illness Dark");
+        let paths: Vec<_> = (0..4)
+            .map(|index| write_image(&dir, &format!("unique-{index}.png"), 1024, 768))
+            .collect();
+        PEAK_DECODES.store(0, Ordering::SeqCst);
+        DECODE_DELAY_MS.store(60, Ordering::SeqCst);
+
+        let workers: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                let text = path.to_string_lossy().into_owned();
+                std::thread::spawn(move || {
+                    warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new())
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("warm thread").expect("warm image");
+        }
+        let peak = PEAK_DECODES.load(Ordering::SeqCst);
+        DECODE_DELAY_MS.store(0, Ordering::SeqCst);
+
+        assert!(
+            peak <= MAX_CONCURRENT_DECODES,
+            "peak decode concurrency {peak} exceeded {MAX_CONCURRENT_DECODES}"
+        );
+        assert!(peak >= 2, "the cap should still allow concurrent work");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
