@@ -14,7 +14,9 @@ use illness_term::{
 use illness_ui::chrome::{self, Action, ChromeState, TabInfo};
 use illness_ui::overlays::{self, OverlayKind, OverlayState, SearchRequest};
 use illness_ui::terminal::SearchState;
-use illness_ui::{TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas};
+use illness_ui::{
+    TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas, gpu::GpuText,
+};
 use raw_window_handle::HasWindowHandle;
 
 use crate::{backdrop, platform};
@@ -69,6 +71,8 @@ pub struct IllnessApp {
     applied_background_opacity: f32,
     /// Family whose load failed, so the toast is not repeated every change.
     font_failure: Option<String>,
+    /// GPU glyph compositor, when a wgpu device and `gpu_text` are available.
+    gpu_text: Option<Arc<GpuText>>,
     window_title: String,
     backdrop: Option<egui::TextureHandle>,
 
@@ -117,6 +121,18 @@ impl IllnessApp {
         }
         let line_height = config.line_height;
         let background_opacity = config.background_opacity;
+        let gpu_text = if config.gpu_text {
+            cc.wgpu_render_state
+                .as_ref()
+                .map(|state| Arc::new(GpuText::new(state)))
+        } else {
+            None
+        };
+        if gpu_text.is_some() {
+            log::info!("GPU text compositor enabled");
+        } else {
+            log::info!("GPU text unavailable or disabled; using the CPU compositor");
+        }
 
         let mut app = Self {
             ctx,
@@ -138,6 +154,7 @@ impl IllnessApp {
             applied_background: None,
             applied_background_opacity: background_opacity,
             font_failure: None,
+            gpu_text,
             window_title: "Illness".to_string(),
             backdrop: None,
             window_focused: false,
@@ -433,7 +450,14 @@ impl IllnessApp {
 
         if (self.config.line_height - self.applied_line_height).abs() > f32::EPSILON {
             self.atlas.set_line_height(self.config.line_height);
+            if let Some(gpu) = &self.gpu_text {
+                gpu.reset();
+            }
             self.applied_line_height = self.config.line_height;
+        }
+
+        if !self.config.gpu_text {
+            self.gpu_text = None;
         }
 
         let background = (self.config.background, self.config.background_path.clone());
@@ -485,6 +509,9 @@ impl IllnessApp {
         self.config.font_size = size;
         self.atlas
             .set_size(&self.ctx, size, self.ctx.pixels_per_point());
+        if let Some(gpu) = &self.gpu_text {
+            gpu.reset();
+        }
         self.applied_font_size = size;
         self.persist();
     }
@@ -495,6 +522,9 @@ impl IllnessApp {
     /// two faces with identical metrics would otherwise keep the old pixels.
     /// Public view state (scroll, search, pointer/IME anchors) is preserved.
     fn invalidate_terminal_surfaces(&mut self) {
+        if let Some(gpu) = &self.gpu_text {
+            gpu.reset();
+        }
         for entry in &mut self.tabs {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
@@ -1021,6 +1051,9 @@ impl eframe::App for IllnessApp {
         let ppp = ctx.pixels_per_point();
         if (ppp - self.applied_ppp).abs() > f32::EPSILON {
             self.atlas.set_size(&ctx, self.config.font_size, ppp);
+            if let Some(gpu) = &self.gpu_text {
+                gpu.reset();
+            }
             self.applied_ppp = ppp;
             ctx.request_repaint();
         }
@@ -1111,6 +1144,7 @@ impl eframe::App for IllnessApp {
             let theme = self.theme;
             let atlas = &mut self.atlas;
             let tabs = &mut self.tabs;
+            let gpu_text = self.gpu_text.as_ref();
 
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let Some(TabEntry::Terminal(tab)) = tabs.get_mut(active) else {
@@ -1126,9 +1160,9 @@ impl eframe::App for IllnessApp {
                     return;
                 };
 
-                let response = tab
-                    .view
-                    .show(ui, &tab.session, theme, config, tokens, atlas);
+                let response =
+                    tab.view
+                        .show(ui, &tab.session, theme, config, tokens, atlas, gpu_text);
                 terminal_rect = Some(response.response.rect);
                 terminal_actions = response.actions;
                 if response.response.secondary_clicked()

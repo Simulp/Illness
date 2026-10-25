@@ -42,6 +42,9 @@ pub struct SurfaceSpec<'a> {
     pub material: Material,
     pub show_cursor: bool,
     pub search: Option<&'a SearchState>,
+    /// Paint glyph pixels. `false` keeps backgrounds, decorations, and the
+    /// cursor fill so a GPU pass can draw the glyph quads on top.
+    pub text: bool,
     pub theme: &'a Theme,
     pub tokens: &'a Tokens,
     pub font_size: f32,
@@ -159,7 +162,6 @@ pub fn render_surface(
             cell_height,
         );
     }
-
     Some(surface.finish(design::material_alpha(spec.material)))
 }
 
@@ -180,6 +182,7 @@ pub fn fingerprint(snapshot: &Snapshot, spec: &SurfaceSpec<'_>) -> u64 {
     spec.line_height.to_bits().hash(&mut hasher);
     material_tag(spec.material).hash(&mut hasher);
     spec.show_cursor.hash(&mut hasher);
+    spec.text.hash(&mut hasher);
 
     match spec.search {
         Some(search) => {
@@ -405,6 +408,7 @@ fn paint_text(
             let y1 = y0 + cell_height;
 
             if cell.ch != ' '
+                && spec.text
                 && let Some(glyph) = atlas.soft_glyph(cell.ch, glyph_style(flags))
                 && glyph.width > 0
                 && glyph.height > 0
@@ -420,7 +424,8 @@ fn paint_text(
 
             // Combining marks share the base cell's origin and never advance.
             for &mark in snapshot.zero_width(cell) {
-                if let Some(glyph) = atlas.soft_glyph(mark, glyph_style(flags))
+                if spec.text
+                    && let Some(glyph) = atlas.soft_glyph(mark, glyph_style(flags))
                     && glyph.width > 0
                     && glyph.height > 0
                 {
@@ -493,6 +498,7 @@ fn paint_cursor(
                         | CellFlags::WIDE_CHAR_SPACER
                         | CellFlags::LEADING_WIDE_CHAR_SPACER,
                 ) && cell.ch != ' '
+                    && spec.text
                     && let Some(glyph) = atlas.soft_glyph(cell.ch, glyph_style(flags))
                     && glyph.width > 0
                     && glyph.height > 0
@@ -506,7 +512,8 @@ fn paint_cursor(
                     }
                 }
                 for &mark in snapshot.zero_width(cell) {
-                    if let Some(glyph) = atlas.soft_glyph(mark, glyph_style(flags))
+                    if spec.text
+                        && let Some(glyph) = atlas.soft_glyph(mark, glyph_style(flags))
                         && glyph.width > 0
                         && glyph.height > 0
                     {
@@ -695,6 +702,7 @@ mod tests {
             material: Material::Mica,
             show_cursor: false,
             search: None,
+            text: true,
             theme,
             tokens,
             font_size: 14.0,
@@ -771,6 +779,45 @@ mod tests {
         let marked = fingerprint(&snapshot, &spec);
         assert_ne!(before, marked);
         assert_eq!(marked, fingerprint(&snapshot, &spec));
+    }
+
+    /// The GPU path reuses this compositor for backgrounds and decorations.
+    #[test]
+    fn text_can_be_omitted_without_losing_decorations() {
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 14.0, 1.0);
+        let theme = Theme::by_name("Illness Dark");
+        let tokens = Tokens::from_theme(theme);
+        let metrics = atlas.metrics();
+        let rect = Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(
+                (metrics.width_px * 4) as f32,
+                (metrics.height_px * 2) as f32,
+            ),
+        );
+        let mut spec = themed_spec(rect, theme, &tokens);
+        spec.material = Material::Solid;
+
+        let mut snapshot = Snapshot::empty(4, 2);
+        snapshot.cells[0].ch = 'A';
+        snapshot.cells[0].flags = CellFlags::UNDERLINE;
+
+        let with_text = render_surface(&mut atlas, &snapshot, &spec).expect("text surface");
+        spec.text = false;
+        let without_text = render_surface(&mut atlas, &snapshot, &spec).expect("plain surface");
+
+        assert_ne!(with_text.pixels, without_text.pixels);
+        let fg = design::color(theme.fg);
+        let underline_y = metrics.height_px as usize - 1;
+        for x in 0..metrics.width_px as usize {
+            let pixel = without_text.pixels[underline_y * without_text.size[0] + x];
+            assert_eq!(
+                (pixel.r(), pixel.g(), pixel.b()),
+                (fg.r(), fg.g(), fg.b()),
+                "underline should stay on the CPU surface"
+            );
+        }
     }
 
     #[test]

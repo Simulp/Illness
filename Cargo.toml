@@ -24,6 +24,7 @@ arboard = "3.7"
 open = "5"
 alacritty_terminal = "0.26.0"
 egui = "0.37"
+egui-wgpu = "0.37"
 eframe = { version = "0.37", features = ["wgpu"] }
 swash = "0.2.10"
 fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] }

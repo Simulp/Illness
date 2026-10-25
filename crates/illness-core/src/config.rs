@@ -59,6 +59,9 @@ pub struct Config {
     pub default_profile: String,
     pub copy_on_select: bool,
     pub profiles: Vec<Profile>,
+    /// Draw terminal glyphs with the GPU compositor when a wgpu device is
+    /// available. `false` always uses the CPU ClearType surface.
+    pub gpu_text: bool,
 }
 
 impl Default for Config {
@@ -79,6 +82,7 @@ impl Default for Config {
             default_profile: String::new(),
             copy_on_select: false,
             profiles: Vec::new(),
+            gpu_text: true,
         }
         .sanitized()
     }
@@ -245,6 +249,7 @@ mod tests {
         assert!(config.default_profile.is_empty());
         assert!(!config.copy_on_select);
         assert!(config.profiles.is_empty());
+        assert!(config.gpu_text);
     }
 
     #[test]
@@ -279,6 +284,12 @@ mod tests {
         assert_eq!(loaded, config);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_gpu_text_defaults_to_enabled() {
+        let parsed: Config = toml::from_str("theme = \"Nord\"\n").expect("parse config");
+        assert!(parsed.gpu_text);
     }
 
     #[test]

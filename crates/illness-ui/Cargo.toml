@@ -11,6 +11,7 @@ illness-term.workspace = true
 anyhow.workspace = true
 log.workspace = true
 egui.workspace = true
+egui-wgpu.workspace = true
 swash.workspace = true
 fontdb.workspace = true
 open.workspace = true

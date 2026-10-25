@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -16,6 +17,7 @@ use illness_term::{
 
 use crate::design::{self, Tokens};
 use crate::glyph::{CellMetrics, GlyphAtlas, GlyphStyle};
+use crate::gpu::GpuText;
 use crate::soft::{self, SurfaceSpec};
 
 /// Unique texture names, since every tab owns its own cached surface.
@@ -84,6 +86,7 @@ impl TerminalView {
         config: &Config,
         tokens: &Tokens,
         atlas: &mut GlyphAtlas,
+        gpu_text: Option<&Arc<GpuText>>,
     ) -> TerminalResponse {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let ppp = ui.ctx().pixels_per_point();
@@ -146,12 +149,21 @@ impl TerminalView {
             material: config.material,
             show_cursor,
             search: search.as_ref(),
+            text: true,
             theme,
             tokens,
             font_size: config.font_size,
             line_height: config.line_height,
         };
-        if !self.paint_soft(ui, &painter, atlas, &snapshot, &spec) {
+        // Pack glyphs before the CPU pass so an atlas failure can turn text
+        // back on without drawing the same glyphs twice.
+        let gpu_frame = gpu_text
+            .filter(|gpu| !gpu.failed())
+            .and_then(|gpu| gpu.build_frame(atlas, &snapshot, &spec));
+        let mut spec = spec;
+        spec.text = gpu_frame.is_none();
+        let soft_painted = self.paint_soft(ui, &painter, atlas, &snapshot, &spec);
+        if !soft_painted {
             painter.rect_filled(rect, 0.0, design::color(theme.bg));
             paint_backgrounds(&painter, &snapshot, theme, origin, &metrics, cols, rows);
             paint_selection(&painter, &selection, origin, &metrics, tokens);
@@ -171,6 +183,10 @@ impl TerminalView {
                     &painter, atlas, &snapshot, theme, origin, &metrics, cols, rows, ppp,
                 );
             }
+        } else if let Some(frame) = gpu_frame
+            && !frame.is_empty()
+        {
+            painter.add(frame.into_shape(rect));
         }
         if blinking && snapshot.cursor.visible {
             // Wake up when the cursor needs to flip.
