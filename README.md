@@ -28,11 +28,14 @@ antialiasing (no ClearType color fringing).
   blur where Windows 10/11 expose it, and also falls back to Solid. Acrylic's Desktop mode is
   native behind-window blur; Mica's Desktop mode paints a decoded, blurred snapshot of the
   current wallpaper that is refreshed when the backdrop is rebuilt, not continuously live.
-  Image uses the chosen custom image. The opacity slider affects a painted backdrop (Mica with
-  Desktop or a loaded image) and Acrylic (including Acrylic with Background set to None, through
-  its accent tint); Solid, Mica with no background, and Mica with an image that failed to load
-  ignore it. Native materials also require Windows transparency effects to be on; otherwise
-  Illness stays Solid.
+  Image uses the chosen custom image. Wallpapers are decoded and blurred on a detached thread,
+  so switching to Mica or Image uploads an already-warmed texture instead of stalling the UI.
+  The opacity slider affects a painted backdrop (Mica with Desktop or a loaded image) and
+  Acrylic (including Acrylic with Background set to None, through its accent tint); Solid,
+  Mica with no background, and Mica with an image that failed to load ignore it. Native
+  materials also require Windows transparency effects to be on; otherwise Illness stays Solid
+  but keeps the request in Settings as "(unavailable)". Turning transparency effects back on,
+  or re-selecting the material, retries it without a restart.
 - Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and Settings (`Ctrl+,`).
 - Seven themes: Illness Dark, Campbell, One Half Dark, Nord, Gruvbox Dark, Solarized Dark, Light.
 - Crisp terminal grid with system fallback for CJK and emoji; wide cells, combining marks,

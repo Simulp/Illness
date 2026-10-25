@@ -7,7 +7,7 @@ use egui::{
     PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, ViewportCommand,
     pos2, vec2,
 };
-use illness_core::{Config, CursorKind, Theme};
+use illness_core::{Config, CursorKind, Material, Theme};
 use illness_term::snapshot::CellFlags;
 use illness_term::{
     Color, GridSize, Key, KeyInput, KeyModes, Mods, MouseButton, MousePhase, SelectionSpan,
@@ -194,6 +194,7 @@ impl TerminalView {
         tokens: &Tokens,
         atlas: &mut GlyphAtlas,
         gpu_text: Option<&Arc<GpuText>>,
+        material: Material,
     ) -> TerminalResponse {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         let ppp = ui.ctx().pixels_per_point();
@@ -306,7 +307,7 @@ impl TerminalView {
             rect: content_rect,
             ppp,
             padding,
-            material: config.material,
+            material,
             show_cursor,
             search: search.as_ref(),
             text: true,

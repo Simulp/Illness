@@ -26,6 +26,17 @@ pub struct Backdrop {
     pub from_image: bool,
 }
 
+/// What a UI-thread backdrop build could do for this material/mode pair.
+pub enum BackdropBuild {
+    /// A paintable texture is ready (or this pair paints nothing).
+    Ready(Option<Backdrop>),
+    /// The blurred image is not cached yet. A background warm was started by
+    /// the app; paint native Mica/theme until it reports back.
+    Warming,
+    /// The image is unusable and `String` is the user-facing reason.
+    Failed(String),
+}
+
 /// Tint alpha painted over the backdrop. `opacity` 0 hides the image behind a
 /// solid theme colour; 100 keeps today's material strength.
 pub fn tint_alpha(material: Material, opacity: f32) -> u8 {
@@ -43,32 +54,132 @@ pub fn tint_alpha(material: Material, opacity: f32) -> u8 {
     alpha.round().clamp(0.0, 255.0) as u8
 }
 
-/// Load or synthesize the blurred backdrop for `mode`.
+/// Build a backdrop without decoding on the UI thread.
 ///
-/// `Ok(None)` means the caller should paint no backdrop. `Err` carries a
-/// user-facing reason (missing or oversized image) for a toast. Desktop mode
-/// never fails: it falls back to a theme gradient.
-pub fn build(
-    ctx: &Context,
-    theme: &Theme,
-    mode: BackgroundMode,
-    path: &str,
-) -> Result<Option<Backdrop>, String> {
-    let (image, from_image) = match mode {
-        BackgroundMode::Desktop => desktop_image(theme),
-        BackgroundMode::Image => {
-            if path.trim().is_empty() {
-                return Err("Choose a background image".to_string());
+/// Desktop prefers a cached wallpaper, then a cached theme gradient. A cold
+/// wallpaper reports [`BackdropBuild::Warming`] so the caller can start a
+/// detached [`warm_cache`] and paint the native material meanwhile. Image mode
+/// is cache-only: a warmed image uploads in a few milliseconds, a cold one
+/// warms in the background.
+pub fn build(ctx: &Context, theme: &Theme, mode: BackgroundMode, path: &str) -> BackdropBuild {
+    match mode {
+        BackgroundMode::None => BackdropBuild::Ready(None),
+        BackgroundMode::Desktop => {
+            if let Some((image, from_image)) = cached_desktop(theme) {
+                return BackdropBuild::Ready(Some(upload(ctx, image, from_image)));
             }
-            let image = custom_image(path)?;
-            (image, true)
+            let candidates = desktop_candidates();
+            if candidates.is_empty() {
+                // No wallpaper source is reported; a theme gradient is cheap
+                // and is the only thing this machine can paint.
+                let image = gradient(theme);
+                cache_put(gradient_key(theme), image.clone());
+                return BackdropBuild::Ready(Some(upload(ctx, image, false)));
+            }
+            BackdropBuild::Warming
         }
-        BackgroundMode::None => return Ok(None),
-    };
-    Ok(Some(Backdrop {
+        BackgroundMode::Image => {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return BackdropBuild::Failed("Choose a background image".to_string());
+            }
+            match cached_image(&image_key(Path::new(trimmed))) {
+                Some(image) => BackdropBuild::Ready(Some(upload(ctx, image, true))),
+                None => BackdropBuild::Warming,
+            }
+        }
+    }
+}
+
+fn upload(ctx: &Context, image: ColorImage, from_image: bool) -> Backdrop {
+    Backdrop {
         texture: ctx.load_texture("illness_backdrop", image, TextureOptions::LINEAR),
         from_image,
-    }))
+    }
+}
+
+/// Decode and blur `mode` into the shared cache without creating a texture.
+///
+/// This is the detached-thread prewarm used while the effective material does
+/// not paint an in-window backdrop (Solid, fallback Solid, Acrylic+Desktop).
+/// A process-wide lock serializes decodes, so two warm requests for the same
+/// image reuse the first result instead of decoding twice. `theme` is used for
+/// the gradient fallback when Desktop reports no usable wallpaper.
+pub fn warm_cache(theme: &Theme, mode: BackgroundMode, path: &str) -> Result<(), String> {
+    if mode == BackgroundMode::None {
+        return Ok(());
+    }
+
+    // Background-only: holding this lock never blocks a UI paint, and the
+    // cache lookup after acquiring it makes duplicate requests cheap.
+    let _warm = warm_lock();
+    match mode {
+        BackgroundMode::Desktop => {
+            for candidate in desktop_candidates() {
+                if cached_image(&image_key(&candidate)).is_some() {
+                    return Ok(());
+                }
+                match load_blurred(&candidate) {
+                    Ok(_) => return Ok(()),
+                    Err(error) => {
+                        log::debug!("background {} unavailable: {error}", candidate.display())
+                    }
+                }
+            }
+            let key = gradient_key(theme);
+            if cached_key(&key).is_none() {
+                cache_put(key, gradient(theme));
+            }
+            Ok(())
+        }
+        BackgroundMode::Image => {
+            let trimmed = path.trim();
+            if trimmed.is_empty() {
+                return Err("Choose a background image".to_string());
+            }
+            let path = Path::new(trimmed);
+            if cached_image(&image_key(path)).is_some() {
+                return Ok(());
+            }
+            load_blurred(path).map(|_| ())
+        }
+        BackgroundMode::None => Ok(()),
+    }
+}
+
+/// Whether [`build`] can paint this pair right now without a decode. `None`
+/// and a desktop with no wallpaper source are immediately paintable.
+pub fn is_cached(theme: &Theme, mode: BackgroundMode, path: &str) -> bool {
+    match mode {
+        BackgroundMode::None => true,
+        BackgroundMode::Desktop => {
+            cached_desktop(theme).is_some() || desktop_candidates().is_empty()
+        }
+        BackgroundMode::Image => {
+            let trimmed = path.trim();
+            !trimmed.is_empty() && cached_image(&image_key(Path::new(trimmed))).is_some()
+        }
+    }
+}
+
+fn cached_desktop(theme: &Theme) -> Option<(ColorImage, bool)> {
+    for candidate in desktop_candidates() {
+        if let Some(image) = cached_image(&image_key(&candidate)) {
+            return Some((image, true));
+        }
+    }
+    cached_key(&gradient_key(theme)).map(|image| (image, false))
+}
+
+fn desktop_candidates() -> Vec<PathBuf> {
+    let transcoded = std::env::var_os("APPDATA").map(|appdata| {
+        PathBuf::from(appdata)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Themes")
+            .join("TranscodedWallpaper")
+    });
+    desktop_wallpaper_candidates(platform::current_wallpaper_path(), transcoded)
 }
 
 /// Ordered wallpaper sources for Desktop mode: the live wallpaper first, then
@@ -91,46 +202,18 @@ fn desktop_wallpaper_candidates(
     candidates
 }
 
-fn desktop_image(theme: &Theme) -> (ColorImage, bool) {
-    let transcoded = std::env::var_os("APPDATA").map(|appdata| {
-        PathBuf::from(appdata)
-            .join("Microsoft")
-            .join("Windows")
-            .join("Themes")
-            .join("TranscodedWallpaper")
-    });
-    let candidates = desktop_wallpaper_candidates(platform::current_wallpaper_path(), transcoded);
-
-    for path in &candidates {
-        match load_blurred(path) {
-            Ok(image) => return (image, true),
-            Err(error) => log::debug!("background {} unavailable: {error}", path.display()),
-        }
-    }
-    (gradient(theme), false)
-}
-
-fn custom_image(path: &str) -> Result<ColorImage, String> {
-    let path = Path::new(path.trim());
-    if path.as_os_str().is_empty() {
-        return Err("Choose a background image".to_string());
-    }
-    load_blurred(path)
-}
-
 /// Decode a wallpaper once per `(path, mtime)` and reuse the blurred result.
 fn load_blurred(path: &Path) -> Result<ColorImage, String> {
-    let modified = std::fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .ok();
-
-    if let Some(cached) = cached_image(path, modified) {
+    let key = image_key(path);
+    if let Some(cached) = cached_key(&key) {
         return Ok(cached);
     }
 
+    #[cfg(test)]
+    DECODE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let image = decode_image(path)?;
     let blurred = blurred(image);
-    store_cached(path, modified, &blurred);
+    cache_put(key, blurred.clone());
     Ok(blurred)
 }
 
@@ -170,35 +253,85 @@ pub fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
+/// Cache identity: `(image path, mtime)` for decoded wallpapers, or the theme
+/// name for a synthesized gradient. Blurred/downscaled images are ~0.9 MB, so a
+/// small LRU keeps a Desktop wallpaper alive across an Image load without
+/// retaining full-size decodes.
+#[derive(Clone, PartialEq, Eq)]
+enum CacheKey {
+    Image {
+        path: PathBuf,
+        modified: Option<SystemTime>,
+    },
+    Gradient {
+        theme: String,
+    },
+}
+
 struct CacheEntry {
-    path: PathBuf,
-    modified: Option<SystemTime>,
+    key: CacheKey,
     image: ColorImage,
 }
 
-static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+/// Bounded LRU: entries are ordered least- to most-recently used.
+const CACHE_CAPACITY: usize = 4;
 
-fn cache() -> &'static Mutex<Option<CacheEntry>> {
-    CACHE.get_or_init(|| Mutex::new(None))
+static CACHE: OnceLock<Mutex<Vec<CacheEntry>>> = OnceLock::new();
+static WARM_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+static DECODE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn cache() -> &'static Mutex<Vec<CacheEntry>> {
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn cached_image(path: &Path, modified: Option<SystemTime>) -> Option<ColorImage> {
-    let cache = cache()
+fn warm_lock() -> std::sync::MutexGuard<'static, ()> {
+    WARM_LOCK
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let entry = cache.as_ref()?;
-    (entry.path == path && entry.modified == modified).then(|| entry.image.clone())
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn store_cached(path: &Path, modified: Option<SystemTime>, image: &ColorImage) {
+fn image_key(path: &Path) -> CacheKey {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    CacheKey::Image {
+        path: path.to_path_buf(),
+        modified,
+    }
+}
+
+fn gradient_key(theme: &Theme) -> CacheKey {
+    CacheKey::Gradient {
+        theme: theme.name.to_string(),
+    }
+}
+
+fn cached_key(key: &CacheKey) -> Option<ColorImage> {
     let mut cache = cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *cache = Some(CacheEntry {
-        path: path.to_path_buf(),
-        modified,
-        image: image.clone(),
-    });
+    let index = cache.iter().position(|entry| &entry.key == key)?;
+    let entry = cache.remove(index);
+    let image = entry.image.clone();
+    cache.push(entry);
+    Some(image)
+}
+
+fn cached_image(key: &CacheKey) -> Option<ColorImage> {
+    cached_key(key)
+}
+
+fn cache_put(key: CacheKey, image: ColorImage) {
+    let mut cache = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|entry| entry.key != key);
+    cache.push(CacheEntry { key, image });
+    while cache.len() > CACHE_CAPACITY {
+        cache.remove(0);
+    }
 }
 
 fn blurred(image: image::DynamicImage) -> ColorImage {
@@ -238,10 +371,20 @@ fn gradient(theme: &Theme) -> ColorImage {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
 
     use super::*;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+    /// Serialize cache-sensitive tests: the cache and decode counter are
+    /// process-wide and cargo runs tests in parallel.
+    static TEST_CACHE_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_CACHE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn temp_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -287,6 +430,7 @@ mod tests {
 
     #[test]
     fn extensionless_wallpaper_decodes_with_a_guessed_format() {
+        let _test = test_cache_lock();
         let dir = temp_dir();
         let path = dir.join("TranscodedWallpaper");
         let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 40, 60, 255]));
@@ -297,11 +441,8 @@ mod tests {
         let loaded = load_blurred(&path).expect("extensionless image should decode");
         assert_eq!(loaded.size, [640, 360]);
 
-        let modified = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
         assert!(
-            cached_image(&path, modified).is_some(),
+            cached_key(&image_key(&path)).is_some(),
             "decoded image should be cached by path and mtime"
         );
 
@@ -310,6 +451,7 @@ mod tests {
 
     #[test]
     fn oversized_wallpaper_is_rejected_before_decoding() {
+        let _test = test_cache_lock();
         let dir = temp_dir();
         let path = dir.join("huge.png");
         let image =
@@ -321,6 +463,121 @@ mod tests {
         let error = load_blurred(&path).expect_err("oversized image must be rejected");
         assert!(error.contains("limit"), "{error}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_warms_decode_once() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = dir.join("shared.png");
+        let image = image::RgbaImage::from_fn(1920, 1080, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 90, 255])
+        });
+        image.save(&path).expect("write image");
+        let text = path.to_string_lossy().into_owned();
+        let theme = Theme::by_name("Illness Dark");
+        let before = DECODE_COUNT.load(Ordering::Relaxed);
+
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let text = text.clone();
+                std::thread::spawn(move || warm_cache(theme, BackgroundMode::Image, &text))
+            })
+            .collect();
+        for worker in workers {
+            worker.join().expect("warm thread").expect("warm image");
+        }
+
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed) - before,
+            1,
+            "concurrent warms must share one decode"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_is_a_small_lru() {
+        let _test = test_cache_lock();
+        for index in 0..=CACHE_CAPACITY {
+            let key = CacheKey::Image {
+                path: PathBuf::from(format!("lru-{index}.png")),
+                modified: None,
+            };
+            cache_put(
+                key,
+                ColorImage::new([1, 1], vec![Color32::from_rgb(index as u8, 0, 0)]),
+            );
+        }
+        let first = CacheKey::Image {
+            path: PathBuf::from("lru-0.png"),
+            modified: None,
+        };
+        assert!(cached_key(&first).is_none(), "oldest entry is evicted");
+        let last = CacheKey::Image {
+            path: PathBuf::from(format!("lru-{CACHE_CAPACITY}.png")),
+            modified: None,
+        };
+        assert!(cached_key(&last).is_some());
+    }
+
+    #[test]
+    fn warmed_image_upload_never_decodes_on_the_ui_path() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = dir.join("warm.png");
+        let image = image::RgbaImage::from_fn(2560, 1440, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, 40, 255])
+        });
+        image.save(&path).expect("write image");
+        let text = path.to_string_lossy().into_owned();
+        let theme = Theme::by_name("Illness Dark");
+        let ctx = Context::default();
+
+        warm_cache(theme, BackgroundMode::Image, &text).expect("warm image");
+        let before = DECODE_COUNT.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let build = build(&ctx, theme, BackgroundMode::Image, &text);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(build, BackdropBuild::Ready(Some(_))));
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            before,
+            "the UI-thread build must only upload the warmed image"
+        );
+        println!("warmed image upload: {elapsed:?}");
+        assert!(
+            elapsed.as_millis() < 50,
+            "warmed upload took {elapsed:?}, expected a short upload"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn warmed_desktop_switch_never_decodes_on_the_ui_path() {
+        let _test = test_cache_lock();
+        let theme = Theme::by_name("Illness Dark");
+        let ctx = Context::default();
+
+        warm_cache(theme, BackgroundMode::Desktop, "").expect("warm desktop");
+        assert!(is_cached(theme, BackgroundMode::Desktop, ""));
+        let before = DECODE_COUNT.load(Ordering::Relaxed);
+        let started = Instant::now();
+        let build = build(&ctx, theme, BackgroundMode::Desktop, "");
+        let elapsed = started.elapsed();
+
+        assert!(matches!(build, BackdropBuild::Ready(Some(_))));
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            before,
+            "a warmed Acrylic+Desktop -> Mica+Desktop switch must not decode"
+        );
+        println!("warmed desktop upload: {elapsed:?}");
+        assert!(
+            elapsed.as_millis() < 50,
+            "warmed upload took {elapsed:?}, expected a short upload"
+        );
     }
 
     #[test]

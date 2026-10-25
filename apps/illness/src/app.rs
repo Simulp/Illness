@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use egui::{
@@ -82,16 +83,24 @@ enum TabEntry {
     Settings,
 }
 
+/// Result of a detached [`backdrop::warm_cache`] request.
+#[derive(Debug)]
+struct BackdropWarmResult {
+    mode: BackgroundMode,
+    path: String,
+    result: Result<(), String>,
+}
+
 /// The winit/egui application shell and all cross-module state.
 pub struct IllnessApp {
     ctx: egui::Context,
     window: Arc<Window>,
     config: Config,
     profiles: Vec<Profile>,
-    /// Whether the swapchain can present a transparent backbuffer. Queried
-    /// from the surface's alpha modes at startup; without it, Mica and
-    /// Acrylic would composite over an ignored clear alpha and show an opaque
-    /// black (or the raw desktop) instead of their intended backdrop.
+    /// Whether the window can currently present native translucent materials:
+    /// the swapchain exposes a transparent alpha mode and Windows transparency
+    /// effects are enabled. The host keeps the static surface-alpha support and
+    /// re-checks the effects setting when focus, theme or occlusion changes.
     native_transparency: bool,
     theme: &'static Theme,
     tokens: Tokens,
@@ -106,15 +115,21 @@ pub struct IllnessApp {
     applied_ppp: f32,
     applied_line_height: f32,
     applied_material: Material,
-    /// The material the user asked for. Unlike `config.material`, this keeps
-    /// the original choice when this session falls back to Solid so the next
-    /// healthy launch can retry it.
-    requested_material: Material,
-    /// True while `config.material` is a session-only Solid fallback.
+    /// The user's material request last sent to the platform.
+    applied_requested_material: Material,
+    /// True while the requested material is rendered as Solid because native
+    /// transparency is unavailable (or the native apply failed). This is never
+    /// persisted and is cleared whenever the user explicitly chooses.
     material_fallback: bool,
     /// `(mode, path)` that produced the current backdrop texture.
     applied_background: Option<(BackgroundMode, String)>,
     applied_background_opacity: f32,
+    /// Detached cache-warm result channel. The UI never decodes an image; it
+    /// requests a warm and rebuilds only when the result arrives.
+    backdrop_warm_tx: Sender<BackdropWarmResult>,
+    backdrop_warm_rx: Receiver<BackdropWarmResult>,
+    /// The `(mode, path)` currently warming on a detached thread.
+    backdrop_warming: Option<(BackgroundMode, String)>,
     /// Family whose load failed, so the toast is not repeated every change.
     font_failure: Option<String>,
     /// GPU glyph compositor, when a wgpu device and `gpu_text` are available.
@@ -154,7 +169,11 @@ impl IllnessApp {
         let profiles = config.profiles.clone();
 
         fonts::install(&ctx);
-        design::install(&ctx, theme, &config);
+        design::install(
+            &ctx,
+            theme,
+            material_for_surface(config.material, native_transparency, false),
+        );
         let mut atlas = GlyphAtlas::new(
             &ctx,
             fonts::CASCADIA_MONO,
@@ -177,7 +196,6 @@ impl IllnessApp {
         }
         let line_height = config.line_height;
         let background_opacity = config.background_opacity;
-        let config_material = config.material;
         let gpu_text = if config.gpu_text {
             render_state.map(|state| Arc::new(GpuText::new(state)))
         } else {
@@ -193,6 +211,7 @@ impl IllnessApp {
             log::info!("GPU text unavailable or disabled; using the CPU compositor");
         }
 
+        let (backdrop_warm_tx, backdrop_warm_rx) = mpsc::channel();
         let mut app = Self {
             ctx,
             window: Arc::clone(&window),
@@ -211,11 +230,14 @@ impl IllnessApp {
             applied_font_size: 0.0,
             applied_ppp: 0.0,
             applied_line_height: line_height,
-            applied_material: Material::Mica,
-            requested_material: config_material,
+            applied_material: Material::Solid,
+            applied_requested_material: Material::Solid,
             material_fallback: false,
             applied_background: None,
             applied_background_opacity: background_opacity,
+            backdrop_warm_tx,
+            backdrop_warm_rx,
+            backdrop_warming: None,
             font_failure: None,
             gpu_text,
             window_title: "Illness".to_string(),
@@ -230,9 +252,7 @@ impl IllnessApp {
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
         app.apply_material_to(window.as_ref());
-        // Startup may prewarm an acrylic desktop texture for a later switch;
-        // runtime material changes never do (see `sync_backdrop_for_material`).
-        app.rebuild_backdrop(true);
+        app.rebuild_backdrop();
         app.open_tab(None);
         app
     }
@@ -420,21 +440,15 @@ impl IllnessApp {
         let dark = !self.theme.is_light();
         let theme_bg = self.theme.bg;
         let opacity = self.config.background_opacity;
-        // `config.material` may already be the session's Solid fallback. A
-        // replay must not overwrite the user's request with that Solid; a real
-        // user change (to a non-Solid material) becomes the new request.
-        let requested = if self.material_fallback && self.config.material == Material::Solid {
-            self.requested_material
-        } else {
-            self.config.material
-        };
-        self.requested_material = requested;
-        let attempted_native = self.config.material != Material::Solid;
-        let (effective, native_unavailable) =
-            material_for_surface(self.config.material, self.native_transparency);
-        let mut fell_back = native_unavailable;
-        if native_unavailable {
-            self.config.material = effective;
+        // `config.material` is always the user's request. A session fallback is
+        // represented by `material_fallback` and never rewritten into config,
+        // so an explicit Solid is the only thing that persists as Solid.
+        let requested = self.config.material;
+        let attempted_native = requested != Material::Solid;
+        let unavailable = attempted_native && !self.native_transparency;
+        let mut effective = material_for_surface(requested, self.native_transparency, false);
+        if unavailable {
+            self.material_fallback = true;
             self.overlays.toast = Some("Native materials unavailable; using Solid".to_string());
             log::warn!(
                 "surface alpha or Windows transparency effects unavailable; {} forced to Solid",
@@ -446,81 +460,123 @@ impl IllnessApp {
                 "window material {} (dark={dark}) failed: {error}",
                 material_name(effective)
             );
-            self.config.material = Material::Solid;
-            if attempted_native {
-                fell_back = true;
+            if effective != Material::Solid {
+                effective = Material::Solid;
+                self.material_fallback = true;
+                self.overlays.toast = Some(format!(
+                    "{} is unavailable here; using Solid",
+                    material_name(requested)
+                ));
             }
             if let Err(error) = platform::apply(window, Material::Solid, dark, theme_bg, opacity) {
                 log::warn!("solid material unavailable: {error}");
             }
-            self.overlays.toast = Some(format!(
-                "{} is unavailable here; using Solid",
-                material_name(requested)
-            ));
         } else {
             log::info!(
                 "window material {} (dark={dark}) applied",
                 material_name(effective)
             );
+            if effective != Material::Solid {
+                self.material_fallback = false;
+            }
         }
-        // A successful native apply clears an earlier fallback; replaying the
-        // session's Solid does not change it.
-        if attempted_native {
-            self.material_fallback = fell_back;
+        if !attempted_native {
+            self.material_fallback = false;
         }
-        self.applied_material = self.config.material;
+        self.applied_material = effective;
+        self.applied_requested_material = requested;
         // A fallback to Solid leaves any prewarmed texture unused; drop it
         // without decoding or toasting. Acrylic+Desktop keeps its texture.
         self.drop_unneeded_backdrop();
-        // The panel fill follows the material: opaque for Solid, transparent
-        // so the native backdrop can show through otherwise. This also covers
-        // a fallback to Solid when the requested material is unavailable.
-        design::install(&self.ctx, self.theme, &self.config);
+        // The panel fill follows the effective material: opaque for Solid,
+        // transparent so the native backdrop can show through otherwise. This
+        // also covers a fallback to Solid when the request is unavailable.
+        design::install(&self.ctx, self.theme, effective);
         self.ctx.request_repaint();
+    }
+
+    /// The material the window actually renders. `config.material` keeps the
+    /// user's request; Solid is substituted while a native material cannot be
+    /// presented or its apply failed.
+    fn effective_material(&self) -> Material {
+        material_for_surface(
+            self.config.material,
+            self.native_transparency,
+            self.material_fallback,
+        )
+    }
+
+    /// Re-check native transparency after the host observes a theme, focus or
+    /// occlusion change. Turning effects off falls back immediately; turning
+    /// them back on retries the requested Mica/Acrylic without a restart.
+    pub fn set_native_transparency(&mut self, available: bool) -> bool {
+        if self.native_transparency == available {
+            return false;
+        }
+        self.native_transparency = available;
+        // A stale fallback must not block a retry when effects return.
+        self.material_fallback = false;
+        let window = Arc::clone(&self.window);
+        self.apply_material_to(window.as_ref());
+        // A retry may need the painted backdrop that the Solid fallback
+        // dropped; falling back drops it again without decoding.
+        self.sync_backdrop_for_material(false);
+        true
+    }
+
+    /// Retry the requested native material after the user re-selects it while
+    /// the session is in a Solid fallback.
+    fn retry_material(&mut self) {
+        if self.config.material == Material::Solid {
+            return;
+        }
+        let requested = self.config.material;
+        choose_material(
+            &mut self.config.material,
+            &mut self.material_fallback,
+            requested,
+        );
+        self.pending_material = true;
+        self.sync_backdrop_for_material(false);
     }
 
     /// Reload the backdrop for the current mode and path.
     ///
-    /// Called only when the mode, path, a gradient-producing theme, or the
-    /// material changes; opacity is applied at paint time. Images are decoded
-    /// once per `(path, mtime)` and rejected when larger than the texture cap.
-    /// A pair that paints no backdrop -- Solid, any material with
-    /// `BackgroundMode::None`, or Acrylic+Desktop -- returns without decoding.
-    ///
-    /// `prewarm` is true only for the initial startup build, where
-    /// Acrylic+Desktop may still decode the wallpaper for a later switch. A
-    /// runtime material change must not pay that decode: entering
-    /// Acrylic+Desktop keeps whatever texture already exists and builds
-    /// nothing. The first switch away from native Acrylic reuses the
-    /// path+mtime cache, so leaving Acrylic stays fast.
-    fn rebuild_backdrop(&mut self, prewarm: bool) {
+    /// Called when the mode, path, a gradient-producing theme, or the effective
+    /// material changes; opacity is applied at paint time. Images are never
+    /// decoded here: a warmed `(path, mtime)` entry uploads in a few
+    /// milliseconds. A cold entry starts a detached warm and this pass paints
+    /// the native material/theme with no texture, then the warm result requests
+    /// a rebuild. A pair that paints no backdrop -- Solid, fallback Solid, any
+    /// material with `BackgroundMode::None`, or Acrylic+Desktop -- drops/keeps
+    /// the texture and warms the cache for a later switch.
+    fn rebuild_backdrop(&mut self) {
         let mode = self.config.background;
         let path = self.config.background_path.clone();
-        match backdrop_plan(self.config.material, mode, prewarm) {
+        let material = self.effective_material();
+        match backdrop_plan(material, mode) {
             BackdropPlan::Drop => {
                 // Solid never paints a texture and a None background has
                 // nothing to paint. Drop it without decoding the wallpaper or
                 // reporting a misleading image failure.
                 self.backdrop = None;
-                self.applied_background = Some((mode, path));
+                self.applied_background = Some((mode, path.clone()));
                 self.applied_background_opacity = self.config.background_opacity;
+                self.start_backdrop_warm(mode, path);
                 self.ctx.request_repaint();
-                log::debug!(
-                    "backdrop dropped for {:?}+{mode:?}: not needed",
-                    self.config.material
-                );
+                log::debug!("backdrop dropped for {material:?}+{mode:?}: not needed");
                 return;
             }
             BackdropPlan::Keep => {
                 // Acrylic+Desktop paints native blur instead, but an existing
-                // texture is retained for a later switch to Mica/Image.
-                self.applied_background = Some((mode, path));
+                // texture is retained for a later switch to Mica/Image. The
+                // cache is warmed with no texture upload so leaving Acrylic
+                // only pays the upload.
+                self.applied_background = Some((mode, path.clone()));
                 self.applied_background_opacity = self.config.background_opacity;
+                self.start_backdrop_warm(mode, path);
                 self.ctx.request_repaint();
-                log::debug!(
-                    "backdrop kept for {:?}+{mode:?}: not painted",
-                    self.config.material
-                );
+                log::debug!("backdrop kept for {material:?}+{mode:?}: not painted");
                 return;
             }
             BackdropPlan::Build => {}
@@ -528,7 +584,7 @@ impl IllnessApp {
 
         let started = std::time::Instant::now();
         match backdrop::build(&self.ctx, self.theme, mode, &path) {
-            Ok(backdrop) => {
+            backdrop::BackdropBuild::Ready(backdrop) => {
                 self.backdrop = backdrop;
                 if self.backdrop.is_none() && mode == BackgroundMode::Image {
                     self.overlays.toast = Some(if path.trim().is_empty() {
@@ -538,7 +594,11 @@ impl IllnessApp {
                     });
                 }
             }
-            Err(error) => {
+            backdrop::BackdropBuild::Warming => {
+                self.backdrop = None;
+                self.start_backdrop_warm(mode, path.clone());
+            }
+            backdrop::BackdropBuild::Failed(error) => {
                 self.backdrop = None;
                 self.overlays.toast = Some(error);
             }
@@ -556,23 +616,98 @@ impl IllnessApp {
         );
     }
 
-    /// Drop a backdrop texture the current material/mode cannot keep.
+    /// Decode/blur the current backdrop on a detached thread.
+    ///
+    /// Used only when the effective material does not paint the texture now
+    /// (Solid, fallback Solid, Acrylic+Desktop) or when a painted build misses
+    /// the cache. The worker stores the blurred image in the shared cache and
+    /// wakes egui; it never uploads a texture. Duplicate requests are collapsed
+    /// by the warm lock inside [`backdrop::warm_cache`].
+    fn start_backdrop_warm(&mut self, mode: BackgroundMode, path: String) {
+        if mode == BackgroundMode::None {
+            return;
+        }
+        if mode == BackgroundMode::Image && path.trim().is_empty() {
+            // A Solid/fallback Image request with no file has nothing to warm,
+            // and choosing a file will rebuild the backdrop.
+            return;
+        }
+        if self.backdrop_warming.as_ref() == Some(&(mode, path.clone())) {
+            return;
+        }
+        if backdrop::is_cached(self.theme, mode, &path) {
+            return;
+        }
+
+        let theme = self.theme;
+        let ctx = self.ctx.clone();
+        let tx = self.backdrop_warm_tx.clone();
+        let worker_path = path.clone();
+        self.backdrop_warming = Some((mode, path));
+        let spawned = std::thread::Builder::new()
+            .name("illness-backdrop-warm".to_string())
+            .spawn(move || {
+                let started = std::time::Instant::now();
+                let result = backdrop::warm_cache(theme, mode, &worker_path);
+                log::debug!(
+                    "backdrop warm {mode:?} finished in {:?}: {result:?}",
+                    started.elapsed()
+                );
+                let _ = tx.send(BackdropWarmResult {
+                    mode,
+                    path: worker_path,
+                    result,
+                });
+                ctx.request_repaint();
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not start the backdrop warm thread: {error}");
+            self.backdrop_warming = None;
+        }
+    }
+
+    /// Apply finished detached warm results. A matching result uploads the
+    /// warmed texture; a stale result is ignored because the background or
+    /// material changed while it ran.
+    fn drain_backdrop_warm(&mut self) {
+        while let Ok(result) = self.backdrop_warm_rx.try_recv() {
+            if self.backdrop_warming.as_ref() == Some(&(result.mode, result.path.clone())) {
+                self.backdrop_warming = None;
+            }
+            if result.mode != self.config.background || result.path != self.config.background_path {
+                continue;
+            }
+            match result.result {
+                Ok(()) => {
+                    if paints_backdrop(self.effective_material(), result.mode) {
+                        self.rebuild_backdrop();
+                    }
+                }
+                Err(error) => {
+                    // A warm for a material that will render Solid must not
+                    // toast an image error the user cannot see.
+                    if paints_backdrop(self.effective_material(), result.mode) {
+                        self.overlays.toast = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Drop a backdrop texture the current effective material/mode cannot keep.
     ///
     /// Returns whether a texture was dropped. No decode or toast occurs.
     fn drop_unneeded_backdrop(&mut self) -> bool {
-        if keeps_backdrop(self.config.material, self.config.background) || self.backdrop.is_none() {
+        let material = self.effective_material();
+        let mode = self.config.background;
+        if keeps_backdrop(material, mode) || self.backdrop.is_none() {
             return false;
         }
         self.backdrop = None;
-        self.applied_background =
-            Some((self.config.background, self.config.background_path.clone()));
+        self.applied_background = Some((mode, self.config.background_path.clone()));
         self.applied_background_opacity = self.config.background_opacity;
         self.ctx.request_repaint();
-        log::debug!(
-            "backdrop dropped for {:?}+{:?}: not needed",
-            self.config.material,
-            self.config.background
-        );
+        log::debug!("backdrop dropped for {material:?}+{mode:?}: not needed");
         true
     }
 
@@ -580,21 +715,23 @@ impl IllnessApp {
     ///
     /// Entering Acrylic+Desktop keeps the existing texture (native blur paints
     /// instead) and never builds one. Leaving Acrylic rebuilds only when the
-    /// new pair actually paints a backdrop, reusing the path+mtime cache.
+    /// new effective pair actually paints a backdrop, reusing the warmed cache.
     /// Leaving for Solid or None drops it without decoding.
     /// `background_changed` means `reapply_config` already rebuilt for the new
-    /// background; rebuilding again here would decode the same wallpaper twice.
+    /// background; rebuilding again here would upload the same wallpaper twice.
     fn sync_backdrop_for_material(&mut self, background_changed: bool) {
+        let material = self.effective_material();
+        let mode = self.config.background;
         let leaving_acrylic =
-            self.applied_material == Material::Acrylic && self.config.material != Material::Acrylic;
+            self.applied_material == Material::Acrylic && material != Material::Acrylic;
         if self.drop_unneeded_backdrop() {
             return;
         }
-        if background_changed || !paints_backdrop(self.config.material, self.config.background) {
+        if background_changed || !paints_backdrop(material, mode) {
             return;
         }
         if leaving_acrylic || self.backdrop.is_none() {
-            self.rebuild_backdrop(false);
+            self.rebuild_backdrop();
         }
     }
 
@@ -607,7 +744,7 @@ impl IllnessApp {
         let theme = Theme::by_name(&self.config.theme);
         let mut background_dirty = false;
         if theme.name != self.applied_theme.as_str() {
-            design::install(&self.ctx, theme, &self.config);
+            design::install(&self.ctx, theme, self.effective_material());
             self.theme = theme;
             self.tokens = Tokens::from_theme(theme);
             self.applied_theme = theme.name.to_string();
@@ -677,18 +814,20 @@ impl IllnessApp {
         let opacity_changed =
             (self.config.background_opacity - self.applied_background_opacity).abs() > f32::EPSILON;
         if background_changed {
-            self.rebuild_backdrop(false);
+            self.rebuild_backdrop();
         } else if opacity_changed {
             self.applied_background_opacity = self.config.background_opacity;
             self.ctx.request_repaint();
         }
 
-        if self.config.material != self.applied_material {
+        if self.config.material != self.applied_requested_material {
             self.pending_material = true;
+            // An explicit new request abandons any earlier session fallback;
+            // `apply_material_to` re-establishes it if the request still fails.
+            self.material_fallback = false;
             // Acrylic+Desktop has no painted in-window backdrop, so switching
-            // to Mica or Image must load one now. An existing texture is
-            // reused, and a simultaneous background change is not rebuilt a
-            // second time.
+            // to Mica or Image must load one now. A warmed texture is uploaded,
+            // and a simultaneous background change is not rebuilt twice.
             self.sync_backdrop_for_material(background_changed);
         }
 
@@ -696,7 +835,7 @@ impl IllnessApp {
         // must re-apply it. This is intentionally minimal: no design token
         // install and no backdrop rebuild, keeping a live slider drag cheap.
         if opacity_changed
-            && self.config.material == Material::Acrylic
+            && self.effective_material() == Material::Acrylic
             && self.applied_material == Material::Acrylic
         {
             let window = Arc::clone(&self.window);
@@ -708,10 +847,8 @@ impl IllnessApp {
             ) {
                 // Do not leave the slider looking live when the tint cannot be
                 // reapplied: fall back exactly like a failed material apply.
+                // The request stays Acrylic and is retried on a healthy launch.
                 log::warn!("failed to re-apply the acrylic tint: {error}");
-                self.config.material = Material::Solid;
-                // A session fallback, not a new user choice: persist the
-                // requested Acrylic so a healthy launch retries it.
                 self.material_fallback = true;
                 self.pending_material = true;
                 self.overlays.toast =
@@ -732,18 +869,10 @@ impl IllnessApp {
             .request_repaint_after(Duration::from_millis(SAVE_DEBOUNCE_MS));
     }
 
-    /// Save the config, writing the user's requested material rather than a
-    /// session-only Solid fallback. `config.material` itself keeps driving the
-    /// live window and is restored after the write. Background mode and path
-    /// are never rewritten here, so a transient fallback keeps an Image
-    /// background for the next healthy launch.
+    /// Save the config. `config.material` is always the user's request now, so
+    /// a session-only Solid fallback is never written.
     fn save_config(&mut self) -> anyhow::Result<()> {
-        let live = self.config.material;
-        self.config.material =
-            material_to_persist(live, self.requested_material, self.material_fallback);
-        let result = self.config.save();
-        self.config.material = live;
-        result
+        self.config.save()
     }
 
     fn persist(&mut self) {
@@ -1081,7 +1210,12 @@ impl IllnessApp {
             }
             Action::ConfigChanged => self.reapply_config(),
             Action::ToggleMaterial => {
-                self.config.material = next_material(self.config.material);
+                let chosen = next_material(self.config.material);
+                choose_material(
+                    &mut self.config.material,
+                    &mut self.material_fallback,
+                    chosen,
+                );
                 self.pending_material = true;
                 self.sync_backdrop_for_material(false);
                 self.persist();
@@ -1354,7 +1488,8 @@ impl IllnessApp {
         // Acrylic blurs the actual windows behind this one; painting the
         // desktop wallpaper here would hide that. Image backgrounds still
         // draw, because the user explicitly chose them.
-        if paints_backdrop(self.config.material, self.config.background)
+        let surface_material = self.effective_material();
+        if paints_backdrop(surface_material, self.config.background)
             && let Some(backdrop) = &self.backdrop
         {
             let screen = ui.max_rect();
@@ -1364,7 +1499,7 @@ impl IllnessApp {
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-            let tint = backdrop::tint_alpha(self.config.material, self.config.background_opacity);
+            let tint = backdrop::tint_alpha(surface_material, self.config.background_opacity);
             ui.painter().rect_filled(
                 screen,
                 0.0,
@@ -1394,7 +1529,7 @@ impl IllnessApp {
             &tab_infos,
             &self.profiles,
             self.active,
-            self.config.material,
+            surface_material,
         );
 
         let overlay_open = !matches!(self.overlays.kind, OverlayKind::None);
@@ -1420,7 +1555,7 @@ impl IllnessApp {
         let mut context_menu_pos = None;
         let mut restart_requested = false;
         let mut close_requested = false;
-        let mut settings_changed = false;
+        let mut settings_outcome = overlays::SettingsOutcome::default();
 
         if settings_active {
             let backdrop_present = self.backdrop.is_some();
@@ -1428,14 +1563,16 @@ impl IllnessApp {
             let theme = self.theme;
             let config = &mut self.config;
             let overlay_state = &mut self.overlays;
+            let material_fallback = self.material_fallback;
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                settings_changed = overlays::show_settings_panel(
+                settings_outcome = overlays::show_settings_panel(
                     ui,
                     tokens,
                     theme,
                     config,
                     overlay_state,
                     backdrop_present,
+                    material_fallback,
                 );
             });
         } else {
@@ -1461,9 +1598,16 @@ impl IllnessApp {
                     return;
                 };
 
-                let response =
-                    tab.view
-                        .show(ui, &tab.session, theme, config, tokens, atlas, gpu_text);
+                let response = tab.view.show(
+                    ui,
+                    &tab.session,
+                    theme,
+                    config,
+                    tokens,
+                    atlas,
+                    gpu_text,
+                    surface_material,
+                );
                 terminal_rect = Some(response.response.rect);
                 terminal_actions = response.actions;
                 if response.response.secondary_clicked()
@@ -1535,8 +1679,11 @@ impl IllnessApp {
             });
         }
 
-        if settings_changed {
+        if settings_outcome.changed {
             self.reapply_config();
+        }
+        if settings_outcome.retry_material {
+            self.retry_material();
         }
 
         if self.bell_flash_until > frame_now
@@ -1595,7 +1742,12 @@ impl IllnessApp {
             self.pending_material = false;
             let window = Arc::clone(&self.window);
             self.apply_material_to(window.as_ref());
+            // Apply may have succeeded after a fallback (or failed into one);
+            // build/drop the in-window backdrop for the material that is now
+            // actually rendered. A warmed entry only costs an upload.
+            self.sync_backdrop_for_material(false);
         }
+        self.drain_backdrop_warm();
 
         self.clamp_active();
         self.update_window_title(&ctx);
@@ -1604,7 +1756,7 @@ impl IllnessApp {
 
     pub fn clear_color(&self) -> [f32; 4] {
         clear_color_for(
-            self.config.material,
+            self.effective_material(),
             self.native_transparency,
             self.theme.bg,
         )
@@ -1625,13 +1777,21 @@ fn clear_color_for(material: Material, native_transparency: bool, bg: Rgb) -> [f
     }
 }
 
-/// Native materials need a transparent swapchain; otherwise their DWM effect is
-/// hidden behind an opaque surface.
-fn material_for_surface(requested: Material, native_transparency: bool) -> (Material, bool) {
-    if requested != Material::Solid && !native_transparency {
-        (Material::Solid, true)
+/// The material actually rendered for a request.
+///
+/// Solid is the surface whenever the user requested it, native transparency is
+/// unavailable, or this session already failed a native apply. The request in
+/// `config.material` is left untouched so Settings can show it and a later
+/// healthy launch can use it.
+fn material_for_surface(
+    requested: Material,
+    native_transparency: bool,
+    fallback: bool,
+) -> Material {
+    if requested == Material::Solid || fallback || !native_transparency {
+        Material::Solid
     } else {
-        (requested, false)
+        requested
     }
 }
 
@@ -1662,11 +1822,11 @@ enum BackdropPlan {
     Build,
 }
 
-/// Acrylic+Desktop is the only pair that keeps without painting. `prewarm`
-/// permits the accepted startup decode for an initial Acrylic+Desktop; runtime
-/// material changes pass `false` so entering that pair never decodes.
-fn backdrop_plan(material: Material, mode: BackgroundMode, prewarm: bool) -> BackdropPlan {
-    if paints_backdrop(material, mode) || (prewarm && keeps_backdrop(material, mode)) {
+/// Acrylic+Desktop is the only pair that keeps without painting: it warms the
+/// cache in the background but never uploads. All other non-painting pairs
+/// (Solid/fallback and None) drop the texture.
+fn backdrop_plan(material: Material, mode: BackgroundMode) -> BackdropPlan {
+    if paints_backdrop(material, mode) {
         BackdropPlan::Build
     } else if keeps_backdrop(material, mode) {
         BackdropPlan::Keep
@@ -1777,19 +1937,20 @@ fn material_name(material: Material) -> &'static str {
     }
 }
 
-/// Material to write to `config.toml`. A session fallback keeps the user's
-/// request; an intentional Solid was already copied into `requested_material`
-/// by `apply_material_to` and persists as Solid.
-fn material_to_persist(current: Material, requested: Material, fallback: bool) -> Material {
-    if fallback { requested } else { current }
-}
-
 fn next_material(material: Material) -> Material {
     match material {
         Material::Mica => Material::Acrylic,
         Material::Acrylic => Material::Solid,
         Material::Solid => Material::Mica,
     }
+}
+
+/// Record an explicit material choice. The request is always the chosen
+/// material (including Solid); an earlier session fallback is abandoned so a
+/// native choice retries immediately.
+fn choose_material(requested: &mut Material, fallback: &mut bool, chosen: Material) {
+    *requested = chosen;
+    *fallback = false;
 }
 
 fn trim_copy(text: &str) -> String {
@@ -2477,62 +2638,139 @@ mod tests {
 
     #[test]
     fn entering_acrylic_desktop_at_runtime_never_decodes() {
-        // Solid -> Acrylic+Desktop: keep the (absent) texture, build nothing.
+        // Solid/Acrylic+Desktop keep or drop the texture and warm the cache in
+        // the background; they never build a texture on the UI thread.
         assert_eq!(
-            backdrop_plan(Material::Acrylic, BackgroundMode::Desktop, false),
+            backdrop_plan(Material::Acrylic, BackgroundMode::Desktop),
             BackdropPlan::Keep
         );
-        // The accepted startup prewarm still builds.
+        // Leaving Acrylic for a painted pair rebuilds from the warmed cache.
         assert_eq!(
-            backdrop_plan(Material::Acrylic, BackgroundMode::Desktop, true),
-            BackdropPlan::Build
-        );
-        // Leaving Acrylic for a painted pair rebuilds from the path+mtime
-        // cache.
-        assert_eq!(
-            backdrop_plan(Material::Mica, BackgroundMode::Desktop, false),
+            backdrop_plan(Material::Mica, BackgroundMode::Desktop),
             BackdropPlan::Build
         );
         assert_eq!(
-            backdrop_plan(Material::Mica, BackgroundMode::Image, false),
+            backdrop_plan(Material::Mica, BackgroundMode::Image),
             BackdropPlan::Build
         );
         // Solid and None drop without decoding.
         assert_eq!(
-            backdrop_plan(Material::Solid, BackgroundMode::Desktop, false),
+            backdrop_plan(Material::Solid, BackgroundMode::Desktop),
             BackdropPlan::Drop
         );
         assert_eq!(
-            backdrop_plan(Material::Solid, BackgroundMode::Image, true),
+            backdrop_plan(Material::Solid, BackgroundMode::Image),
             BackdropPlan::Drop
         );
         assert_eq!(
-            backdrop_plan(Material::Acrylic, BackgroundMode::None, true),
+            backdrop_plan(Material::Acrylic, BackgroundMode::None),
             BackdropPlan::Drop
         );
     }
 
     #[test]
-    fn transient_material_fallback_persists_the_user_request() {
-        // A healthy session persists what is live.
+    fn effective_solid_never_plans_a_backdrop_build() {
+        // A requested Mica image with native transparency off must not decode:
+        // the effective material is Solid, whose plan is Drop even at startup.
+        let effective = material_for_surface(Material::Mica, false, false);
+        assert_eq!(effective, Material::Solid);
         assert_eq!(
-            material_to_persist(Material::Acrylic, Material::Acrylic, false),
-            Material::Acrylic
+            backdrop_plan(effective, BackgroundMode::Image),
+            BackdropPlan::Drop
         );
-        // An intentional Solid was copied into `requested_material`.
+        // Acrylic+Desktop is native blur only; it keeps/warms but never builds.
+        let effective = material_for_surface(Material::Acrylic, true, false);
         assert_eq!(
-            material_to_persist(Material::Solid, Material::Solid, false),
+            backdrop_plan(effective, BackgroundMode::Desktop),
+            BackdropPlan::Keep
+        );
+        // The same request with a healthy surface paints Mica.
+        let effective = material_for_surface(Material::Mica, true, false);
+        assert_eq!(
+            backdrop_plan(effective, BackgroundMode::Desktop),
+            BackdropPlan::Build
+        );
+    }
+
+    #[test]
+    fn explicit_solid_after_fallback_persists_solid() {
+        let mut requested = Material::Mica;
+        let mut fallback = true;
+        choose_material(&mut requested, &mut fallback, Material::Solid);
+
+        // config.material is the only persisted material, so an explicit Solid
+        // is saved rather than the stale Mica request.
+        let config = Config {
+            material: requested,
+            ..Config::default()
+        };
+        assert_eq!(config.material, Material::Solid);
+        assert!(!fallback);
+        assert_eq!(
+            material_for_surface(config.material, true, fallback),
             Material::Solid
         );
-        // A session-only fallback writes the requested Mica/Acrylic/Image
-        // launch intent instead of Solid.
+    }
+
+    #[test]
+    fn fallback_retries_the_requested_material_without_rewriting_it() {
+        let mut requested = Material::Mica;
+        let mut fallback = true;
+        choose_material(&mut requested, &mut fallback, Material::Mica);
+
+        assert_eq!(requested, Material::Mica);
+        assert!(!fallback, "an explicit retry abandons the old fallback");
+        // Still Solid while transparency effects are off...
         assert_eq!(
-            material_to_persist(Material::Solid, Material::Mica, true),
+            material_for_surface(requested, false, fallback),
+            Material::Solid
+        );
+        // ...and Mica when the live retry succeeds.
+        assert_eq!(
+            material_for_surface(requested, true, fallback),
             Material::Mica
         );
+    }
+
+    #[test]
+    fn live_transparency_toggle_changes_the_effective_material() {
+        // Turning effects off falls back immediately.
         assert_eq!(
-            material_to_persist(Material::Solid, Material::Acrylic, true),
+            material_for_surface(Material::Acrylic, false, false),
+            Material::Solid
+        );
+        // Turning them on retries the same request without a restart.
+        assert_eq!(
+            material_for_surface(Material::Acrylic, true, false),
             Material::Acrylic
+        );
+        // A recorded apply failure still forces Solid until an explicit retry.
+        assert_eq!(
+            material_for_surface(Material::Mica, true, true),
+            Material::Solid
+        );
+    }
+
+    #[test]
+    fn mica_with_no_background_keeps_the_native_transparent_path() {
+        // With DWM/transparency available, Mica+None must stay Mica: no Solid
+        // panel fill, no opaque clear color, and no painted backdrop.
+        let requested = Material::Mica;
+        let effective = material_for_surface(requested, true, false);
+        assert_eq!(effective, Material::Mica);
+        assert_eq!(
+            backdrop_plan(effective, BackgroundMode::None),
+            BackdropPlan::Drop
+        );
+        assert!(!paints_backdrop(effective, BackgroundMode::None));
+        assert_eq!(
+            clear_color_for(effective, true, Rgb::new(0x12, 0x34, 0x56)),
+            [0.0; 4]
+        );
+        // Only a genuinely unavailable surface falls back to Solid.
+        assert_eq!(
+            material_for_surface(requested, false, false),
+            Material::Solid
         );
     }
 
@@ -2558,29 +2796,30 @@ mod tests {
 
     #[test]
     fn native_materials_require_verified_surface_transparency() {
+        for material in [Material::Mica, Material::Acrylic] {
+            assert_eq!(
+                material_for_surface(material, false, false),
+                Material::Solid,
+                "{material:?} is unavailable without surface alpha/effects"
+            );
+            assert_eq!(material_for_surface(material, true, false), material);
+            assert_eq!(
+                material_for_surface(material, true, true),
+                Material::Solid,
+                "{material:?} stays Solid after an apply failure"
+            );
+        }
         assert_eq!(
-            material_for_surface(Material::Mica, false),
-            (Material::Solid, true)
+            material_for_surface(Material::Solid, false, false),
+            Material::Solid
         );
         assert_eq!(
-            material_for_surface(Material::Acrylic, false),
-            (Material::Solid, true)
+            material_for_surface(Material::Solid, true, false),
+            Material::Solid
         );
         assert_eq!(
-            material_for_surface(Material::Solid, false),
-            (Material::Solid, false)
-        );
-        assert_eq!(
-            material_for_surface(Material::Mica, true),
-            (Material::Mica, false)
-        );
-        assert_eq!(
-            material_for_surface(Material::Acrylic, true),
-            (Material::Acrylic, false)
-        );
-        assert_eq!(
-            material_for_surface(Material::Solid, true),
-            (Material::Solid, false)
+            material_for_surface(Material::Solid, true, true),
+            Material::Solid
         );
     }
 

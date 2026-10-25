@@ -102,6 +102,10 @@ struct Host {
     /// Physical size currently applied to the wgpu surface. Buffered `WM_SIZE`
     /// replays must not resize or repaint an unchanged surface.
     last_surface_size: Option<(u32, u32)>,
+    /// Static surface capability: the swapchain exposes a transparent alpha
+    /// mode. The live availability also depends on Windows transparency
+    /// effects, which the host re-checks on focus/theme/occlusion changes.
+    surface_alpha: bool,
     /// Set by a zero-sized (minimized) resize. The first non-zero restore must
     /// repaint even when Windows reports the same size as before minimizing.
     restore_pending: bool,
@@ -130,6 +134,7 @@ impl Host {
             close_requested: false,
             closing: false,
             last_surface_size: None,
+            surface_alpha: false,
             restore_pending: false,
             first_frame: true,
         }
@@ -189,7 +194,9 @@ impl Host {
             event_loop.exit();
             return;
         }
-        let native_transparency = log_gpu(&window, &self.painter);
+        let (surface_alpha, effects_enabled) = log_gpu(&window, &self.painter);
+        self.surface_alpha = surface_alpha;
+        let native_transparency = surface_alpha && effects_enabled;
 
         // `set_window` configured the surface at the window's current size.
         // Record it so a buffered `WM_SIZE` replay of that same size does not
@@ -257,6 +264,22 @@ impl Host {
         });
     }
 
+    /// Re-sample the live Windows transparency-effects setting while keeping
+    /// the static surface-alpha capability. Theme, focus, activation and
+    /// un-occlusion events are cheap and cover the user toggling Settings >
+    /// Personalization > Colors without a restart.
+    fn refresh_native_transparency(&mut self) {
+        let available = self.surface_alpha && crate::platform::transparency_effects_enabled();
+        let Some(app) = self.app.as_mut() else {
+            return;
+        };
+        if app.set_native_transparency(available)
+            && let Some(window) = &self.window
+        {
+            window.request_redraw();
+        }
+    }
+
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         if self.closing {
             log::debug!("redraw ignored after close");
@@ -269,9 +292,21 @@ impl Host {
         // paint then sees the 160x28 minimized client area and reflows the
         // terminal to a 1-row grid. The forced resize/redraw on restore paints
         // the restored size instead.
-        if window.is_minimized().unwrap_or(false) {
-            log::debug!("redraw ignored while minimized");
+        let live_size = window.inner_size();
+        if window.is_minimized().unwrap_or(false) || live_size.width == 0 || live_size.height == 0 {
+            log::debug!(
+                "redraw ignored while minimized or zero-sized ({}x{})",
+                live_size.width,
+                live_size.height
+            );
             return;
+        }
+        // A paint at a size the surface already has proves the restore pass
+        // happened. Do not let a stale flag force another identical resize.
+        if self.restore_pending
+            && self.last_surface_size == Some((live_size.width, live_size.height))
+        {
+            self.restore_pending = false;
         }
         let Some(state) = self.state.as_mut() else {
             return;
@@ -494,6 +529,23 @@ impl ApplicationHandler<UserEvent> for Host {
                 {
                     window.request_redraw();
                 }
+                if !occluded {
+                    self.refresh_native_transparency();
+                }
+            }
+            WindowEvent::ThemeChanged(_) => {
+                if let Some(state) = self.state.as_mut() {
+                    let _ = state.on_window_event(&window, &event);
+                }
+                self.refresh_native_transparency();
+                window.request_redraw();
+            }
+            WindowEvent::Focused(true) => {
+                if let Some(state) = self.state.as_mut() {
+                    let _ = state.on_window_event(&window, &event);
+                }
+                self.refresh_native_transparency();
+                window.request_redraw();
             }
             WindowEvent::Destroyed => self.finish_close(event_loop),
             _ => {
@@ -643,12 +695,14 @@ fn clear_repaint_deadline(deadline: &Mutex<Option<Instant>>) {
     }
 }
 
-/// Log the surface alpha capabilities and report whether a transparent
-/// backbuffer is available. `egui-wgpu` prefers `PreMultiplied` when it is
-/// available; this makes the choice visible in the startup log.
-fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
+/// Log the surface alpha capabilities and report `(surface_alpha,
+/// transparency_effects_enabled)`. The static alpha capability is kept
+/// separately from the live effects setting so the host can re-check effects
+/// without recreating the surface. `egui-wgpu` prefers `PreMultiplied` when it
+/// is available; this makes the choice visible in the startup log.
+fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> (bool, bool) {
     let Some(render_state) = painter.render_state() else {
-        return false;
+        return (false, false);
     };
     let info = render_state.adapter.get_info();
     log::info!("wgpu adapter: {} ({:?})", info.name, info.backend);
@@ -658,7 +712,7 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
         let _ = window;
         // Without the Windows DWM paths, native Mica/Acrylic are unavailable
         // and the app must stay on an opaque Solid surface.
-        false
+        (false, false)
     }
 
     // `Painter` does not expose its chosen alpha mode. A throwaway surface
@@ -685,11 +739,11 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
                 "surface alpha modes {modes:?}; transparent backbuffer: {chosen}; \
                  Windows transparency effects: {effects_enabled}"
             );
-            alpha_transparent && effects_enabled
+            (alpha_transparent, effects_enabled)
         }
         Err(error) => {
             log::warn!("failed to query surface alpha modes: {error}");
-            false
+            (false, false)
         }
     }
 }

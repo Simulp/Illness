@@ -1,5 +1,5 @@
 use egui::{Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Vec2, Visuals};
-use illness_core::{Config, Material, Rgb, Theme};
+use illness_core::{Material, Rgb, Theme};
 
 use crate::fonts;
 
@@ -212,7 +212,7 @@ fn style_widget(widget: &mut egui::style::WidgetVisuals, fill: Color32, tokens: 
     widget.expansion = 0.0;
 }
 
-pub fn install(ctx: &egui::Context, theme: &Theme, config: &Config) {
+pub fn install(ctx: &egui::Context, theme: &Theme, material: Material) {
     fonts::install(ctx);
 
     let tokens = Tokens::from_theme(theme);
@@ -233,7 +233,7 @@ pub fn install(ctx: &egui::Context, theme: &Theme, config: &Config) {
     visuals.text_options.font_hinting = true;
     visuals.text_options.subpixel_binning = false;
     visuals.override_text_color = Some(tokens.text);
-    visuals.panel_fill = if config.material == Material::Solid {
+    visuals.panel_fill = if material == Material::Solid {
         tokens.bg
     } else {
         Color32::TRANSPARENT

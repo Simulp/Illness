@@ -78,6 +78,15 @@ pub struct SearchRequest {
     pub case_sensitive: bool,
 }
 
+/// What one Settings pass changed. `retry_material` asks the app to re-apply
+/// the requested native material after the user re-selected it while the
+/// session was showing its Solid fallback.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SettingsOutcome {
+    pub changed: bool,
+    pub retry_material: bool,
+}
+
 /// Show whichever overlay is active. At most one overlay is drawn, so only it captures the keyboard.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
@@ -626,8 +635,10 @@ pub fn show_settings_panel(
     config: &mut Config,
     state: &mut OverlayState,
     backdrop_present: bool,
-) -> bool {
+    material_fallback: bool,
+) -> SettingsOutcome {
     let mut changed = false;
+    let mut retry_material = false;
 
     Frame::new()
         .fill(tokens.bg)
@@ -667,8 +678,15 @@ pub fn show_settings_panel(
                             .max_height(ui.available_height())
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                changed |=
-                                    appearance_section(ui, tokens, config, state, backdrop_present);
+                                changed |= appearance_section(
+                                    ui,
+                                    tokens,
+                                    config,
+                                    state,
+                                    backdrop_present,
+                                    material_fallback,
+                                    &mut retry_material,
+                                );
                                 changed |= terminal_section(ui, tokens, config);
                                 changed |= profiles_section(ui, tokens, config, state);
                                 about_section(ui, tokens, theme, state);
@@ -678,7 +696,10 @@ pub fn show_settings_panel(
             });
         });
 
-    changed
+    SettingsOutcome {
+        changed,
+        retry_material,
+    }
 }
 
 fn appearance_section(
@@ -687,6 +708,8 @@ fn appearance_section(
     config: &mut Config,
     state: &mut OverlayState,
     backdrop_present: bool,
+    material_fallback: bool,
+    retry_material: &mut bool,
 ) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Appearance");
@@ -708,20 +731,37 @@ fn appearance_section(
 
     changed |= setting_row(ui, tokens, "Material", |ui| {
         let mut chosen = config.material;
+        let mut picked = false;
         ComboBox::from_id_salt("illness_settings_material")
             .width(170.0)
-            .selected_text(material_name(config.material))
+            .selected_text(material_label(config.material, material_fallback))
             .popup_style(popup_style(tokens))
             .show_ui(ui, |ui| {
                 for material in [Material::Mica, Material::Acrylic, Material::Solid] {
-                    ui.selectable_value(&mut chosen, material, material_name(material));
+                    if ui
+                        .selectable_label(config.material == material, material_name(material))
+                        .clicked()
+                    {
+                        chosen = material;
+                        picked = true;
+                    }
                 }
             });
-        if chosen != config.material {
-            config.material = chosen;
-            true
-        } else {
-            false
+        if !picked {
+            return false;
+        }
+        match material_pick(config.material, material_fallback, chosen) {
+            MaterialPick::Changed => {
+                config.material = chosen;
+                true
+            }
+            MaterialPick::Retry => {
+                // Re-selecting the unavailable request retries it without
+                // rewriting config; the app falls back again only on failure.
+                *retry_material = true;
+                false
+            }
+            MaterialPick::None => false,
         }
     });
 
@@ -783,7 +823,14 @@ fn appearance_section(
         })
         .inner
     });
-    if !background_enabled {
+    if material_fallback && config.material != Material::Solid {
+        muted_label(
+            ui,
+            tokens,
+            "Native materials are unavailable, so the window is Solid. Opacity and the image \
+             apply when the request becomes available.",
+        );
+    } else if !background_enabled {
         muted_label(
             ui,
             tokens,
@@ -1817,6 +1864,35 @@ fn material_name(material: Material) -> &'static str {
     }
 }
 
+/// Label the requested material, flagging a session-only Solid fallback.
+fn material_label(material: Material, fallback: bool) -> String {
+    if fallback && material != Material::Solid {
+        format!("{} (unavailable)", material_name(material))
+    } else {
+        material_name(material).to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaterialPick {
+    /// Nothing changed.
+    None,
+    /// A different material was chosen and should be persisted/applied.
+    Changed,
+    /// The same unavailable native material was re-selected; retry it.
+    Retry,
+}
+
+fn material_pick(current: Material, fallback: bool, chosen: Material) -> MaterialPick {
+    if chosen != current {
+        MaterialPick::Changed
+    } else if fallback && current != Material::Solid {
+        MaterialPick::Retry
+    } else {
+        MaterialPick::None
+    }
+}
+
 fn background_name(mode: BackgroundMode) -> &'static str {
     match mode {
         BackgroundMode::Desktop => "Desktop",
@@ -1849,6 +1925,45 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn material_label_flags_a_fallback_but_not_solid() {
+        assert_eq!(material_label(Material::Mica, false), "Mica");
+        assert_eq!(material_label(Material::Acrylic, false), "Acrylic");
+        assert_eq!(material_label(Material::Mica, true), "Mica (unavailable)");
+        assert_eq!(
+            material_label(Material::Acrylic, true),
+            "Acrylic (unavailable)"
+        );
+        assert_eq!(material_label(Material::Solid, true), "Solid");
+    }
+
+    #[test]
+    fn material_pick_retries_the_unavailable_request_and_accepts_solid() {
+        // Fallback shows Mica; choosing Solid is a real persisted change.
+        assert_eq!(
+            material_pick(Material::Mica, true, Material::Solid),
+            MaterialPick::Changed
+        );
+        // Choosing the same unavailable native material retries it.
+        assert_eq!(
+            material_pick(Material::Mica, true, Material::Mica),
+            MaterialPick::Retry
+        );
+        assert_eq!(
+            material_pick(Material::Acrylic, true, Material::Acrylic),
+            MaterialPick::Retry
+        );
+        // A healthy session selecting its current material is a no-op.
+        assert_eq!(
+            material_pick(Material::Mica, false, Material::Mica),
+            MaterialPick::None
+        );
+        assert_eq!(
+            material_pick(Material::Mica, false, Material::Acrylic),
+            MaterialPick::Changed
+        );
     }
 
     #[test]
