@@ -1,0 +1,20 @@
+#!/usr/bin/env pwsh
+# Build the Windows NSIS installer for Illness into dist/.
+# The installer is per-machine: running it prompts for UAC elevation.
+$ErrorActionPreference = 'Stop'
+
+if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
+    throw @'
+cargo-packager is not installed.
+Install version 0.11.8 first:
+  cargo install cargo-packager --version 0.11.8 --locked
+'@
+}
+
+# Run from this directory so cargo-packager discovers only this Packager.toml.
+Push-Location $PSScriptRoot
+try {
+    cargo packager --release
+} finally {
+    Pop-Location
+}

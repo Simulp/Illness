@@ -1,0 +1,40 @@
+# Windows installer configuration for Illness (cargo-packager 0.11.8).
+#
+# Build from this directory:
+#   cargo packager --release
+# or run apps/illness/build-installer.ps1 from anywhere.
+#
+# Keep `version` in sync with [workspace.package] in the root Cargo.toml.
+# The app embeds its fonts and window icon, so no runtime resources are
+# packaged; user settings live in %APPDATA%\illness.
+
+name = "illness"
+product-name = "Illness"
+version = "0.1.0"
+identifier = "com.simulp.illness"
+publisher = "Simulp"
+description = "A Windows-first terminal emulator built on Alacritty's VT core and egui."
+copyright = "Copyright (c) 2026 Simulp"
+license-file = "installer-license.txt"
+formats = ["nsis"]
+
+# cargo builds into the workspace target directory; installers go to dist/.
+out-dir = "../../dist"
+binaries-dir = "../../target/release"
+binaries = [{ path = "illness", main = true }]
+icons = ["../../assets/illness.ico"]
+
+before-packaging-command = "cargo build --release -p illness"
+
+[nsis]
+# Machine-wide install: UAC prompt, $PROGRAMFILES64\Illness, All Users Start
+# Menu shortcut, and an uninstall entry in Programs and Features for all users.
+# Do not change this to "currentUser" or "both".
+# Note: cargo-packager 0.11.8 does not accept `install-mode`; the canonical
+# config key is `installMode` (alias: `installer-mode`).
+installMode = "perMachine"
+installer-icon = "../../assets/illness.ico"
+compression = "lzma"
+languages = ["English"]
+# Uninstaller can optionally remove the per-user config; it is kept by default.
+appdata-paths = ['$APPDATA\illness']
