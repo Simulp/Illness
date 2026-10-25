@@ -115,6 +115,10 @@ fn main() -> anyhow::Result<()> {
     let result = run();
     if let Err(error) = &result {
         log::error!("startup failed: {error}");
+        // `host::run` already reports window/surface creation failures. The
+        // event-loop build and run errors only surface here, so show the same
+        // native dialog for them instead of failing silently in a GUI build.
+        platform::show_startup_error(&format!("Illness could not start.\n\n{error}"));
     }
     result
 }

@@ -1,8 +1,9 @@
 //! In-window backdrop for translucent materials.
 //!
 //! Mica/Image backgrounds paint a blurred wallpaper behind the terminal and
-//! chrome, tinted by the configured opacity. Acrylic+Desktop skips this texture
-//! because `platform.rs` applies native behind-window blur instead.
+//! chrome, tinted by the configured opacity. Acrylic+Desktop keeps a prewarmed
+//! texture but never paints it: `platform.rs` applies native behind-window blur
+//! instead.
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use illness_core::config::BackgroundMode;

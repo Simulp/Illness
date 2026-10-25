@@ -400,15 +400,16 @@ impl IllnessApp {
 
     fn apply_material_to(&mut self, window: &impl HasWindowHandle) {
         let dark = !self.theme.is_light();
+        let theme_bg = self.theme.bg;
         let opacity = self.config.background_opacity;
         let requested = self.config.material;
-        if let Err(error) = platform::apply(window, requested, dark, opacity) {
+        if let Err(error) = platform::apply(window, requested, dark, theme_bg, opacity) {
             log::warn!(
                 "window material {} (dark={dark}) failed: {error}",
                 material_name(requested)
             );
             self.config.material = Material::Solid;
-            if let Err(error) = platform::apply(window, Material::Solid, dark, opacity) {
+            if let Err(error) = platform::apply(window, Material::Solid, dark, theme_bg, opacity) {
                 log::warn!("solid material unavailable: {error}");
             }
             self.overlays.toast = Some(format!(
@@ -431,21 +432,18 @@ impl IllnessApp {
 
     /// Reload the backdrop for the current mode and path.
     ///
-    /// Called only when the mode, path, or a gradient-producing theme changes;
-    /// opacity is applied at paint time. Images are decoded once per
-    /// `(path, mtime)` and rejected when larger than the texture cap.
+    /// Called only when the mode, path, a gradient-producing theme, or the
+    /// material changes; opacity is applied at paint time. Images are decoded
+    /// once per `(path, mtime)` and rejected when larger than the texture cap.
+    ///
+    /// Acrylic+Desktop also keeps a prewarmed texture even though the paint
+    /// guard suppresses it. The first switch away from native Acrylic then
+    /// reuses the path+mtime cache instead of paying for a cold wallpaper
+    /// decode in the middle of a frame.
     fn rebuild_backdrop(&mut self) {
+        let started = std::time::Instant::now();
         let mode = self.config.background;
         let path = self.config.background_path.clone();
-        // Native Acrylic already blurs the real desktop. Decoding and painting
-        // the wallpaper here would cover that behind-window blur.
-        if self.config.material == Material::Acrylic && mode == BackgroundMode::Desktop {
-            self.backdrop = None;
-            self.applied_background = Some((mode, path));
-            self.applied_background_opacity = self.config.background_opacity;
-            self.ctx.request_repaint();
-            return;
-        }
         match backdrop::build(&self.ctx, self.theme, mode, &path) {
             Ok(backdrop) => {
                 self.backdrop = backdrop;
@@ -466,12 +464,26 @@ impl IllnessApp {
         self.applied_background = Some((mode, path));
         self.applied_background_opacity = self.config.background_opacity;
         self.ctx.request_repaint();
+        log::debug!(
+            "backdrop rebuilt for {mode:?} in {:?} (image={})",
+            started.elapsed(),
+            self.backdrop
+                .as_ref()
+                .is_some_and(|backdrop| backdrop.from_image)
+        );
     }
 
-    /// Load an in-window backdrop after a material change when the new
-    /// material/mode needs one and none is currently loaded.
+    /// Keep the in-window backdrop in step with a material change.
+    ///
+    /// Entering Acrylic keeps the existing texture (the paint guard suppresses
+    /// it) and leaving Acrylic always rebuilds so a wallpaper changed while
+    /// native blur was active is re-read through the path+mtime cache.
     fn sync_backdrop_for_material(&mut self) {
-        if needs_backdrop(self.config.material, self.config.background) && self.backdrop.is_none() {
+        let leaving_acrylic =
+            self.applied_material == Material::Acrylic && self.config.material != Material::Acrylic;
+        let needs_load =
+            needs_backdrop(self.config.material, self.config.background) && self.backdrop.is_none();
+        if leaving_acrylic || needs_load {
             self.rebuild_backdrop();
         }
     }
@@ -568,9 +580,22 @@ impl IllnessApp {
         }
 
         // The legacy acrylic accent carries its own tint, so opacity changes
-        // must re-apply it even though the in-window tint is painted live.
-        if opacity_changed && self.config.material == Material::Acrylic {
-            self.pending_material = true;
+        // must re-apply it. This is intentionally the only work done: no
+        // design token install and no backdrop rebuild, keeping a live slider
+        // drag cheap.
+        if opacity_changed
+            && self.config.material == Material::Acrylic
+            && self.applied_material == Material::Acrylic
+        {
+            let window = Arc::clone(&self.window);
+            if let Err(error) = platform::apply_acrylic_tint(
+                window.as_ref(),
+                self.theme.bg,
+                !self.theme.is_light(),
+                self.config.background_opacity,
+            ) {
+                log::warn!("failed to re-apply the acrylic tint: {error}");
+            }
         }
 
         self.schedule_persist();
@@ -1440,11 +1465,9 @@ impl IllnessApp {
     pub fn clear_color(&self) -> [f32; 4] {
         match self.config.material {
             Material::Solid => design::color(self.theme.bg).to_normalized_gamma_f32(),
-            // Mica without a backdrop paints nothing in the UI, so a
-            // transparent clear would leave a fully see-through window.
-            Material::Mica if self.backdrop.is_none() => {
-                design::color(self.theme.bg).to_normalized_gamma_f32()
-            }
+            // Mica was applied successfully (a failure falls back to Solid),
+            // so the swapchain must stay transparent for DWM to composite the
+            // system backdrop behind it, including Mica+None.
             Material::Mica | Material::Acrylic => [0.0, 0.0, 0.0, 0.0],
         }
     }

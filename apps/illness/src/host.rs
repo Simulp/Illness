@@ -96,6 +96,12 @@ struct Host {
     /// Earliest wake-up delivered through [`UserEvent::Repaint`].
     repaint_at: Option<Instant>,
     close_requested: bool,
+    /// Set once the close path has saved and asked the loop to exit. Buffered
+    /// winit events such as `RedrawRequested` must not run after this point.
+    closing: bool,
+    /// Physical size currently applied to the wgpu surface. Buffered `WM_SIZE`
+    /// replays must not resize or repaint an unchanged surface.
+    last_surface_size: Option<(u32, u32)>,
     first_frame: bool,
 }
 
@@ -119,6 +125,8 @@ impl Host {
             requested_repaint: Arc::new(Mutex::new(None)),
             repaint_at: None,
             close_requested: false,
+            closing: false,
+            last_surface_size: None,
             first_frame: true,
         }
     }
@@ -179,6 +187,12 @@ impl Host {
         }
         log_gpu(&window, &self.painter);
 
+        // `set_window` configured the surface at the window's current size.
+        // Record it so a buffered `WM_SIZE` replay of that same size does not
+        // resize or repaint again.
+        let size = window.inner_size();
+        self.last_surface_size = Some((size.width, size.height));
+
         let mut state = egui_winit::State::new(
             self.ctx.clone(),
             ViewportId::ROOT,
@@ -235,6 +249,10 @@ impl Host {
     }
 
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        if self.closing {
+            log::debug!("redraw ignored after close");
+            return;
+        }
         let Some(window) = self.window.clone() else {
             return;
         };
@@ -258,9 +276,7 @@ impl Host {
             .get(&ViewportId::ROOT)
             .map(|viewport| viewport.commands.clone())
             .unwrap_or_default();
-        let cancel_close = commands
-            .iter()
-            .any(|command| matches!(command, ViewportCommand::CancelClose));
+        let cancel_close = cancel_close_requested(&commands);
         let mut actions = Vec::new();
         egui_winit::process_viewport_commands(
             &self.ctx,
@@ -322,9 +338,11 @@ impl Host {
     /// Save the session and stop the loop. `shutdown_and_save` is idempotent,
     /// so every close path can route here without double-saving.
     fn finish_close(&mut self, event_loop: &ActiveEventLoop) {
+        self.closing = true;
         if let Some(app) = self.app.as_mut() {
             app.shutdown_and_save();
         }
+        log::debug!("close path finished; stopping the event loop");
         event_loop.exit();
     }
 }
@@ -356,6 +374,13 @@ impl ApplicationHandler<UserEvent> for Host {
         if window.id() != window_id {
             return;
         }
+        // Once the close path ran, buffered events (a queued
+        // `RedrawRequested`, a late `Resized`, ...) must not touch a shut-down
+        // app. `Destroyed` still routes to the idempotent finish path.
+        if self.closing && !matches!(event, WindowEvent::Destroyed) {
+            log::debug!("window event ignored after close: {event:?}");
+            return;
+        }
 
         match event {
             WindowEvent::RedrawRequested => self.redraw(event_loop),
@@ -365,17 +390,33 @@ impl ApplicationHandler<UserEvent> for Host {
                 }
                 // Winit can deliver a stale size; query the live client area.
                 // A zero size is winit's minimize marker on Windows; there is
-                // no surface to resize in that case.
+                // no surface to resize in that case. Windows can also replay a
+                // buffered `WM_SIZE` for the current size: resizing and
+                // repainting then would multiply paints during a resize storm.
                 let size = window.inner_size();
-                if let (Some(width), Some(height)) =
-                    (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                {
-                    self.painter
-                        .on_window_resized(ViewportId::ROOT, width, height);
-                    // Paint once now so the swapchain is never presented at
-                    // the old size while a redraw is still pending.
-                    self.redraw(event_loop);
-                }
+                let Some((width, height)) =
+                    changed_surface_size(self.last_surface_size, size.width, size.height)
+                else {
+                    log::debug!(
+                        "resize event ignored: {}x{} (surface {:?})",
+                        size.width,
+                        size.height,
+                        self.last_surface_size
+                    );
+                    return;
+                };
+                log::debug!(
+                    "surface resized {:?} -> {}x{}",
+                    self.last_surface_size,
+                    width.get(),
+                    height.get()
+                );
+                self.painter
+                    .on_window_resized(ViewportId::ROOT, width, height);
+                self.last_surface_size = Some((width.get(), height.get()));
+                // Paint once now so the swapchain is never presented at the
+                // old size while a redraw is still pending.
+                self.redraw(event_loop);
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(state) = self.state.as_mut() {
@@ -410,12 +451,7 @@ impl ApplicationHandler<UserEvent> for Host {
                     window.request_redraw();
                 }
             }
-            WindowEvent::Destroyed => {
-                if let Some(app) = self.app.as_mut() {
-                    app.shutdown_and_save();
-                }
-                event_loop.exit();
-            }
+            WindowEvent::Destroyed => self.finish_close(event_loop),
             _ => {
                 if let Some(state) = self.state.as_mut()
                     && state.on_window_event(&window, &event).repaint
@@ -505,6 +541,31 @@ fn take_repaint_deadline(deadline: &Mutex<Option<Instant>>) -> Option<Instant> {
         .and_then(|mut deadline| deadline.take())
 }
 
+/// Interpret a pass's viewport commands. A `Close` always wins, so an app that
+/// closes its last tab cannot be kept alive by a `CancelClose` sent in the same
+/// pass; otherwise `CancelClose` vetoes the OS close frame.
+fn cancel_close_requested(commands: &[ViewportCommand]) -> bool {
+    !commands
+        .iter()
+        .any(|command| matches!(command, ViewportCommand::Close))
+        && commands
+            .iter()
+            .any(|command| matches!(command, ViewportCommand::CancelClose))
+}
+
+/// Return the surface size only when a non-zero size differs from the one
+/// already applied. Zero is winit's minimize marker; an equal size is a
+/// buffered `WM_SIZE` replay.
+fn changed_surface_size(
+    last: Option<(u32, u32)>,
+    width: u32,
+    height: u32,
+) -> Option<(NonZeroU32, NonZeroU32)> {
+    let width = NonZeroU32::new(width)?;
+    let height = NonZeroU32::new(height)?;
+    (last != Some((width.get(), height.get()))).then_some((width, height))
+}
+
 fn clear_repaint_deadline(deadline: &Mutex<Option<Instant>>) {
     if let Ok(mut deadline) = deadline.lock() {
         *deadline = None;
@@ -536,5 +597,37 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) {
             log::info!("surface alpha modes {modes:?}; transparent backbuffer: {chosen}");
         }
         Err(error) => log::warn!("failed to query surface alpha modes: {error}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cancel_close_requested, changed_surface_size};
+    use egui::ViewportCommand;
+
+    #[test]
+    fn close_wins_over_cancel_close_in_the_same_pass() {
+        assert!(cancel_close_requested(&[ViewportCommand::CancelClose]));
+        assert!(!cancel_close_requested(&[ViewportCommand::Close]));
+        assert!(!cancel_close_requested(&[
+            ViewportCommand::CancelClose,
+            ViewportCommand::Close,
+        ]));
+        assert!(!cancel_close_requested(&[]));
+    }
+
+    #[test]
+    fn surface_size_change_dedupes_replays_and_skips_zero() {
+        assert_eq!(
+            changed_surface_size(None, 1180, 760).map(|(w, h)| (w.get(), h.get())),
+            Some((1180, 760))
+        );
+        assert!(changed_surface_size(Some((1180, 760)), 1180, 760).is_none());
+        assert!(changed_surface_size(Some((1180, 760)), 0, 0).is_none());
+        assert!(changed_surface_size(Some((1180, 760)), 0, 400).is_none());
+        assert_eq!(
+            changed_surface_size(Some((1180, 760)), 800, 600).map(|(w, h)| (w.get(), h.get())),
+            Some((800, 600))
+        );
     }
 }

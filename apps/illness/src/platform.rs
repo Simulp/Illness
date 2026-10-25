@@ -6,7 +6,7 @@
 #![allow(unsafe_code)]
 
 use anyhow::Result;
-use illness_core::Material;
+use illness_core::{Material, Rgb};
 use raw_window_handle::HasWindowHandle;
 use std::path::PathBuf;
 
@@ -42,12 +42,10 @@ const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 #[cfg(target_os = "windows")]
 const ACCENT_DISABLED: u32 = 0;
 
-/// Acrylic tint RGB packed as the low 24 bits of an `AABBGGRR` gradient
-/// colour. The alpha byte is derived from the configured opacity.
+/// Alpha at 100% background opacity. The legacy acrylic blur needs a
+/// translucent tint to show through; a low alpha keeps the verified strength.
 #[cfg(target_os = "windows")]
-const ACRYLIC_RGB_DARK: u32 = 0x0030_2020;
-#[cfg(target_os = "windows")]
-const ACRYLIC_RGB_LIGHT: u32 = 0x00f5_f5f5;
+const ACRYLIC_TINT_ALPHA_OPAQUE: f32 = 32.0;
 
 /// `ACCENT_POLICY` from `winuser.h`.
 #[cfg(target_os = "windows")]
@@ -261,19 +259,20 @@ pub fn current_wallpaper_path() -> Option<PathBuf> {
 
 /// Apply the requested backdrop to `window`.
 ///
-/// `opacity` is the user's background-opacity percentage (0-100); Acrylic uses
-/// it to derive the alpha byte of the legacy accent tint. Mica failing on
-/// Windows 10 is expected; the caller falls back to [`Material::Solid`] and
+/// `theme_bg` is the theme background tint used by the legacy acrylic accent;
+/// `opacity` is the user's background-opacity percentage (0-100). Mica failing
+/// on Windows 10 is expected; the caller falls back to [`Material::Solid`] and
 /// reports a toast. On non-Windows platforms this is a no-op.
 pub fn apply(
     window: &impl HasWindowHandle,
     material: Material,
     dark: bool,
+    theme_bg: Rgb,
     opacity: f32,
 ) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (window, material, dark, opacity);
+        let _ = (window, material, dark, theme_bg, opacity);
         Ok(())
     }
 
@@ -303,7 +302,7 @@ pub fn apply(
                 let _ = window_vibrancy::clear_mica(window);
                 let _ = window_vibrancy::clear_acrylic(window);
                 extend_frame(hwnd, false);
-                let tint = acrylic_tint(dark, opacity);
+                let tint = acrylic_tint(theme_bg, opacity);
                 if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
                     anyhow::bail!("legacy acrylic accent policy is unavailable");
                 }
@@ -321,19 +320,62 @@ pub fn apply(
     }
 }
 
+/// Re-apply only the legacy acrylic tint after an opacity change.
+///
+/// This deliberately avoids `design::install`, a backdrop rebuild, or any
+/// other material work so dragging the opacity slider stays cheap. `dark` is
+/// accepted for symmetry with [`apply`]; the tint itself follows `theme_bg`.
+pub fn apply_acrylic_tint(
+    window: &impl HasWindowHandle,
+    theme_bg: Rgb,
+    dark: bool,
+    opacity: f32,
+) -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (window, theme_bg, dark, opacity);
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = dark;
+        let started = std::time::Instant::now();
+        let handle = window.window_handle()?;
+        let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+            anyhow::bail!("window does not expose a Win32 handle");
+        };
+        let hwnd = win32.hwnd.get() as HWND;
+        let tint = acrylic_tint(theme_bg, opacity);
+        if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
+            anyhow::bail!("legacy acrylic accent policy is unavailable");
+        }
+        log::debug!(
+            "acrylic tint re-applied in {:?} (alpha={})",
+            started.elapsed(),
+            tint >> 24
+        );
+        Ok(())
+    }
+}
+
 /// Build the `AABBGGRR` gradient colour for the legacy acrylic policy.
 ///
-/// The RGB tint stays dark or light with the theme; the alpha follows the
-/// background-opacity slider the same way the in-window tint does.
+/// The RGB tint comes from the theme background. The alpha follows the
+/// background-opacity slider: 255 at 0% (opaque theme colour) down to
+/// [`ACRYLIC_TINT_ALPHA_OPAQUE`] at 100% (full blur).
 #[cfg(target_os = "windows")]
-fn acrylic_tint(dark: bool, opacity: f32) -> u32 {
-    let rgb = if dark {
-        ACRYLIC_RGB_DARK
+fn acrylic_tint(theme_bg: Rgb, opacity: f32) -> u32 {
+    let opacity = if opacity.is_finite() {
+        opacity.clamp(0.0, 100.0) / 100.0
     } else {
-        ACRYLIC_RGB_LIGHT
+        1.0
     };
-    let alpha = u32::from(crate::backdrop::tint_alpha(Material::Acrylic, opacity));
-    (alpha << 24) | rgb
+    let alpha = (255.0 + (ACRYLIC_TINT_ALPHA_OPAQUE - 255.0) * opacity).round() as u32;
+    (alpha << 24)
+        | (u32::from(theme_bg.b) << 16)
+        | (u32::from(theme_bg.g) << 8)
+        | u32::from(theme_bg.r)
 }
 
 /// Show a blocking native error dialog for a failure that prevents startup.
@@ -447,17 +489,33 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::acrylic_tint;
+    use illness_core::Rgb;
 
     #[test]
     fn acrylic_tint_alpha_follows_opacity() {
-        let transparent_tint = acrylic_tint(true, 0.0);
-        let full_blur = acrylic_tint(true, 100.0);
+        let theme_bg = Rgb::new(0x20, 0x20, 0x30);
 
-        assert_eq!(transparent_tint >> 24, 255, "0% must be opaque");
-        assert_eq!(full_blur >> 24, 50, "100% keeps Acrylic strength");
-        assert_ne!(transparent_tint, full_blur);
-        assert_eq!(transparent_tint & 0x00ff_ffff, 0x0030_2020);
-        assert_eq!(full_blur & 0x00ff_ffff, 0x0030_2020);
-        assert_eq!(acrylic_tint(false, 100.0) & 0x00ff_ffff, 0x00f5_f5f5);
+        assert_eq!(acrylic_tint(theme_bg, 0.0) >> 24, 255, "0% must be opaque");
+        assert_eq!(acrylic_tint(theme_bg, 50.0) >> 24, 144, "50% is halfway");
+        assert_eq!(
+            acrylic_tint(theme_bg, 100.0) >> 24,
+            32,
+            "100% keeps the verified Acrylic strength"
+        );
+        assert_ne!(acrylic_tint(theme_bg, 0.0), acrylic_tint(theme_bg, 100.0));
+        assert_eq!(
+            acrylic_tint(theme_bg, f32::NAN) >> 24,
+            32,
+            "non-finite opacity is full strength"
+        );
+    }
+
+    #[test]
+    fn acrylic_tint_uses_theme_rgb() {
+        let theme_bg = Rgb::new(0x12, 0x34, 0x56);
+
+        assert_eq!(acrylic_tint(theme_bg, 0.0) & 0x00ff_ffff, 0x0056_3412);
+        assert_eq!(acrylic_tint(theme_bg, 50.0) & 0x00ff_ffff, 0x0056_3412);
+        assert_eq!(acrylic_tint(theme_bg, 100.0) & 0x00ff_ffff, 0x0056_3412);
     }
 }
