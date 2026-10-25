@@ -6,11 +6,21 @@
 //! white + gamma-corrected alpha (`2c - c²`, tuned for light-on-dark UI) and
 //! premultiplied RGBA for color glyphs.
 //!
-//! Windows Terminal's grayscale shader instead applies a color-dependent
-//! gamma-1.8 correction per fragment (0.69 vs our 0.75 at 50% coverage), which
-//! measured softer at 14 px: 305 -> 224 full-alpha pixels (-27%) and
-//! 832 -> 913 partial pixels (+10%). The fixed dark-mode curve is kept so the
-//! atlas stays color-agnostic.
+//! Terminal grid glyphs (the [`SoftGlyph`] path used by both the software
+//! compositor and the GPU mask pipeline) are deliberately *grayscale*. swash's
+//! `Format::Subpixel` mask is a raw three-sample RGB mask with no LCD low-pass
+//! filter, and its hinting snaps stems to the 1/3-pixel LCD grid. At terminal
+//! sizes that leaves ±60% per-channel coverage on every stem edge, which reads
+//! as rainbow fringing on light-on-dark text. Windows Terminal's default
+//! grayscale mode has none of that error, so the grid uses one coverage byte
+//! per pixel and ordinary alpha blending. Color glyphs (emoji) keep their own
+//! colors.
+//!
+//! Windows Terminal's grayscale shader applies a color-dependent gamma-1.8
+//! correction per fragment (0.69 vs our 0.75 at 50% coverage), which measured
+//! softer at 14 px: 305 -> 224 full-alpha pixels (-27%) and 832 -> 913 partial
+//! pixels (+10%). The fixed dark-mode curve is kept for the egui atlas so it
+//! stays color-agnostic. The terminal mask path stores raw coverage.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -124,10 +134,10 @@ pub struct Glyph {
     pub wide: bool,
 }
 
-/// A glyph rasterized into CPU memory for subpixel software compositing.
+/// A glyph rasterized into CPU memory for software compositing.
 ///
-/// Mask glyphs store three bytes per pixel of linear RGB coverage, so each
-/// channel can be blended independently (ClearType). Color glyphs (emoji)
+/// Mask glyphs store one byte of grayscale coverage per pixel, so every color
+/// channel blends by the same amount (no chroma fringing). Color glyphs (emoji)
 /// store premultiplied RGBA and ignore the foreground color.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SoftGlyph {
@@ -135,7 +145,7 @@ pub struct SoftGlyph {
     pub height: u32,
     pub left: i32,
     pub top: i32,
-    /// RGB coverage (3 bytes/pixel) or premultiplied RGBA (4 bytes/pixel).
+    /// Grayscale coverage (1 byte/pixel) or premultiplied RGBA (4 bytes/pixel).
     pub data: Vec<u8>,
     pub color: bool,
 }
@@ -457,12 +467,11 @@ impl GlyphAtlas {
         Some(glyph)
     }
 
-    /// Rasterizes and caches a glyph for software subpixel compositing.
+    /// Rasterizes and caches a glyph for software compositing.
     ///
-    /// Mask glyphs use swash's `Format::Subpixel` and therefore come back as
-    /// `Content::SubpixelMask`. swash/zeno store that mask as four bytes per
-    /// pixel (RGBX, alpha unused), so it is compacted to the three bytes per
-    /// pixel exposed by [`SoftGlyph`].
+    /// Mask glyphs use swash's `Format::Alpha` and therefore come back as
+    /// `Content::Mask`, one coverage byte per pixel. Color glyphs keep
+    /// premultiplied RGBA.
     pub fn soft_glyph(&mut self, ch: char, style: GlyphStyle) -> Option<Arc<SoftGlyph>> {
         let key = (ch, style);
         if let Some(glyph) = self.soft_cache.get(&key) {
@@ -497,7 +506,7 @@ impl GlyphAtlas {
                 .and_then(|index| self.fallback_faces.get(index))
                 .and_then(|face| FontRef::from_index(&face.data, face.index))
                 .or(primary)?;
-            rasterize_subpixel(
+            rasterize(
                 &mut self.scale,
                 source_font,
                 glyph_id,
@@ -724,32 +733,6 @@ fn rasterize_with(
     )
 }
 
-/// Rasterizes one glyph as three-channel subpixel coverage.
-fn rasterize_subpixel(
-    scale: &mut ScaleContext,
-    font: FontRef<'_>,
-    glyph_id: GlyphId,
-    style: GlyphStyle,
-    physical_size: f32,
-    ppp: f32,
-) -> Option<Image> {
-    let weight = if style.is_bold() {
-        BOLD_WEIGHT
-    } else {
-        REGULAR_WEIGHT
-    };
-    rasterize_format(
-        scale,
-        font,
-        glyph_id,
-        style,
-        physical_size,
-        ppp,
-        RasterOptions { hint: true, weight },
-        Format::Subpixel,
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn rasterize_format(
     scale: &mut ScaleContext,
@@ -868,21 +851,10 @@ fn soft_from_image(image: &Image) -> SoftGlyph {
                 data.extend_from_slice(&pixel);
             }
         }
-    } else if image.data.len() >= count * 4 {
-        // swash's SubpixelMask is RGBX: four bytes per pixel, alpha unused.
-        data.reserve(count * 3);
-        for pixel in image.data.as_chunks::<4>().0.iter().take(count) {
-            data.extend_from_slice(&pixel[..3]);
-        }
-    } else if image.data.len() >= count * 3 {
-        data.extend_from_slice(&image.data[..count * 3]);
     } else {
-        // Grayscale fallback: replicate one coverage byte across all channels.
-        data.reserve(count * 3);
-        for index in 0..count {
-            let coverage = image.data.get(index).copied().unwrap_or(0);
-            data.extend_from_slice(&[coverage, coverage, coverage]);
-        }
+        // `Format::Alpha` masks are one coverage byte per pixel.
+        data.extend_from_slice(&image.data[..image.data.len().min(count)]);
+        data.resize(count, 0);
     }
 
     SoftGlyph {
@@ -1042,8 +1014,8 @@ mod tests {
     }
 
     #[test]
-    fn test_soft_glyph_subpixel_fringes() {
-        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+    fn test_soft_glyph_grayscale_mask() {
+        let (_ctx, mut atlas) = atlas(18.0, 1.0);
         let glyph = atlas
             .soft_glyph('H', GlyphStyle::Regular)
             .expect("H soft glyph");
@@ -1051,17 +1023,58 @@ mod tests {
         assert!(glyph.width > 0 && glyph.height > 0);
         assert_eq!(
             glyph.data.len(),
-            glyph.width as usize * glyph.height as usize * 3
+            glyph.width as usize * glyph.height as usize,
+            "grayscale masks must store one coverage byte per pixel"
         );
         assert!(glyph.data.iter().any(|&value| value > 0));
         assert!(
-            glyph
-                .data
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .any(|pixel| pixel[0] != pixel[1] || pixel[1] != pixel[2]),
-            "expected per-channel ClearType fringes"
+            glyph.data.iter().any(|&value| value > 0 && value < 255),
+            "expected antialiased edge coverage"
+        );
+    }
+
+    /// The lowercase `i` must keep a detached but horizontally aligned dot.
+    /// A broken placement or a clipped mask shows up as a missing gap, a
+    /// one-pixel dot, or a dot that no longer overlaps the stem.
+    #[test]
+    fn test_i_dot_and_stem_geometry() {
+        let (_ctx, mut atlas) = atlas(18.0, 1.0);
+        let glyph = atlas
+            .soft_glyph('i', GlyphStyle::Regular)
+            .expect("i soft glyph");
+        assert!(!glyph.color);
+        let width = glyph.width as usize;
+        let height = glyph.height as usize;
+        let ink = |y: usize| -> Vec<usize> {
+            (0..width)
+                .filter(|&x| glyph.data[y * width + x] > 0)
+                .collect()
+        };
+
+        let dot = ink(0);
+        assert!(!dot.is_empty(), "i dot is clipped at the top");
+        assert!(
+            dot.iter().all(|&x| x > 0 && x + 1 < width),
+            "i dot touches the mask edge: {dot:?}"
+        );
+        assert!(dot.len() >= 2, "i dot is only {} px wide", dot.len());
+        assert!(
+            ink(height - 1).len() >= 2,
+            "i bottom is clipped at the last mask row"
+        );
+
+        let gap = (1..height)
+            .find(|&y| ink(y).is_empty())
+            .expect("i dot should be detached from the stem by a blank row");
+        assert!(gap > 0 && gap < height / 2, "unexpected i gap at row {gap}");
+
+        let stem_row = gap + 2;
+        assert!(stem_row < height, "i stem missing below the dot gap");
+        let stem = ink(stem_row);
+        assert!(stem.len() >= 2, "i stem is only {} px wide", stem.len());
+        assert!(
+            dot.iter().any(|x| stem.contains(x)),
+            "i dot {dot:?} does not overlap stem {stem:?}"
         );
     }
 

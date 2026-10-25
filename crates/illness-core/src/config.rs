@@ -63,7 +63,7 @@ pub struct Config {
     /// filtered out when built-in profiles are merged on the next launch.
     pub hidden_profiles: Vec<String>,
     /// Draw terminal glyphs with the GPU compositor when a wgpu device is
-    /// available. `false` always uses the CPU ClearType surface.
+    /// available. `false` always uses the CPU grayscale compositor.
     pub gpu_text: bool,
 }
 
