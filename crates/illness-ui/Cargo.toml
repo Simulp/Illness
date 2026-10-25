@@ -14,6 +14,7 @@ egui.workspace = true
 swash.workspace = true
 fontdb.workspace = true
 open.workspace = true
+rfd.workspace = true
 
 [lints]
 workspace = true

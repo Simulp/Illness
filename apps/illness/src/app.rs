@@ -26,7 +26,7 @@ const BELL_FLASH_SECS: f64 = 0.18;
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-/// One live tab: the PTY session plus everything the UI remembers about it.
+/// One live terminal tab: the PTY session plus everything the UI remembers.
 struct Tab {
     session: Session,
     view: TerminalView,
@@ -39,6 +39,12 @@ struct Tab {
     focus_reported: bool,
 }
 
+/// A slot in the tab strip. Settings is a real tab but has no PTY session.
+enum TabEntry {
+    Terminal(Box<Tab>),
+    Settings,
+}
+
 /// The eframe application shell and all cross-module state.
 pub struct IllnessApp {
     ctx: egui::Context,
@@ -47,7 +53,7 @@ pub struct IllnessApp {
     theme: &'static Theme,
     tokens: Tokens,
     atlas: GlyphAtlas,
-    tabs: Vec<Tab>,
+    tabs: Vec<TabEntry>,
     active: usize,
     chrome: ChromeState,
     overlays: OverlayState,
@@ -69,25 +75,11 @@ pub struct IllnessApp {
 impl IllnessApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = Config::load();
-        config.profiles = detect_profiles();
+        let mut detected = detect_profiles();
         #[cfg(target_os = "windows")]
-        config.profiles.extend(platform::wsl_profiles());
-        if !config
-            .profiles
-            .iter()
-            .any(|profile| profile.name == config.default_profile)
-        {
-            config.default_profile = config
-                .profiles
-                .first()
-                .map(|profile| profile.name.clone())
-                .unwrap_or_default();
-        }
-        if config.default_profile.is_empty()
-            && let Some(profile) = config.profiles.first()
-        {
-            config.default_profile = profile.name.clone();
-        }
+        detected.extend(platform::wsl_profiles());
+        config.profiles = merge_profiles(std::mem::take(&mut config.profiles), detected);
+        ensure_default_profile(&mut config);
 
         let theme = Theme::by_name(&config.theme);
         let tokens = Tokens::from_theme(theme);
@@ -141,13 +133,49 @@ impl IllnessApp {
     pub fn open_tab(&mut self, profile: Option<&str>) {
         match self.build_tab(profile) {
             Ok(tab) => {
-                self.tabs.push(tab);
-                self.active = self.tabs.len().saturating_sub(1);
+                let index = self.settings_index().unwrap_or(self.tabs.len());
+                self.tabs.insert(index, TabEntry::Terminal(Box::new(tab)));
+                self.active = index;
             }
             Err(error) => {
                 self.overlays.toast = Some(error);
             }
         }
+    }
+
+    /// Focus the Settings tab, creating it after the terminal tabs if needed.
+    fn open_settings(&mut self) {
+        if let Some(index) = self.settings_index() {
+            self.active = index;
+        } else {
+            self.tabs.push(TabEntry::Settings);
+            self.active = self.tabs.len() - 1;
+        }
+        self.chrome.dropdown_open = false;
+    }
+
+    fn settings_index(&self) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|entry| matches!(entry, TabEntry::Settings))
+    }
+
+    fn active_terminal(&self) -> Option<&Tab> {
+        match self.tabs.get(self.active) {
+            Some(TabEntry::Terminal(tab)) => Some(tab),
+            _ => None,
+        }
+    }
+
+    fn active_terminal_mut(&mut self) -> Option<&mut Tab> {
+        match self.tabs.get_mut(self.active) {
+            Some(TabEntry::Terminal(tab)) => Some(tab.as_mut()),
+            _ => None,
+        }
+    }
+
+    fn active_terminal_index(&self) -> Option<usize> {
+        matches!(self.tabs.get(self.active), Some(TabEntry::Terminal(_))).then_some(self.active)
     }
 
     fn build_tab(&self, requested: Option<&str>) -> Result<Tab, String> {
@@ -301,6 +329,10 @@ impl IllnessApp {
 
     fn reapply_config(&mut self) {
         self.config = self.config.clone().sanitized();
+        ensure_default_profile(&mut self.config);
+        if self.config.profiles != self.profiles {
+            self.profiles = self.config.profiles.clone();
+        }
 
         let theme = Theme::by_name(&self.config.theme);
         if theme.name != self.applied_theme.as_str() {
@@ -310,6 +342,7 @@ impl IllnessApp {
             self.backdrop = backdrop::build(&self.ctx, theme);
             self.applied_theme = theme.name.to_string();
             self.pending_material = true;
+            self.ctx.request_repaint();
         }
 
         if (self.config.font_size - self.applied_font_size).abs() > f32::EPSILON {
@@ -346,7 +379,10 @@ impl IllnessApp {
         }
         self.saved = true;
 
-        for tab in &self.tabs {
+        for entry in &self.tabs {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
             tab.session.shutdown();
         }
         if let Err(error) = self.config.save() {
@@ -367,23 +403,23 @@ impl IllnessApp {
     }
 
     fn close_tab(&mut self, index: usize) {
-        match close_effect(self.tabs.len(), self.active, index) {
-            None => {}
-            Some(CloseEffect::CloseWindow) => {
-                self.tabs.remove(index);
-                self.active = 0;
-                self.shutdown_and_save();
-                self.ctx.send_viewport_cmd(ViewportCommand::Close);
-            }
-            Some(CloseEffect::KeepTabs { next_active }) => {
-                self.tabs.remove(index);
-                self.active = next_active.min(self.tabs.len().saturating_sub(1));
-            }
+        if index >= self.tabs.len() {
+            return;
         }
+        if self.tabs.len() == 1 {
+            self.tabs.remove(index);
+            self.active = 0;
+            self.shutdown_and_save();
+            self.ctx.send_viewport_cmd(ViewportCommand::Close);
+            return;
+        }
+
+        self.tabs.remove(index);
+        self.active = next_active_after_close(self.active, index, self.tabs.len());
     }
 
     fn restart_tab(&mut self, index: usize) {
-        let Some(tab) = self.tabs.get(index) else {
+        let Some(TabEntry::Terminal(tab)) = self.tabs.get(index) else {
             return;
         };
         let profile_name = tab.profile_name.clone();
@@ -391,7 +427,7 @@ impl IllnessApp {
         match self.build_tab(Some(&profile_name)) {
             Ok(replacement) => {
                 if let Some(slot) = self.tabs.get_mut(index) {
-                    *slot = replacement;
+                    *slot = TabEntry::Terminal(Box::new(replacement));
                     self.active = index;
                 }
             }
@@ -419,7 +455,7 @@ impl IllnessApp {
     }
 
     fn selection_text(&self) -> Option<String> {
-        let text = self.tabs.get(self.active)?.session.selection_to_string()?;
+        let text = self.active_terminal()?.session.selection_to_string()?;
         let text = trim_copy(&text);
         (!text.is_empty()).then_some(text)
     }
@@ -436,7 +472,7 @@ impl IllnessApp {
             return;
         }
 
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self.active_terminal() {
             let bracketed = tab.session.snapshot().modes.bracketed_paste;
             tab.session.write(&format_paste(&text, bracketed));
         }
@@ -449,7 +485,7 @@ impl IllnessApp {
     }
 
     fn select_all(&mut self) {
-        if let Some(tab) = self.tabs.get(self.active) {
+        if let Some(tab) = self.active_terminal() {
             let snapshot = tab.session.snapshot();
             if snapshot.cols > 0 && snapshot.rows > 0 {
                 tab.session
@@ -461,7 +497,7 @@ impl IllnessApp {
     }
 
     fn clear_view(&mut self) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
+        if let Some(tab) = self.active_terminal_mut() {
             tab.session.selection_clear();
             let offset = i32::try_from(tab.session.snapshot().display_offset).unwrap_or(i32::MAX);
             if offset > 0 {
@@ -476,13 +512,13 @@ impl IllnessApp {
         if query.is_empty() {
             self.overlays.search_index = None;
             self.last_search = None;
-            if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) {
                 tab.view.search = None;
             }
             return;
         }
 
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) else {
             self.overlays.search_index = Some((0, 0));
             return;
         };
@@ -536,7 +572,7 @@ impl IllnessApp {
         if self.overlays.kind != OverlayKind::Search {
             self.overlays.search_index = None;
             self.last_search = None;
-            if let Some(tab) = self.tabs.get_mut(self.active)
+            if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active)
                 && tab.view.search.is_some()
             {
                 tab.view.search = None;
@@ -549,13 +585,13 @@ impl IllnessApp {
         if query.is_empty() {
             self.overlays.search_index = None;
             self.last_search = None;
-            if let Some(tab) = self.tabs.get_mut(self.active) {
+            if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) {
                 tab.view.search = None;
             }
             return;
         }
 
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) else {
             self.overlays.search_index = Some((0, 0));
             return;
         };
@@ -600,8 +636,7 @@ impl IllnessApp {
                 self.overlays.kind = OverlayKind::Search;
             }
             Action::OpenSettings => {
-                self.chrome.dropdown_open = false;
-                self.overlays.kind = OverlayKind::Settings;
+                self.open_settings();
             }
             Action::Minimize => self.ctx.send_viewport_cmd(ViewportCommand::Minimized(true)),
             Action::Maximize => {
@@ -651,7 +686,10 @@ impl IllnessApp {
         let theme = self.theme;
         let mut bell = false;
 
-        for tab in &mut self.tabs {
+        for entry in &mut self.tabs {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
             while let Ok(event) = tab.session.events().try_recv() {
                 match event {
                     SessionEvent::Title(title) => {
@@ -687,7 +725,10 @@ impl IllnessApp {
     }
 
     fn sync_tabs(&mut self) {
-        for tab in &mut self.tabs {
+        for entry in &mut self.tabs {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
             if tab.session.is_exited() {
                 tab.exited = true;
             }
@@ -700,10 +741,13 @@ impl IllnessApp {
     /// Send focus in/out reports when the window focus or active tab changes,
     /// but only to sessions that enabled DECSET 1004.
     fn sync_focus(&mut self) {
-        let active = self.active;
+        let active = self.active_terminal_index();
         let window_focused = self.window_focused;
-        for (index, tab) in self.tabs.iter_mut().enumerate() {
-            let desired = window_focused && index == active;
+        for (index, entry) in self.tabs.iter_mut().enumerate() {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
+            let desired = window_focused && Some(index) == active;
             if !tab.session.focus_reporting() {
                 tab.focus_reported = false;
                 continue;
@@ -727,17 +771,29 @@ impl IllnessApp {
     fn tab_infos(&self) -> Vec<TabInfo> {
         self.tabs
             .iter()
-            .map(|tab| TabInfo {
-                title: tab.title.clone(),
-                profile: tab.profile_name.clone(),
-                accent: tab.accent,
-                exited: tab.exited,
+            .map(|entry| match entry {
+                TabEntry::Terminal(tab) => TabInfo {
+                    title: tab.title.clone(),
+                    profile: tab.profile_name.clone(),
+                    accent: tab.accent,
+                    exited: tab.exited,
+                },
+                TabEntry::Settings => TabInfo {
+                    title: "Settings".to_string(),
+                    profile: "Settings".to_string(),
+                    accent: self.theme.accent,
+                    exited: false,
+                },
             })
             .collect()
     }
 
     fn update_window_title(&mut self, ctx: &egui::Context) {
-        let title = self.tabs.get(self.active).map(|tab| tab.title.as_str());
+        let title = match self.tabs.get(self.active) {
+            Some(TabEntry::Terminal(tab)) => Some(tab.title.as_str()),
+            Some(TabEntry::Settings) => Some("Settings"),
+            None => None,
+        };
         let desired = window_title_for(title);
         if desired != self.window_title {
             self.window_title = desired.clone();
@@ -831,7 +887,7 @@ impl IllnessApp {
             }
             Shortcut::Palette => self.overlays.kind = OverlayKind::Palette,
             Shortcut::Search => self.overlays.kind = OverlayKind::Search,
-            Shortcut::Settings => self.overlays.kind = OverlayKind::Settings,
+            Shortcut::Settings => self.open_settings(),
             Shortcut::ZoomIn => self.set_font_size(self.config.font_size + 1.0),
             Shortcut::ZoomOut => self.set_font_size(self.config.font_size - 1.0),
             Shortcut::ZoomReset => self.set_font_size(DEFAULT_FONT_SIZE),
@@ -931,8 +987,20 @@ impl eframe::App for IllnessApp {
         let mut context_menu_pos = None;
         let mut restart_requested = false;
         let mut close_requested = false;
+        let mut settings_changed = false;
 
-        {
+        let settings_active = matches!(self.tabs.get(self.active), Some(TabEntry::Settings));
+
+        if settings_active {
+            let tokens = &self.tokens;
+            let theme = self.theme;
+            let config = &mut self.config;
+            let overlay_state = &mut self.overlays;
+            egui::CentralPanel::no_frame().show(ui, |ui| {
+                settings_changed =
+                    overlays::show_settings_panel(ui, tokens, theme, config, overlay_state);
+            });
+        } else {
             let active = self.active;
             let config = &self.config;
             let tokens = &self.tokens;
@@ -941,7 +1009,7 @@ impl eframe::App for IllnessApp {
             let tabs = &mut self.tabs;
 
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                let Some(tab) = tabs.get_mut(active) else {
+                let Some(TabEntry::Terminal(tab)) = tabs.get_mut(active) else {
                     let rect = ui.available_rect_before_wrap();
                     ui.painter().rect_filled(rect, 0.0, tokens.bg);
                     ui.painter().text(
@@ -1028,6 +1096,10 @@ impl eframe::App for IllnessApp {
             });
         }
 
+        if settings_changed {
+            self.reapply_config();
+        }
+
         if self.bell_flash_until > frame_now
             && let Some(rect) = terminal_rect
         {
@@ -1065,7 +1137,6 @@ impl eframe::App for IllnessApp {
             &ctx,
             &mut self.overlays,
             &self.tokens,
-            self.theme,
             &mut self.config,
             &self.profiles,
             &tab_infos,
@@ -1106,6 +1177,42 @@ fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
         scrollback: config.scrollback,
         cursor: config.cursor,
     }
+}
+
+/// Keep profiles saved in `config.toml` and append detected built-ins whose
+/// names are not present yet. Saved values win on case-insensitive name
+/// collisions, and saved profiles stay first in the list.
+fn merge_profiles(saved: Vec<Profile>, detected: Vec<Profile>) -> Vec<Profile> {
+    let mut merged = saved;
+    for profile in detected {
+        if !merged
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(&profile.name))
+        {
+            merged.push(profile);
+        }
+    }
+    merged
+}
+
+/// Point `default_profile` at an existing profile that has a program path.
+fn ensure_default_profile(config: &mut Config) {
+    let current = config.default_profile.trim();
+    let valid = !current.is_empty()
+        && config.profiles.iter().any(|profile| {
+            profile.name.eq_ignore_ascii_case(current) && !profile.program.trim().is_empty()
+        });
+    if valid {
+        return;
+    }
+
+    config.default_profile = config
+        .profiles
+        .iter()
+        .find(|profile| !profile.program.trim().is_empty())
+        .or_else(|| config.profiles.first())
+        .map(|profile| profile.name.clone())
+        .unwrap_or_default();
 }
 
 fn restarted_state(profile: &Profile) -> (String, bool, Option<i32>) {
@@ -1307,27 +1414,17 @@ fn card_rect(bounds: Rect, size: Vec2) -> Rect {
     )
 }
 
-/// What closing a tab should do, independent of session state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CloseEffect {
-    CloseWindow,
-    KeepTabs { next_active: usize },
-}
-
-fn close_effect(tab_count: usize, active: usize, closing: usize) -> Option<CloseEffect> {
-    if tab_count == 0 || active >= tab_count || closing >= tab_count {
-        return None;
-    }
-    if tab_count == 1 {
-        return Some(CloseEffect::CloseWindow);
-    }
-    let remaining = tab_count - 1;
-    let next_active = if closing < active {
+/// New active strip index after removing `closing` from `remaining` entries.
+fn next_active_after_close(active: usize, closing: usize, remaining: usize) -> usize {
+    if remaining == 0 {
+        0
+    } else if closing < active {
         active - 1
+    } else if closing == active {
+        closing.min(remaining - 1)
     } else {
-        active.min(remaining - 1)
-    };
-    Some(CloseEffect::KeepTabs { next_active })
+        active
+    }
 }
 
 fn active_after_move(active: usize, from: usize, to: usize) -> usize {
@@ -1426,6 +1523,84 @@ mod tests {
     }
 
     #[test]
+    fn merge_keeps_saved_profiles_first() {
+        let saved = vec![profile("Mine")];
+        let detected = vec![profile("Command Prompt")];
+        let merged = merge_profiles(saved, detected);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Mine", "Command Prompt"]
+        );
+    }
+
+    #[test]
+    fn merge_saved_wins_on_same_name() {
+        let mut saved = profile("PowerShell");
+        saved.program = "custom-pwsh.exe".to_string();
+        let mut detected = profile("powershell");
+        detected.program = "detected-pwsh.exe".to_string();
+
+        let merged = merge_profiles(vec![saved], vec![detected]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "PowerShell");
+        assert_eq!(merged[0].program, "custom-pwsh.exe");
+    }
+
+    #[test]
+    fn merge_appends_missing_detected_profiles() {
+        let saved = vec![profile("PowerShell")];
+        let detected = vec![
+            profile("PowerShell"),
+            profile("Command Prompt"),
+            profile("Ubuntu"),
+        ];
+
+        let merged = merge_profiles(saved, detected);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["PowerShell", "Command Prompt", "Ubuntu"]
+        );
+    }
+
+    #[test]
+    fn merge_uses_detected_without_saved_profiles() {
+        let merged = merge_profiles(Vec::new(), vec![profile("PowerShell")]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "PowerShell");
+    }
+
+    #[test]
+    fn ensure_default_prefers_a_profile_with_a_program() {
+        let mut config = Config {
+            profiles: vec![
+                Profile {
+                    program: String::new(),
+                    ..profile("Broken")
+                },
+                profile("PowerShell"),
+            ],
+            default_profile: "Broken".to_string(),
+            ..Config::default()
+        };
+
+        ensure_default_profile(&mut config);
+        assert_eq!(config.default_profile, "PowerShell");
+
+        let mut empty = Config {
+            default_profile: "missing".to_string(),
+            ..Config::default()
+        };
+        ensure_default_profile(&mut empty);
+        assert!(empty.default_profile.is_empty());
+    }
+
+    #[test]
     fn shortcut_table_matches_the_spec() {
         assert_eq!(
             shortcut_for(Key::T, ctrl_shift(), false),
@@ -1509,21 +1684,13 @@ mod tests {
 
     #[test]
     fn test_close_last_tab() {
-        assert_eq!(close_effect(0, 0, 0), None);
-        assert_eq!(close_effect(1, 0, 0), Some(CloseEffect::CloseWindow));
-        assert_eq!(close_effect(2, 4, 0), None);
-        assert_eq!(
-            close_effect(2, 1, 1),
-            Some(CloseEffect::KeepTabs { next_active: 0 })
-        );
-        assert_eq!(
-            close_effect(3, 1, 0),
-            Some(CloseEffect::KeepTabs { next_active: 0 })
-        );
-        assert_eq!(
-            close_effect(3, 1, 1),
-            Some(CloseEffect::KeepTabs { next_active: 1 })
-        );
+        assert_eq!(next_active_after_close(0, 0, 0), 0);
+        assert_eq!(next_active_after_close(0, 0, 1), 0);
+        assert_eq!(next_active_after_close(1, 1, 1), 0);
+        assert_eq!(next_active_after_close(1, 0, 2), 0);
+        assert_eq!(next_active_after_close(2, 1, 3), 1);
+        assert_eq!(next_active_after_close(2, 3, 3), 2);
+        assert_eq!(next_active_after_close(0, 1, 2), 0);
     }
 
     #[test]

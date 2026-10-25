@@ -30,6 +30,7 @@ fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] 
 window-vibrancy = "0.8.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_Controls", "Win32_System_Registry"] }
 raw-window-handle = "0.6"
+rfd = { version = "0.17", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg"] }
 
 [workspace.lints.rust]

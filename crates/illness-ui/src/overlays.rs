@@ -1,11 +1,11 @@
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Area, Color32, Context, DragValue, FontId, Frame, Id, Key, Layout, Margin,
-    Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind,
-    TextEdit, Ui, Vec2,
+    Align, Align2, Area, Color32, ComboBox, Context, DragValue, FontId, Frame, Id, Key, Layout,
+    Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke,
+    StrokeKind, TextEdit, Ui, Vec2,
 };
-use illness_core::{Config, CursorKind, Material, Profile, Theme};
+use illness_core::{Config, CursorKind, Material, Profile, Rgb, Theme};
 
 use crate::chrome::{Action, TabInfo};
 use crate::design::{self, Tokens};
@@ -14,14 +14,11 @@ use crate::icons::{self, Icon};
 pub const PALETTE_WIDTH: f32 = 640.0;
 pub const SEARCH_WIDTH: f32 = 380.0;
 pub const SEARCH_HEIGHT: f32 = 40.0;
-pub const SETTINGS_WIDTH: f32 = 420.0;
 
 /// How long a toast stays on screen.
 const TOAST_SECS: f64 = 3.0;
 /// 0.47 of opaque black, used only for modal backdrops.
 const BACKDROP_ALPHA: u8 = 160;
-/// Dim behind the settings sheet.
-const SHEET_BACKDROP_ALPHA: u8 = 110;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum OverlayKind {
@@ -29,7 +26,6 @@ pub enum OverlayKind {
     None,
     Palette,
     Search,
-    Settings,
     ContextMenu(Pos2),
 }
 
@@ -81,7 +77,6 @@ pub fn show(
     ctx: &Context,
     state: &mut OverlayState,
     tokens: &Tokens,
-    theme: &Theme,
     config: &mut Config,
     profiles: &[Profile],
     tabs: &[TabInfo],
@@ -102,7 +97,6 @@ pub fn show(
         OverlayKind::None => Vec::new(),
         OverlayKind::Palette => show_palette(ctx, state, tokens, config, profiles, tabs),
         OverlayKind::Search => show_search(ctx, state, tokens),
-        OverlayKind::Settings => show_settings(ctx, state, tokens, theme, config, profiles),
         OverlayKind::ContextMenu(pos) => show_context_menu(ctx, state, tokens, config, pos),
     };
     actions
@@ -209,6 +203,65 @@ pub fn clamp_padding(padding: f32) -> f32 {
 
 pub fn clamp_scrollback(lines: usize) -> usize {
     lines.clamp(1_000, 200_000)
+}
+
+/// Apply a theme name chosen in Settings. Returns whether the theme changed.
+pub fn select_theme(config: &mut Config, chosen: &str) -> bool {
+    let name = Theme::by_name(chosen).name;
+    if config.theme == name {
+        return false;
+    }
+    config.theme = name.to_string();
+    true
+}
+
+/// Shorten a path for a one-line label while keeping both its start (drive or
+/// root) and its tail (file name), so long shell paths do not overflow a row.
+pub fn elide_path(path: &str, max_chars: usize) -> String {
+    let count = path.chars().count();
+    if count <= max_chars {
+        return path.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "…".to_string();
+    }
+
+    let keep = max_chars - 1;
+    let head_len = keep.div_ceil(2);
+    let tail_len = keep - head_len;
+    let head: String = path.chars().take(head_len).collect();
+    let tail: String = path
+        .chars()
+        .rev()
+        .take(tail_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{head}…{tail}")
+}
+
+fn unique_profile_name(profiles: &[Profile]) -> String {
+    let base = "New Profile";
+    if !profiles
+        .iter()
+        .any(|profile| profile.name.eq_ignore_ascii_case(base))
+    {
+        return base.to_string();
+    }
+    for index in 2..=999 {
+        let candidate = format!("{base} {index}");
+        if !profiles
+            .iter()
+            .any(|profile| profile.name.eq_ignore_ascii_case(&candidate))
+        {
+            return candidate;
+        }
+    }
+    format!("{base} {}", profiles.len() + 1)
 }
 
 pub fn search_request(state: &OverlayState, forward: bool) -> SearchRequest {
@@ -559,146 +612,99 @@ fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<
     actions
 }
 
-fn show_settings(
-    ctx: &Context,
-    state: &mut OverlayState,
+pub fn show_settings_panel(
+    ui: &mut Ui,
     tokens: &Tokens,
     theme: &Theme,
     config: &mut Config,
-    profiles: &[Profile],
-) -> Vec<Action> {
-    let screen = ctx.content_rect();
-    let top = tokens.titlebar_h.max(40.0) + 6.0;
-    let dim_rect = settings_dim_rect(screen);
-    if dim(
-        ctx,
-        "illness_settings_backdrop",
-        dim_rect,
-        SHEET_BACKDROP_ALPHA,
-    ) {
-        state.close();
-        return Vec::new();
-    }
-
-    let height = (screen.bottom() - top - 18.0).max(120.0);
-
-    let mut close = false;
+    state: &mut OverlayState,
+) -> bool {
     let mut changed = false;
 
-    Area::new(Id::unique("illness_settings"))
-        .order(Order::Tooltip)
-        .fixed_pos(Pos2::new(screen.right() - SETTINGS_WIDTH, top))
-        .sense(Sense::click())
-        .show(ctx, |ui| {
-            ui.set_width(SETTINGS_WIDTH);
-            Frame::new()
-                .fill(tokens.bg_elev)
-                .stroke(Stroke::new(1.0, tokens.border))
-                .inner_margin(16)
-                .show(ui, |ui| {
-                    ui.set_width(SETTINGS_WIDTH - 32.0);
-                    ui.set_min_height(height - 32.0);
-                    ui.set_max_height(height - 32.0);
+    Frame::new()
+        .fill(tokens.bg)
+        .inner_margin(Margin::symmetric(24, 18))
+        .show(ui, |ui| {
+            ui.set_min_size(ui.available_size());
 
-                    ui.horizontal(|ui| {
+            let content_width = ui.available_width().min(760.0);
+            let pad = ((ui.available_width() - content_width) * 0.5).max(0.0);
+
+            ui.horizontal_top(|ui| {
+                if pad > 0.0 {
+                    ui.add_space(pad);
+                }
+                ui.allocate_ui_with_layout(
+                    Vec2::new(content_width, ui.available_height()),
+                    Layout::top_down(Align::Min),
+                    |ui| {
                         ui.label(
                             RichText::new("Settings")
-                                .size(18.0)
+                                .size(22.0)
                                 .strong()
                                 .color(tokens.text),
                         );
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, tokens, Icon::Close, 24.0).clicked() {
-                                close = true;
-                            }
-                        });
-                    });
-                    ui.add_space(6.0);
-                    hairline(ui, tokens);
-                    ui.add_space(4.0);
+                        ui.add_space(2.0);
+                        muted_label(ui, tokens, "Changes are saved automatically.");
+                        ui.add_space(6.0);
+                        hairline(ui, tokens);
+                        ui.add_space(6.0);
 
-                    ScrollArea::vertical()
-                        .max_height((height - 96.0).max(80.0))
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            changed |= appearance_section(ui, tokens, config);
-                            changed |= terminal_section(ui, tokens, config);
-                            profiles_section(ui, tokens, profiles);
-                            about_section(ui, tokens, theme, state);
-                        });
-
-                    ui.add_space(8.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if text_button(ui, tokens, "Done", false, Vec2::new(72.0, 28.0)).clicked() {
-                            close = true;
-                        }
-                    });
-                });
+                        ScrollArea::vertical()
+                            .id_salt("illness_settings_scroll")
+                            .max_height(ui.available_height())
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                changed |= appearance_section(ui, tokens, config);
+                                changed |= terminal_section(ui, tokens, config);
+                                changed |= profiles_section(ui, tokens, config, state);
+                                about_section(ui, tokens, theme, state);
+                            });
+                    },
+                );
+            });
         });
 
-    let mut actions = Vec::new();
-    if changed {
-        actions.push(Action::ConfigChanged);
-    }
-    if close {
-        state.close();
-    }
-    actions
+    changed
 }
 
 fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Appearance");
-    muted_label(ui, tokens, "Theme");
-    ui.add_space(2.0);
 
-    let mut chosen_theme = None;
-    for pair in Theme::all().chunks(2) {
-        ui.horizontal(|ui| {
-            let gap = 8.0;
-            let cell_width = ((ui.available_width() - gap) / 2.0).max(80.0);
-            for theme in pair {
-                if theme_card(ui, theme, cell_width, &config.theme, tokens).clicked() {
-                    chosen_theme = Some(theme.name.to_string());
+    changed |= setting_row(ui, tokens, "Theme", |ui| {
+        let mut chosen = config.theme.clone();
+        ComboBox::from_id_salt("illness_settings_theme")
+            .width(170.0)
+            .height(300.0)
+            .selected_text(Theme::by_name(&config.theme).name)
+            .popup_style(popup_style(tokens))
+            .show_ui(ui, |ui| {
+                for theme in Theme::all() {
+                    ui.selectable_value(&mut chosen, theme.name.to_string(), theme.name);
                 }
-            }
-        });
-    }
-    if let Some(name) = chosen_theme {
-        config.theme = name;
-        changed = true;
-    }
+            });
+        select_theme(config, &chosen)
+    });
 
-    ui.add_space(10.0);
-    muted_label(ui, tokens, "Material");
-    let materials = [Material::Mica, Material::Acrylic, Material::Solid];
-    let selected_material = materials
-        .iter()
-        .position(|material| *material == config.material)
-        .unwrap_or(0);
-    let mut chosen_material = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (index, material) in materials.iter().enumerate() {
-            if text_button(
-                ui,
-                tokens,
-                material_name(*material),
-                index == selected_material,
-                Vec2::new(74.0, 26.0),
-            )
-            .clicked()
-            {
-                chosen_material = Some(*material);
-            }
+    changed |= setting_row(ui, tokens, "Material", |ui| {
+        let mut chosen = config.material;
+        ComboBox::from_id_salt("illness_settings_material")
+            .width(170.0)
+            .selected_text(material_name(config.material))
+            .popup_style(popup_style(tokens))
+            .show_ui(ui, |ui| {
+                for material in [Material::Mica, Material::Acrylic, Material::Solid] {
+                    ui.selectable_value(&mut chosen, material, material_name(material));
+                }
+            });
+        if chosen != config.material {
+            config.material = chosen;
+            true
+        } else {
+            false
         }
     });
-    if let Some(material) = chosen_material
-        && material != config.material
-    {
-        config.material = material;
-        changed = true;
-    }
 
     ui.add_space(10.0);
     changed |= setting_row(ui, tokens, "Font size", |ui| {
@@ -793,6 +799,33 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Terminal");
 
+    changed |= setting_row(ui, tokens, "Default shell", |ui| {
+        let mut chosen = config.default_profile.clone();
+        let selected = if chosen.trim().is_empty() {
+            "None".to_string()
+        } else {
+            chosen.clone()
+        };
+        ComboBox::from_id_salt("illness_settings_default_shell")
+            .width(170.0)
+            .selected_text(selected)
+            .popup_style(popup_style(tokens))
+            .show_ui(ui, |ui| {
+                for profile in &config.profiles {
+                    if profile.program.trim().is_empty() {
+                        continue;
+                    }
+                    ui.selectable_value(&mut chosen, profile.name.clone(), &profile.name);
+                }
+            });
+        if chosen != config.default_profile {
+            config.default_profile = chosen;
+            true
+        } else {
+            false
+        }
+    });
+
     changed |= setting_row(ui, tokens, "Scrollback", |ui| {
         let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
         ui.label(
@@ -842,28 +875,142 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     changed
 }
 
-fn profiles_section(ui: &mut Ui, tokens: &Tokens, profiles: &[Profile]) {
+fn profiles_section(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    config: &mut Config,
+    state: &mut OverlayState,
+) -> bool {
     section_title(ui, tokens, "Profiles");
-    if profiles.is_empty() {
-        muted_label(ui, tokens, "No profiles detected.");
-        return;
-    }
+    muted_label(ui, tokens, "Changes apply to new tabs.");
+    ui.add_space(4.0);
 
-    for profile in profiles {
-        ui.horizontal(|ui| {
-            let (swatch, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-            ui.painter()
-                .rect_filled(swatch.shrink(2.0), 2.0, design::color(profile.accent));
-            ui.label(RichText::new(&profile.name).size(12.5).color(tokens.text));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(&profile.program)
+    let mut changed = false;
+    let mut remove = None;
+    let count = config.profiles.len();
+
+    for (index, profile) in config.profiles.iter_mut().enumerate() {
+        Frame::new()
+            .fill(tokens.bg)
+            .stroke(Stroke::new(1.0, tokens.border))
+            .corner_radius(tokens.radius_sm)
+            .inner_margin(Margin::symmetric(8, 6))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+
+                ui.horizontal(|ui| {
+                    let (swatch, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().rect_filled(
+                        swatch.shrink(2.0),
+                        2.0,
+                        design::color(profile.accent),
+                    );
+
+                    let name_width = (ui.available_width() - 74.0).max(80.0);
+                    let name = ui.add(
+                        TextEdit::singleline(&mut profile.name)
+                            .hint_text("Profile name")
+                            .desired_width(name_width)
+                            .font(FontId::proportional(12.0))
+                            .text_color(tokens.text)
+                            .margin(Margin::symmetric(6, 3))
+                            .frame(edit_frame(tokens)),
+                    );
+                    if name.changed() {
+                        changed = true;
+                    }
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if count > 1 {
+                            if text_button(ui, tokens, "Remove", false, Vec2::new(58.0, 22.0))
+                                .clicked()
+                            {
+                                remove = Some(index);
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new("Last profile")
+                                    .size(10.0)
+                                    .color(tokens.text_dim),
+                            );
+                        }
+                    });
+                });
+
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let browse_width = 54.0;
+                    let program_width = (ui.available_width() - browse_width - 12.0).max(80.0);
+                    let program = ui.add(
+                        TextEdit::singleline(&mut profile.program)
+                            .hint_text("C:\\Windows\\System32\\cmd.exe")
+                            .desired_width(program_width)
+                            .font(FontId::proportional(11.5))
+                            .text_color(tokens.text)
+                            .margin(Margin::symmetric(6, 3))
+                            .frame(edit_frame(tokens)),
+                    );
+                    if program.changed() {
+                        changed = true;
+                    }
+                    let program = program.on_hover_text(&profile.program);
+                    if program.lost_focus() && profile.program.trim().is_empty() {
+                        state.toast =
+                            Some(format!("Profile \"{}\" needs a program path", profile.name));
+                    }
+
+                    let browse =
+                        text_button(ui, tokens, "Browse", false, Vec2::new(browse_width, 22.0));
+                    if browse.clicked()
+                        && let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Programs", &["exe", "cmd", "bat", "com"])
+                            .add_filter("All files", &["*"])
+                            .pick_file()
+                    {
+                        profile.program = path.to_string_lossy().into_owned();
+                        changed = true;
+                    }
+                });
+
+                let args = profile.args.join(" ");
+                ui.add_space(2.0);
+                let summary = if args.is_empty() {
+                    "No arguments".to_string()
+                } else {
+                    elide_path(&args, 46)
+                };
+                let args_label = ui.label(
+                    RichText::new(format!("Args: {summary}"))
                         .size(10.5)
                         .color(tokens.text_dim),
                 );
+                if !args.is_empty() {
+                    args_label.on_hover_text(args);
+                }
             });
-        });
+        ui.add_space(6.0);
     }
+
+    if let Some(index) = remove
+        && config.profiles.len() > 1
+    {
+        config.profiles.remove(index);
+        changed = true;
+    }
+
+    if text_button(ui, tokens, "Add profile", false, Vec2::new(92.0, 24.0)).clicked() {
+        let name = unique_profile_name(&config.profiles);
+        config.profiles.push(Profile {
+            name: name.clone(),
+            program: String::new(),
+            args: Vec::new(),
+            accent: Rgb::new(tokens.accent.r(), tokens.accent.g(), tokens.accent.b()),
+        });
+        state.toast = Some(format!("Added \"{name}\"; choose its program"));
+        changed = true;
+    }
+
+    changed
 }
 
 fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut OverlayState) {
@@ -970,13 +1117,6 @@ fn show_context_menu(
 
 fn backdrop(ctx: &Context, id: &str, alpha: u8) -> bool {
     dim(ctx, id, ctx.content_rect(), alpha)
-}
-
-/// Dim the whole content area. The settings sheet is painted in
-/// `Order::Tooltip` after this backdrop, so the sheet itself stays undarkened
-/// while clicks anywhere outside it close the overlay.
-fn settings_dim_rect(screen: Rect) -> Rect {
-    screen
 }
 
 fn dim(ctx: &Context, id: &str, area: Rect, alpha: u8) -> bool {
@@ -1091,54 +1231,23 @@ fn menu_row(
     response
 }
 
-fn theme_card(ui: &mut Ui, theme: &Theme, width: f32, selected: &str, tokens: &Tokens) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 42.0), Sense::click());
-    let is_selected = theme.name.eq_ignore_ascii_case(selected);
+fn edit_frame(tokens: &Tokens) -> Frame {
+    Frame::new()
+        .fill(tokens.bg_sunken)
+        .stroke(Stroke::new(1.0, tokens.border))
+        .corner_radius(tokens.radius_sm)
+}
 
-    let fill = if is_selected {
-        tokens.selection
-    } else if response.hovered() {
-        tokens.hover
-    } else {
-        tokens.bg
-    };
-    ui.painter().rect_filled(rect, tokens.radius_sm, fill);
-    ui.painter().rect_stroke(
-        rect,
-        tokens.radius_sm,
-        Stroke::new(
-            if is_selected { 1.5 } else { 1.0 },
-            if is_selected {
-                tokens.accent
-            } else {
-                tokens.border
-            },
-        ),
-        StrokeKind::Inside,
-    );
-
-    let swatch = Rect::from_center_size(
-        Pos2::new(rect.left() + 18.0, rect.center().y),
-        Vec2::splat(18.0),
-    );
-    ui.painter()
-        .rect_filled(swatch, 4.0, design::color(theme.bg));
-    ui.painter().rect_stroke(
-        swatch,
-        4.0,
-        Stroke::new(1.0, design::color(theme.accent)),
-        StrokeKind::Inside,
-    );
-
-    let painter = ui.painter().with_clip_rect(rect.shrink(2.0));
-    painter.text(
-        Pos2::new(swatch.right() + 8.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        theme.name,
-        FontId::proportional(12.0),
-        tokens.text,
-    );
-    response
+/// ComboBox popups use `window_fill`, which the app sets to transparent for
+/// its frameless material backdrop. Give these menus an opaque panel.
+fn popup_style(tokens: &Tokens) -> egui::style::StyleModifier {
+    let tokens = *tokens;
+    egui::style::StyleModifier::new(move |style| {
+        style.visuals.window_fill = tokens.bg_elev;
+        style.visuals.window_stroke = Stroke::new(1.0, tokens.border);
+        style.visuals.window_corner_radius = egui::CornerRadius::same(tokens.radius_md as u8);
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(tokens.radius_md as u8);
+    })
 }
 
 fn setting_row(
@@ -1381,6 +1490,47 @@ mod tests {
     }
 
     #[test]
+    fn elide_path_keeps_the_start_and_file_name() {
+        assert_eq!(elide_path("cmd.exe", 12), "cmd.exe");
+        assert_eq!(elide_path("anything", 0), "");
+        assert_eq!(elide_path("anything", 1), "…");
+
+        let long = r"C:\Program Files\PowerShell\7\pwsh.exe";
+        let short = elide_path(long, 20);
+        assert_eq!(short.chars().count(), 20);
+        assert!(short.starts_with(r"C:\Program"));
+        assert!(short.ends_with("pwsh.exe"));
+        assert!(short.contains('…'));
+
+        let unicode = "C:\\Users\\Simulp\\Документы\\shell.exe";
+        assert_eq!(elide_path(unicode, 16).chars().count(), 16);
+    }
+
+    #[test]
+    fn theme_selection_updates_config() {
+        let mut config = Config::default();
+        assert!(select_theme(&mut config, "Light"));
+        assert_eq!(config.theme, "Light");
+        assert!(Theme::by_name(&config.theme).is_light());
+
+        assert!(!select_theme(&mut config, "Light"));
+        assert!(select_theme(&mut config, "nord"));
+        assert_eq!(config.theme, "Nord");
+    }
+
+    #[test]
+    fn new_profile_names_do_not_collide() {
+        assert_eq!(unique_profile_name(&[]), "New Profile");
+        let existing = vec![Profile {
+            name: "new profile".to_string(),
+            program: "pwsh.exe".to_string(),
+            args: Vec::new(),
+            accent: Rgb::new(0x7e, 0xe7, 0x87),
+        }];
+        assert_eq!(unique_profile_name(&existing), "New Profile 2");
+    }
+
+    #[test]
     fn search_enter() {
         let state = OverlayState {
             search: "needle".to_string(),
@@ -1414,20 +1564,5 @@ mod tests {
         assert_eq!(state.kind, OverlayKind::Palette);
         assert!(handle_escape(&mut state, true));
         assert_eq!(state.kind, OverlayKind::None);
-    }
-
-    #[test]
-    fn settings_dim_covers_window_behind_sheet() {
-        let screen = Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(1180.0, 760.0));
-        let top = 46.0;
-        let dim = settings_dim_rect(screen);
-        let sheet = Rect::from_min_max(Pos2::new(screen.right() - SETTINGS_WIDTH, top), screen.max);
-        assert_eq!(dim, screen);
-        assert!(
-            dim.contains_rect(sheet),
-            "dim {:?} must cover the window behind sheet {:?}",
-            dim,
-            sheet
-        );
     }
 }
