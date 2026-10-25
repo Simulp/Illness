@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Area, Color32, Context, FontId, Frame, Id, Key, Layout, Margin, Modifiers,
-    Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind, TextEdit, Ui,
-    Vec2,
+    Align, Align2, Area, Color32, Context, DragValue, FontId, Frame, Id, Key, Layout, Margin,
+    Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke, StrokeKind,
+    TextEdit, Ui, Vec2,
 };
 use illness_core::{Config, CursorKind, Material, Profile, Theme};
 
@@ -187,7 +187,7 @@ pub fn clamp_font_size(size: f32) -> f32 {
     if size.is_finite() {
         size.clamp(8.0, 40.0)
     } else {
-        14.0
+        18.0
     }
 }
 
@@ -703,15 +703,23 @@ fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool
     ui.add_space(10.0);
     changed |= setting_row(ui, tokens, "Font size", |ui| {
         let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
-        ui.label(
-            RichText::new(format!("{:.0}", config.font_size))
-                .size(12.0)
-                .color(tokens.text),
-        );
-        let minus = text_button(ui, tokens, "−", false, Vec2::new(26.0, 24.0)).clicked();
+        let mut size = config.font_size;
+        let dragged = ui
+            .add(
+                DragValue::new(&mut size)
+                    .range(8.0..=40.0)
+                    .speed(0.1)
+                    .fixed_decimals(0)
+                    .suffix(" pt"),
+            )
+            .changed();
+        let minus = text_button(ui, tokens, "-", false, Vec2::new(26.0, 24.0)).clicked();
 
         let mut step_changed = false;
-        if plus && config.font_size < 40.0 {
+        if dragged {
+            config.font_size = clamp_font_size(size);
+            step_changed = true;
+        } else if plus && config.font_size < 40.0 {
             config.font_size = clamp_font_size(config.font_size + 1.0);
             step_changed = true;
         }

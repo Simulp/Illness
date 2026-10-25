@@ -86,7 +86,8 @@ impl TerminalView {
         atlas: &mut GlyphAtlas,
     ) -> TerminalResponse {
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        let rect = response.rect;
+        let ppp = ui.ctx().pixels_per_point();
+        let rect = soft::snap_rect(response.rect, ppp);
         let metrics = atlas.metrics();
         let padding = config.padding.max(0.0);
         let (cols, rows) = Self::grid_size(rect, &metrics, padding);
@@ -120,7 +121,6 @@ impl TerminalView {
         );
 
         let origin = grid_rect.min;
-        let ppp = ui.ctx().pixels_per_point();
         let now = ui.input(|input| input.time);
         let any_input = ui.input(|input| !input.events.is_empty());
         if first_layout || any_input {

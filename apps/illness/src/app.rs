@@ -18,7 +18,7 @@ use raw_window_handle::HasWindowHandle;
 
 use crate::{backdrop, platform};
 
-const DEFAULT_FONT_SIZE: f32 = 14.0;
+const DEFAULT_FONT_SIZE: f32 = 18.0;
 const INITIAL_COLS: usize = 120;
 const INITIAL_ROWS: usize = 30;
 const BELL_FLASH_SECS: f64 = 0.18;

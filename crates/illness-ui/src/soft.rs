@@ -48,6 +48,23 @@ pub struct SurfaceSpec<'a> {
     pub line_height: f32,
 }
 
+/// Align a logical rect to the physical pixel grid.
+///
+/// The compositor works in whole physical pixels. Painting its texture at a
+/// fractional physical position would resample it even with `NEAREST`, which
+/// softens hinted ClearType glyphs, so snap the destination before layout and
+/// rendering.
+pub fn snap_rect(rect: Rect, ppp: f32) -> Rect {
+    if !ppp.is_finite() || ppp <= 0.0 {
+        return rect;
+    }
+    let snap = |value: f32| (value * ppp).round() / ppp;
+    Rect::from_min_max(
+        egui::pos2(snap(rect.min.x), snap(rect.min.y)),
+        egui::pos2(snap(rect.max.x), snap(rect.max.y)),
+    )
+}
+
 /// Physical pixel size of the surface, or `None` when the rect is unusable.
 pub fn surface_size(rect: Rect, ppp: f32) -> Option<[usize; 2]> {
     if !ppp.is_finite() || ppp <= 0.0 || !rect.width().is_finite() || !rect.height().is_finite() {
@@ -761,6 +778,21 @@ mod tests {
         assert_eq!(design::material_alpha(Material::Solid), 255);
         assert_eq!(design::material_alpha(Material::Mica), 210);
         assert_eq!(design::material_alpha(Material::Acrylic), 185);
+    }
+
+    #[test]
+    fn snap_rect_lands_on_physical_pixels() {
+        let rect = Rect::from_min_max(pos2(0.3, 1.1), pos2(100.7, 50.2));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let snapped = snap_rect(rect, ppp);
+            for value in [snapped.min.x, snapped.min.y, snapped.max.x, snapped.max.y] {
+                let physical = value * ppp;
+                assert!(
+                    (physical - physical.round()).abs() < 1e-3,
+                    "{value} is not on the {ppp}x pixel grid"
+                );
+            }
+        }
     }
 
     #[test]

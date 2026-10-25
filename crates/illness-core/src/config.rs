@@ -50,7 +50,7 @@ impl Default for Config {
         Self {
             theme: "Illness Dark".to_string(),
             font_family: "Cascadia Mono".to_string(),
-            font_size: 14.0,
+            font_size: 18.0,
             line_height: 1.2,
             material: Material::Mica,
             cursor: CursorKind::Block,
@@ -142,7 +142,7 @@ impl Config {
 
     /// Clamp values into supported ranges, resolve the theme, and dedup profiles.
     pub fn sanitized(mut self) -> Self {
-        self.font_size = finite_or(self.font_size, 14.0).clamp(8.0, 40.0);
+        self.font_size = finite_or(self.font_size, 18.0).clamp(8.0, 40.0);
         self.line_height = finite_or(self.line_height, 1.2).clamp(1.0, 2.0);
         self.padding = finite_or(self.padding, 8.0).clamp(0.0, 32.0);
         self.scrollback = if self.scrollback == 0 {
@@ -206,7 +206,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.theme, "Illness Dark");
         assert_eq!(config.font_family, "Cascadia Mono");
-        assert_eq!(config.font_size, 14.0);
+        assert_eq!(config.font_size, 18.0);
         assert_eq!(config.line_height, 1.2);
         assert_eq!(config.material, Material::Mica);
         assert_eq!(config.cursor, CursorKind::Block);
