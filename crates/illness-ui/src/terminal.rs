@@ -74,6 +74,11 @@ pub struct TerminalView {
     soft_key: Option<u64>,
     soft_last_render: f64,
     soft_texture_name: String,
+    /// Viewport IME commands are cached; sending them every frame forces egui
+    /// to repaint at the display refresh rate even when nothing changed.
+    ime_allowed: bool,
+    ime_purpose: bool,
+    ime_rect: Option<Rect>,
 }
 
 impl TerminalView {
@@ -197,7 +202,7 @@ impl TerminalView {
                 1.06 - phase
             };
             ui.ctx()
-                .request_repaint_after(Duration::from_secs_f64(remaining.max(0.016)));
+                .request_repaint_after(Duration::from_secs_f64(remaining.max(0.001)));
         }
 
         let pointer = response
@@ -210,10 +215,16 @@ impl TerminalView {
         self.ime_pos = pointer
             .and_then(|pos| Self::cell_at(pos, grid_rect, &metrics, (cols, rows)))
             .map(|(row, col)| cell_rect(origin, &metrics, row, col).min);
-        ui.ctx()
-            .send_viewport_cmd(ViewportCommand::IMEAllowed(true));
-        ui.ctx()
-            .send_viewport_cmd(ViewportCommand::IMEPurpose(egui::IMEPurpose::Terminal));
+        if !self.ime_allowed {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::IMEAllowed(true));
+            self.ime_allowed = true;
+        }
+        if !self.ime_purpose {
+            ui.ctx()
+                .send_viewport_cmd(ViewportCommand::IMEPurpose(egui::IMEPurpose::Terminal));
+            self.ime_purpose = true;
+        }
         if response.has_focus() {
             let ime_rect = self
                 .ime_pos
@@ -221,8 +232,11 @@ impl TerminalView {
                 .unwrap_or_else(|| {
                     cell_rect(origin, &metrics, snapshot.cursor.row, snapshot.cursor.col)
                 });
-            ui.ctx()
-                .send_viewport_cmd(ViewportCommand::IMERect(ime_rect));
+            if self.ime_rect != Some(ime_rect) {
+                ui.ctx()
+                    .send_viewport_cmd(ViewportCommand::IMERect(ime_rect));
+                self.ime_rect = Some(ime_rect);
+            }
         }
 
         let mut actions = Vec::new();
@@ -332,7 +346,8 @@ impl TerminalView {
             if delta != 0 {
                 self.scroll_target = apply_wheel(self.scroll_target, delta);
             }
-            ui.ctx().request_repaint_after(Duration::from_millis(16));
+            ui.ctx()
+                .request_repaint_after(Duration::from_secs_f64(f64::from(frame_interval(ui))));
         }
 
         self.animate_scroll(ui, session, &snapshot);
@@ -423,11 +438,11 @@ impl TerminalView {
             self.soft_key != Some(key) || self.soft_size != size || self.soft_texture.0.is_none();
         if needs_render {
             let now = ui.ctx().input(|input| input.time);
-            // Coalesce bursts of PTY output: a full software composite is
-            // several milliseconds, so never do more than one per frame.
-            if self.soft_texture.0.is_some() && now - self.soft_last_render < 1.0 / 60.0 {
+            let frame_dt = f64::from(frame_interval(ui));
+            // Coalesce bursts of PTY output to one composite per display frame.
+            if self.soft_texture.0.is_some() && now - self.soft_last_render < frame_dt {
                 ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(16));
+                    .request_repaint_after(Duration::from_secs_f64(frame_dt));
             } else {
                 match soft::render_surface(atlas, snapshot, spec) {
                     Some(image) => {
@@ -1330,6 +1345,12 @@ pub(crate) fn row_text(snapshot: &Snapshot, row: usize, cols: usize) -> String {
         }
     }
     text
+}
+
+fn frame_interval(ui: &Ui) -> f32 {
+    ui.ctx()
+        .input(|input| input.stable_dt)
+        .clamp(1.0 / 240.0, 1.0 / 24.0)
 }
 
 fn link_at(
