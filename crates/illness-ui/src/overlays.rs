@@ -1234,6 +1234,15 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
         step_changed
     });
 
+    changed |= setting_row(ui, tokens, "New tabs inherit current folder", |ui| {
+        toggle(ui, tokens, &mut config.inherit_cwd)
+    });
+    muted_label(
+        ui,
+        tokens,
+        "New tabs start in the active tab's shell folder; otherwise the launch folder.",
+    );
+
     changed |= setting_row(ui, tokens, "Copy on select", |ui| {
         toggle(ui, tokens, &mut config.copy_on_select)
     });

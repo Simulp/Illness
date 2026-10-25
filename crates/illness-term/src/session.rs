@@ -163,6 +163,8 @@ pub struct Session {
     title: Arc<Mutex<Option<String>>>,
     exited: Arc<AtomicBool>,
     hyperlinks: Mutex<HashMap<u32, String>>,
+    /// Native PID of the shell process attached to the PTY.
+    child_pid: Option<u32>,
 }
 
 impl Session {
@@ -202,6 +204,12 @@ impl Session {
         };
         let window_size = window_size(grid, cell_px);
         let pty = tty::new(&options, window_size, 0).context("failed to create pty")?;
+        // The watcher owns the native process handle and exposes its PID on
+        // Windows. Other platforms keep `None` and use the stored spawn cwd.
+        #[cfg(target_os = "windows")]
+        let child_pid = pty.child_watcher().pid().map(|pid| pid.get());
+        #[cfg(not(target_os = "windows"))]
+        let child_pid = None;
         let event_loop = EventLoop::new(term.clone(), proxy, pty, true, false)
             .context("failed to start terminal event loop")?;
         let sender = event_loop.channel();
@@ -216,7 +224,17 @@ impl Session {
             title,
             exited,
             hyperlinks: Mutex::new(HashMap::new()),
+            child_pid,
         })
+    }
+
+    /// Native PID of the shell process attached to this PTY, when known.
+    ///
+    /// On Windows this is the ConPTY child. The PID can be reused after the
+    /// shell exits; callers must treat a failed process query as "unknown"
+    /// and fall back to their stored working directory.
+    pub fn child_pid(&self) -> Option<u32> {
+        self.child_pid
     }
 
     /// Send raw bytes to the child process.
@@ -479,6 +497,7 @@ impl Session {
             title,
             exited,
             hyperlinks: Mutex::new(HashMap::new()),
+            child_pid: None,
         }
     }
 
@@ -958,6 +977,24 @@ mod tests {
         let snapshot = session.snapshot();
         assert_eq!(snapshot.cursor.kind, CursorKind::Block);
         assert!(snapshot.cursor.visible);
+    }
+
+    #[test]
+    #[ignore = "spawns a real ConPTY process"]
+    fn spawn_exposes_the_shell_pid() {
+        #[cfg(target_os = "windows")]
+        {
+            let session = Session::spawn(
+                SpawnSpec::new("cmd.exe"),
+                GridSize::new(80, 24),
+                (8, 16),
+                Arc::new(|| {}),
+            )
+            .expect("spawn cmd.exe");
+            let pid = session.child_pid().expect("ConPTY child PID");
+            assert_ne!(pid, 0);
+            session.shutdown();
+        }
     }
 
     #[test]

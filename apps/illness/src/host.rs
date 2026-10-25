@@ -7,6 +7,7 @@
 //! [`egui_wgpu::winit::Painter`].
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -30,7 +31,10 @@ enum UserEvent {
     Repaint { when: Instant },
 }
 
-pub fn run(icon: Option<Arc<egui::IconData>>) -> anyhow::Result<()> {
+pub fn run(
+    icon: Option<Arc<egui::IconData>>,
+    startup_folder: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
 
@@ -49,7 +53,7 @@ pub fn run(icon: Option<Arc<egui::IconData>>) -> anyhow::Result<()> {
         },
     ));
 
-    let mut host = Host::new(ctx, painter, proxy, icon);
+    let mut host = Host::new(ctx, painter, proxy, icon, startup_folder);
     event_loop.run_app(&mut host)?;
     Ok(())
 }
@@ -85,6 +89,9 @@ struct Host {
     painter: egui_wgpu::winit::Painter,
     proxy: EventLoopProxy<UserEvent>,
     icon: Option<Arc<egui::IconData>>,
+    /// Directory passed on the command line; the first shell and new tabs
+    /// start here.
+    startup_folder: Option<PathBuf>,
     state: Option<egui_winit::State>,
     window: Option<Arc<Window>>,
     app: Option<app::IllnessApp>,
@@ -118,12 +125,14 @@ impl Host {
         painter: egui_wgpu::winit::Painter,
         proxy: EventLoopProxy<UserEvent>,
         icon: Option<Arc<egui::IconData>>,
+        startup_folder: Option<PathBuf>,
     ) -> Self {
         Self {
             ctx,
             painter,
             proxy,
             icon,
+            startup_folder,
             state: None,
             window: None,
             app: None,
@@ -237,6 +246,7 @@ impl Host {
             render_state.as_ref(),
             window.clone(),
             native_transparency,
+            self.startup_folder.clone(),
         );
 
         self.state = Some(state);

@@ -1,10 +1,11 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use egui::{
-    self, Align2, Color32, Event, FontId, Id, Key, Modifiers, Order, Rect, RichText, Sense, Stroke,
-    StrokeKind, Vec2, ViewportCommand, pos2, vec2,
+    self, Color32, Event, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Vec2,
+    ViewportCommand, pos2, vec2,
 };
 use illness_core::config::BackgroundMode;
 use illness_core::{Config, Material, Profile, Rgb, Theme, detect_profiles};
@@ -221,18 +222,18 @@ const FOCUS_OUT: &[u8] = b"\x1b[O";
 
 /// One live terminal tab: the PTY session plus everything the UI remembers.
 struct Tab {
+    /// Stable across reordering, closing other tabs, and Settings focus.
+    id: u64,
     session: Session,
     view: TerminalView,
     title: String,
     profile_name: String,
-    /// Launch values captured at spawn time. Restart uses these when the
-    /// profile was renamed or removed so it never silently starts another
-    /// shell.
+    /// Program captured at spawn time, used to avoid trusting a Windows-side
+    /// cwd for WSL shells.
     program: String,
-    args: Vec<String>,
+    /// Working directory used at spawn and last read from the live shell.
+    cwd: Option<PathBuf>,
     accent: Rgb,
-    exited: bool,
-    exit_code: Option<i32>,
     /// Whether the PTY currently believes this tab has focus (DECSET 1004).
     focus_reported: bool,
 }
@@ -274,6 +275,14 @@ pub struct IllnessApp {
     window: Arc<Window>,
     config: Config,
     profiles: Vec<Profile>,
+    /// Folder supplied on the command line. It seeds the first tab and is the
+    /// fallback when no live terminal cwd can be read.
+    startup_folder: Option<PathBuf>,
+    /// Stable id of the most recently active terminal tab. New tabs requested
+    /// while Settings is active still inherit that terminal's live cwd.
+    last_terminal_id: Option<u64>,
+    /// Monotonic id source for terminal tabs.
+    next_terminal_id: u64,
     /// Whether the window can currently present native translucent materials:
     /// the swapchain exposes a transparent alpha mode and Windows transparency
     /// effects are enabled. The host keeps the static surface-alpha support and
@@ -346,6 +355,7 @@ impl IllnessApp {
         render_state: Option<&egui_wgpu::RenderState>,
         window: Arc<Window>,
         native_transparency: bool,
+        startup_folder: Option<PathBuf>,
     ) -> Self {
         let mut config = Config::load();
         let mut detected = detect_profiles();
@@ -412,6 +422,9 @@ impl IllnessApp {
             window: Arc::clone(&window),
             config,
             profiles,
+            startup_folder,
+            last_terminal_id: None,
+            next_terminal_id: 1,
             native_transparency,
             theme,
             tokens,
@@ -460,16 +473,88 @@ impl IllnessApp {
     }
 
     /// Spawn a tab for `profile` (or the configured default) and make it active.
+    ///
+    /// The new shell starts in the active terminal's current directory. If
+    /// Settings is focused, the most recently active terminal is used; a
+    /// missing or unreadable shell falls back to its stored cwd and then to
+    /// the command-line folder.
     pub fn open_tab(&mut self, profile: Option<&str>) {
-        match self.build_tab(profile) {
+        let profile = self.profile_for(profile);
+        let cwd = self.resolve_new_tab_cwd();
+        log::debug!("opening {} tab in {:?}", profile.name, cwd);
+        match self.build_tab_for(&profile, cwd) {
             Ok(tab) => {
+                let id = tab.id;
                 let index = self.settings_index().unwrap_or(self.tabs.len());
                 self.tabs.insert(index, TabEntry::Terminal(Box::new(tab)));
                 self.active = index;
+                self.last_terminal_id = Some(id);
             }
             Err(error) => {
                 self.overlays.set_toast(error);
             }
+        }
+    }
+
+    /// Resolve the spawn cwd for a new tab at the moment it is requested.
+    ///
+    /// A successful PEB read updates the active tab's stored cwd, so a later
+    /// spawn still has a recent value. WSL, elevated shells and dead
+    /// processes cannot be read and use the stored/startup path.
+    fn resolve_new_tab_cwd(&mut self) -> Option<PathBuf> {
+        if !self.config.inherit_cwd {
+            return select_new_tab_cwd(
+                false,
+                None,
+                None,
+                self.startup_folder.clone(),
+                std::env::current_dir().ok(),
+            );
+        }
+
+        let terminal_id = match self.tabs.get(self.active) {
+            Some(TabEntry::Terminal(tab)) => Some(tab.id),
+            _ => self.last_terminal_id,
+        };
+        let live = terminal_id
+            .and_then(|id| self.tab_index_by_id(id))
+            .and_then(|index| match self.tabs.get_mut(index) {
+                Some(TabEntry::Terminal(tab)) => {
+                    let live = tab_live_cwd(tab).filter(|path| path.is_dir());
+                    if let Some(cwd) = &live {
+                        tab.cwd = Some(cwd.clone());
+                    }
+                    Some((live, tab.cwd.clone()))
+                }
+                _ => None,
+            });
+        let (live, stored) = live.unwrap_or((None, None));
+        select_new_tab_cwd(
+            true,
+            live,
+            stored,
+            self.startup_folder.clone(),
+            std::env::current_dir().ok(),
+        )
+    }
+
+    fn tab_index_by_id(&self, id: u64) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|entry| matches!(entry, TabEntry::Terminal(tab) if tab.id == id))
+    }
+
+    /// Remember the active terminal for tabs opened while Settings is shown.
+    fn note_active_terminal(&mut self) {
+        if let Some(TabEntry::Terminal(tab)) = self.tabs.get(self.active) {
+            self.last_terminal_id = Some(tab.id);
+            return;
+        }
+        if self
+            .last_terminal_id
+            .is_some_and(|id| self.tab_index_by_id(id).is_none())
+        {
+            self.last_terminal_id = None;
         }
     }
 
@@ -508,36 +593,32 @@ impl IllnessApp {
         matches!(self.tabs.get(self.active), Some(TabEntry::Terminal(_))).then_some(self.active)
     }
 
-    fn build_tab(&self, requested: Option<&str>) -> Result<Tab, String> {
-        let profile = self.profile_for(requested);
-        self.build_tab_for(&profile)
-    }
-
-    fn build_tab_for(&self, profile: &Profile) -> Result<Tab, String> {
+    fn build_tab_for(&mut self, profile: &Profile, cwd: Option<PathBuf>) -> Result<Tab, String> {
         let metrics = self.atlas.metrics();
         let cell_px = (cell_pixel(metrics.width_px), cell_pixel(metrics.height_px));
         let ctx = self.ctx.clone();
         let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
+        let cwd = cwd.or_else(|| std::env::current_dir().ok());
 
         let session = Session::spawn(
-            spawn_spec(profile, &self.config),
+            spawn_spec(profile, &self.config, cwd.as_deref()),
             GridSize::new(INITIAL_COLS, INITIAL_ROWS),
             cell_px,
             waker,
         )
         .map_err(|error| format!("Could not start {}: {error}", profile.name))?;
 
-        let (title, exited, exit_code) = restarted_state(profile);
+        let id = self.next_terminal_id;
+        self.next_terminal_id = self.next_terminal_id.saturating_add(1);
         Ok(Tab {
+            id,
             session,
             view: TerminalView::default(),
-            title,
+            title: profile.name.clone(),
             profile_name: profile.name.clone(),
             program: profile.program.clone(),
-            args: profile.args.clone(),
+            cwd,
             accent: profile.accent,
-            exited,
-            exit_code,
             focus_reported: false,
         })
     }
@@ -1767,44 +1848,47 @@ impl IllnessApp {
     }
 
     fn close_tab(&mut self, index: usize) {
+        self.remove_tab(index);
+    }
+
+    /// Remove one tab and keep the strip usable.
+    ///
+    /// Manual close and shell exit share this path. Removing the active tab
+    /// selects the nearest remaining terminal or Settings tab; removing the
+    /// last tab asks the host to close the window.
+    fn remove_tab(&mut self, index: usize) {
         if index >= self.tabs.len() {
             return;
         }
-        if self.tabs.len() == 1 {
-            self.tabs.remove(index);
+        self.tabs.remove(index);
+        if removal_closes_window(self.tabs.len()) {
             self.active = 0;
+            self.note_active_terminal();
             // The host saves and exits after this pass; shutting down here
             // would break a later CancelClose.
             self.ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
 
-        self.tabs.remove(index);
         self.active = next_active_after_close(self.active, index, self.tabs.len());
+        self.note_active_terminal();
     }
 
-    fn restart_tab(&mut self, index: usize) {
-        let Some(TabEntry::Terminal(tab)) = self.tabs.get(index) else {
-            return;
-        };
-        let profile = restart_profile(
-            &tab.profile_name,
-            &tab.program,
-            &tab.args,
-            tab.accent,
-            &self.profiles,
-        );
-
-        match self.build_tab_for(&profile) {
-            Ok(replacement) => {
-                if let Some(slot) = self.tabs.get_mut(index) {
-                    *slot = TabEntry::Terminal(Box::new(replacement));
-                    self.active = index;
-                }
-            }
-            Err(error) => {
-                self.overlays.set_toast(error);
-            }
+    /// Drop every terminal whose shell has exited, including several that
+    /// exited between two frames.
+    fn remove_exited_tabs(&mut self) {
+        let exited: Vec<usize> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                TabEntry::Terminal(tab) if tab.session.is_exited() => Some(index),
+                _ => None,
+            })
+            .collect();
+        for index in exited.into_iter().rev() {
+            log::debug!("removing exited tab {index}");
+            self.remove_tab(index);
         }
     }
 
@@ -1816,6 +1900,7 @@ impl IllnessApp {
         self.active = active_after_move(self.active, from, to);
         let tab = self.tabs.remove(from);
         self.tabs.insert(to, tab);
+        self.note_active_terminal();
     }
 
     fn copy_selection(&mut self) {
@@ -1993,11 +2078,18 @@ impl IllnessApp {
 
     fn handle_action(&mut self, action: Action) {
         match action {
-            Action::NewTab(profile) => self.open_tab(profile.as_deref()),
-            Action::CloseTab(index) => self.close_tab(index),
+            Action::NewTab(profile) => {
+                log::debug!("new-tab action profile={profile:?}");
+                self.open_tab(profile.as_deref());
+            }
+            Action::CloseTab(index) => {
+                log::debug!("close-tab action index={index}");
+                self.close_tab(index);
+            }
             Action::ActivateTab(index) => {
                 if index < self.tabs.len() {
                     self.active = index;
+                    self.note_active_terminal();
                 }
             }
             Action::MoveTab(from, to) => self.move_tab(from, to),
@@ -2021,6 +2113,7 @@ impl IllnessApp {
                     .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
             }
             Action::CloseWindow => {
+                log::debug!("close-window action");
                 // Let the host run the pass, collect the Close command and
                 // save/exit afterwards so a CancelClose can still win.
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
@@ -2092,11 +2185,9 @@ impl IllnessApp {
                         let reply = format!("\x1b[8;{};{}t", snapshot.rows, snapshot.cols);
                         tab.session.write(reply.as_bytes());
                     }
-                    SessionEvent::ChildExit(code) => {
-                        tab.exited = true;
-                        tab.exit_code = Some(code);
-                    }
-                    SessionEvent::Exit => tab.exited = true,
+                    // `is_exited` is set before the event is sent; the tab is
+                    // removed in `sync_tabs`, so the code is not needed.
+                    SessionEvent::ChildExit(_) | SessionEvent::Exit => {}
                     SessionEvent::CursorBlinkingChange
                     | SessionEvent::MouseCursorDirty
                     | SessionEvent::Wakeup => {}
@@ -2114,13 +2205,11 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
-            if tab.session.is_exited() {
-                tab.exited = true;
-            }
             if let Some(title) = tab.session.title() {
                 tab.title = display_title(&title, &tab.profile_name);
             }
         }
+        self.remove_exited_tabs();
     }
 
     /// Send focus in/out reports when the window focus or active tab changes,
@@ -2151,6 +2240,7 @@ impl IllnessApp {
         } else if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
         }
+        self.note_active_terminal();
     }
 
     fn tab_infos(&self) -> Vec<TabInfo> {
@@ -2161,13 +2251,11 @@ impl IllnessApp {
                     title: tab.title.clone(),
                     profile: tab.profile_name.clone(),
                     accent: tab.accent,
-                    exited: tab.exited,
                 },
                 TabEntry::Settings => TabInfo {
                     title: "Settings".to_string(),
                     profile: "Settings".to_string(),
                     accent: self.theme.accent,
-                    exited: false,
                 },
             })
             .collect()
@@ -2268,6 +2356,7 @@ impl IllnessApp {
             Shortcut::SelectTab(index) => {
                 if index < self.tabs.len() {
                     self.active = index;
+                    self.note_active_terminal();
                 }
             }
             Shortcut::Palette => self.overlays.kind = OverlayKind::Palette,
@@ -2287,6 +2376,7 @@ impl IllnessApp {
         }
         let len = self.tabs.len() as isize;
         self.active = (self.active as isize + delta).rem_euclid(len) as usize;
+        self.note_active_terminal();
     }
 }
 
@@ -2398,8 +2488,6 @@ impl IllnessApp {
         let mut terminal_actions = Vec::new();
         let mut terminal_rect = None;
         let mut context_menu_pos = None;
-        let mut restart_requested = false;
-        let mut close_requested = false;
         let mut settings_outcome = overlays::SettingsOutcome::default();
 
         if settings_active {
@@ -2431,15 +2519,10 @@ impl IllnessApp {
 
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let Some(TabEntry::Terminal(tab)) = tabs.get_mut(active) else {
-                    let rect = ui.available_rect_before_wrap();
-                    ui.painter().rect_filled(rect, 0.0, tokens.bg);
-                    ui.painter().text(
-                        rect.center(),
-                        Align2::CENTER_CENTER,
-                        "No sessions — Ctrl+Shift+T opens one",
-                        FontId::proportional(14.0),
-                        tokens.text_dim,
-                    );
+                    // The host closes the window when the last tab is
+                    // removed; paint only the background for this pass.
+                    ui.painter()
+                        .rect_filled(ui.available_rect_before_wrap(), 0.0, tokens.bg);
                     return;
                 };
 
@@ -2463,63 +2546,10 @@ impl IllnessApp {
 
                 if !overlay_open
                     && !shortcut_used
-                    && !tab.exited
+                    && !tab.session.is_exited()
                     && let Some(bytes) = tab.view.take_input(ui)
                 {
                     tab.session.write(&bytes);
-                }
-
-                if tab.exited {
-                    let card_size = vec2(360.0, 150.0);
-                    let card = card_rect(response.response.rect, card_size);
-                    egui::Area::new(Id::unique(("illness_exit_card", active)))
-                        .order(Order::Middle)
-                        .fixed_pos(card.min)
-                        .show(ui.ctx(), |ui| {
-                            ui.set_width(card.width());
-                            egui::Frame::new()
-                                .fill(tokens.bg_elev)
-                                .stroke(Stroke::new(1.0, tokens.border))
-                                .corner_radius(tokens.radius_md)
-                                .inner_margin(16.0)
-                                .show(ui, |ui| {
-                                    ui.set_width((card.width() - 32.0).max(80.0));
-                                    ui.set_min_height((card.height() - 32.0).max(40.0));
-                                    ui.label(
-                                        RichText::new("Session ended")
-                                            .size(16.0)
-                                            .color(tokens.text),
-                                    );
-                                    ui.add_space(4.0);
-                                    ui.label(
-                                        RichText::new(exit_detail(tab.exit_code))
-                                            .size(12.0)
-                                            .color(tokens.text_dim),
-                                    );
-                                    ui.add_space(12.0);
-                                    ui.horizontal(|ui| {
-                                        let restart = egui::Button::new(
-                                            RichText::new("Restart").size(13.0).color(tokens.bg),
-                                        )
-                                        .fill(tokens.accent)
-                                        .corner_radius(6.0)
-                                        .min_size(vec2(88.0, 28.0));
-                                        if ui.add(restart).clicked() {
-                                            restart_requested = true;
-                                        }
-
-                                        let close = egui::Button::new(
-                                            RichText::new("Close").size(13.0).color(tokens.text),
-                                        )
-                                        .fill(tokens.bg_hover)
-                                        .corner_radius(6.0)
-                                        .min_size(vec2(88.0, 28.0));
-                                        if ui.add(close).clicked() {
-                                            close_requested = true;
-                                        }
-                                    });
-                                });
-                        });
                 }
             });
         }
@@ -2545,13 +2575,6 @@ impl IllnessApp {
 
         for action in terminal_actions {
             self.handle_terminal_action(action);
-        }
-
-        if restart_requested {
-            self.restart_tab(self.active);
-        }
-        if close_requested {
-            self.close_tab(self.active);
         }
 
         if let Some(pos) = context_menu_pos
@@ -2677,11 +2700,66 @@ fn backdrop_plan(material: Material, mode: BackgroundMode) -> BackdropPlan {
     }
 }
 
-fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
+/// PowerShell's `Set-Location`/`cd` changes its provider location without
+/// updating the Win32 current directory, so a PEB read would keep reporting
+/// the startup folder. Sync the two at every prompt. The original prompt is
+/// preserved and still produces the visible text.
+const POWERSHELL_CWD_HOOK: &str = concat!(
+    "$global:__illness_prompt = $function:prompt; ",
+    "function global:prompt { ",
+    "try { [Environment]::CurrentDirectory = ",
+    "$ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath } catch {}; ",
+    "if ($global:__illness_prompt) { & $global:__illness_prompt } ",
+    "else { 'PS ' + (Get-Location) + '> ' } ",
+    "}"
+);
+
+fn is_power_shell(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe")
+        })
+}
+
+/// A PowerShell invocation that runs a command and exits does not need the
+/// interactive cwd hook, and appending `-Command` there would change its
+/// meaning.
+fn powershell_runs_a_command(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        [
+            "-command",
+            "-c",
+            "-encodedcommand",
+            "-e",
+            "-ec",
+            "-file",
+            "-f",
+            "-commandwithargs",
+        ]
+        .iter()
+        .any(|flag| arg.eq_ignore_ascii_case(flag))
+    })
+}
+
+fn shell_args(profile: &Profile, inherit_cwd: bool) -> Vec<String> {
+    let mut args = profile.args.clone();
+    if inherit_cwd && is_power_shell(&profile.program) && !powershell_runs_a_command(&args) {
+        args.push("-NoExit".to_string());
+        args.push("-Command".to_string());
+        args.push(POWERSHELL_CWD_HOOK.to_string());
+    }
+    args
+}
+
+fn spawn_spec(profile: &Profile, config: &Config, cwd: Option<&Path>) -> SpawnSpec {
     SpawnSpec {
         program: profile.program.clone(),
-        args: profile.args.clone(),
-        cwd: std::env::current_dir().ok(),
+        args: shell_args(profile, config.inherit_cwd),
+        cwd: cwd
+            .map(Path::to_path_buf)
+            .or_else(|| std::env::current_dir().ok()),
         env: vec![
             ("TERM".to_string(), "xterm-256color".to_string()),
             ("COLORTERM".to_string(), "truecolor".to_string()),
@@ -2689,6 +2767,54 @@ fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
         scrollback: config.scrollback,
         cursor: config.cursor,
     }
+}
+
+/// Choose a new tab's cwd from the live shell, its stored value, the
+/// command-line folder, or the process directory, in that order.
+///
+/// A path that no longer exists is skipped rather than handed to ConPTY,
+/// which would make the new tab fail instead of falling back.
+fn select_spawn_cwd(
+    live: Option<PathBuf>,
+    stored: Option<PathBuf>,
+    startup: Option<PathBuf>,
+    process: Option<PathBuf>,
+) -> Option<PathBuf> {
+    live.filter(|path| path.is_dir())
+        .or_else(|| stored.filter(|path| path.is_dir()))
+        .or_else(|| startup.filter(|path| path.is_dir()))
+        .or(process)
+}
+
+/// Respect the Settings opt-out: disabled inheritance ignores the active
+/// terminal entirely and uses only the launch folder, then the process cwd.
+fn select_new_tab_cwd(
+    inherit: bool,
+    live: Option<PathBuf>,
+    stored: Option<PathBuf>,
+    startup: Option<PathBuf>,
+    process: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if inherit {
+        select_spawn_cwd(live, stored, startup, process)
+    } else {
+        select_spawn_cwd(None, None, startup, process)
+    }
+}
+
+/// WSL's Windows-side process cwd is not the Linux shell's cwd, so a live
+/// query would silently point new tabs at the wrong directory.
+fn is_wsl_program(program: &str) -> bool {
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("wsl.exe"))
+}
+
+fn tab_live_cwd(tab: &Tab) -> Option<PathBuf> {
+    if tab.session.is_exited() || is_wsl_program(&tab.program) {
+        return None;
+    }
+    platform::process_cwd(tab.session.child_pid()?)
 }
 
 /// Keep profiles saved in `config.toml` and append detected built-ins whose
@@ -2715,30 +2841,6 @@ fn merge_profiles(saved: Vec<Profile>, detected: Vec<Profile>, hidden: &[String]
     merged
 }
 
-/// Resolve which profile a restart should launch.
-///
-/// When the profile still exists, its current program and args win. If it was
-/// renamed or removed, use the values captured when the tab was spawned so
-/// Restart keeps the same shell instead of falling back to the default.
-fn restart_profile(
-    name: &str,
-    program: &str,
-    args: &[String],
-    accent: Rgb,
-    profiles: &[Profile],
-) -> Profile {
-    profiles
-        .iter()
-        .find(|profile| profile.name.eq_ignore_ascii_case(name))
-        .cloned()
-        .unwrap_or_else(|| Profile {
-            name: name.to_string(),
-            program: program.to_string(),
-            args: args.to_vec(),
-            accent,
-        })
-}
-
 /// Point `default_profile` at a profile whose name still exists.
 ///
 /// This runs on load only. Running it during edits would silently switch the
@@ -2761,10 +2863,6 @@ fn ensure_default_profile(config: &mut Config) {
         .or_else(|| config.profiles.first())
         .map(|profile| profile.name.clone())
         .unwrap_or_default();
-}
-
-fn restarted_state(profile: &Profile) -> (String, bool, Option<i32>) {
-    (profile.name.clone(), false, None)
 }
 
 fn cell_pixel(value: u32) -> u16 {
@@ -2918,13 +3016,6 @@ fn count_visible_matches(
         .sum()
 }
 
-fn exit_detail(exit_code: Option<i32>) -> String {
-    match exit_code {
-        Some(code) => format!("Exit code {code}"),
-        None => "Process exited".to_string(),
-    }
-}
-
 fn zoom_size(size: f32, delta: f32) -> f32 {
     if size.is_finite() {
         (size + delta).clamp(8.0, 40.0)
@@ -2954,20 +3045,8 @@ fn color_response(index: usize, theme: &Theme) -> String {
     format!("\x1b]{prefix};rgb:{red:04x}/{green:04x}/{blue:04x}\x07")
 }
 
-fn card_rect(bounds: Rect, size: Vec2) -> Rect {
-    let width = size.x.min((bounds.width() - 16.0).max(1.0));
-    let height = size.y.min((bounds.height() - 16.0).max(1.0));
-    let left = bounds.left() + 8.0;
-    let top = bounds.top() + 8.0;
-    let max_x = (bounds.right() - width - 8.0).max(left);
-    let max_y = (bounds.bottom() - height - 8.0).max(top);
-    Rect::from_min_size(
-        pos2(
-            (bounds.center().x - width * 0.5).clamp(left, max_x),
-            (bounds.center().y - height * 0.5).clamp(top, max_y),
-        ),
-        vec2(width, height),
-    )
+fn removal_closes_window(remaining: usize) -> bool {
+    remaining == 0
 }
 
 /// New active strip index after removing `closing` from `remaining` entries.
@@ -3269,25 +3348,6 @@ mod tests {
     }
 
     #[test]
-    fn restart_falls_back_to_the_spawned_program_after_a_rename() {
-        let profiles = vec![profile("Renamed")];
-        let args = vec!["-d".to_string(), "Ubuntu".to_string()];
-        let fallback = restart_profile(
-            "PowerShell",
-            "pwsh.exe",
-            &args,
-            Rgb::new(0x7e, 0xe7, 0x87),
-            &profiles,
-        );
-        assert_eq!(fallback.name, "PowerShell");
-        assert_eq!(fallback.program, "pwsh.exe");
-        assert_eq!(fallback.args, args);
-
-        let resolved = restart_profile("Renamed", "old.exe", &[], Rgb::new(0, 0, 0), &profiles);
-        assert_eq!(resolved.program, "pwsh.exe");
-    }
-
-    #[test]
     fn save_debounce_waits_or_flushes_on_pointer_release() {
         let mut debounce = SaveDebounce::default();
         assert!(!debounce.take_due(1.0, false));
@@ -3392,14 +3452,27 @@ mod tests {
     }
 
     #[test]
-    fn test_close_last_tab() {
-        assert_eq!(next_active_after_close(0, 0, 0), 0);
-        assert_eq!(next_active_after_close(0, 0, 1), 0);
-        assert_eq!(next_active_after_close(1, 1, 1), 0);
+    fn shell_exit_selects_a_neighbor_or_closes_the_window() {
+        // Removing a non-active tab keeps the same active terminal; its
+        // index shifts left.
         assert_eq!(next_active_after_close(1, 0, 2), 0);
-        assert_eq!(next_active_after_close(2, 1, 3), 1);
-        assert_eq!(next_active_after_close(2, 3, 3), 2);
-        assert_eq!(next_active_after_close(0, 1, 2), 0);
+        // Removing the active tab picks the next tab when one exists.
+        assert_eq!(next_active_after_close(1, 1, 2), 1);
+        // Removing the active last tab picks the previous one.
+        assert_eq!(next_active_after_close(2, 2, 2), 1);
+        // No tab remains: the host closes the window instead of showing an
+        // empty app.
+        assert!(removal_closes_window(0));
+        assert!(!removal_closes_window(1));
+    }
+
+    #[test]
+    fn last_terminal_exit_leaves_the_settings_tab_active() {
+        // [Settings, Terminal]: the active terminal was last.
+        assert_eq!(next_active_after_close(1, 1, 1), 0);
+        // [Terminal, Settings]: the terminal was first.
+        assert_eq!(next_active_after_close(0, 0, 1), 0);
+        assert!(!removal_closes_window(1));
     }
 
     #[test]
@@ -3443,18 +3516,6 @@ mod tests {
         }
         assert_eq!(count_visible_matches(&snapshot, "ab", false), 3);
         assert_eq!(count_visible_matches(&snapshot, "aa", false), 1);
-    }
-
-    #[test]
-    fn test_exit_restart() {
-        assert_eq!(exit_detail(Some(3)), "Exit code 3");
-        assert_eq!(exit_detail(None), "Process exited");
-
-        let source = profile("PowerShell");
-        let (title, exited, exit_code) = restarted_state(&source);
-        assert_eq!(title, "PowerShell");
-        assert!(!exited);
-        assert_eq!(exit_code, None);
     }
 
     #[test]
@@ -4078,13 +4139,6 @@ mod tests {
     }
 
     #[test]
-    fn exit_card_stays_inside_the_terminal() {
-        let bounds = Rect::from_min_size(pos2(0.0, 0.0), vec2(200.0, 100.0));
-        let card = card_rect(bounds, vec2(360.0, 150.0));
-        assert!(bounds.contains_rect(card));
-    }
-
-    #[test]
     fn search_counter_wraps_in_both_directions() {
         assert_eq!(cycle_search(1, 3, true), 2);
         assert_eq!(cycle_search(3, 3, true), 1);
@@ -4110,8 +4164,157 @@ mod tests {
             cursor: illness_core::CursorKind::Beam,
             ..Config::default()
         };
-        let spec = spawn_spec(&profile, &config);
+        let spec = spawn_spec(&profile, &config, None);
         assert_eq!(spec.scrollback, 25_000);
         assert_eq!(spec.cursor, illness_core::CursorKind::Beam);
+    }
+
+    #[test]
+    fn new_tabs_start_in_the_command_line_folder() {
+        let profile = profile("PowerShell");
+        let config = Config::default();
+        let startup = std::env::temp_dir();
+
+        let spec = spawn_spec(&profile, &config, Some(&startup));
+
+        assert_eq!(spec.cwd.as_deref(), Some(startup.as_path()));
+    }
+
+    #[test]
+    fn no_command_line_folder_keeps_the_process_directory() {
+        let profile = profile("PowerShell");
+        let config = Config::default();
+
+        let spec = spawn_spec(&profile, &config, None);
+
+        assert_eq!(spec.cwd, std::env::current_dir().ok());
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("illness-cwd-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&path).expect("create test directory");
+        path
+    }
+
+    #[test]
+    fn live_shell_cwd_wins_for_a_new_tab() {
+        let live = test_dir("live");
+        let stored = test_dir("stored");
+        let startup = test_dir("startup");
+        let process = test_dir("process");
+
+        let selected = select_spawn_cwd(
+            Some(live.clone()),
+            Some(stored.clone()),
+            Some(startup.clone()),
+            Some(process.clone()),
+        );
+
+        assert_eq!(selected, Some(live));
+        for path in [stored, startup, process] {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+
+    #[test]
+    fn missing_live_and_stored_dirs_fall_back_to_startup_then_process() {
+        let missing = std::env::temp_dir().join("illness-cwd-missing");
+        let startup = test_dir("startup-fallback");
+        let process = test_dir("process-fallback");
+
+        assert_eq!(
+            select_spawn_cwd(
+                Some(missing.clone()),
+                Some(missing.clone()),
+                Some(startup.clone()),
+                Some(process.clone()),
+            ),
+            Some(startup.clone())
+        );
+        assert_eq!(
+            select_spawn_cwd(None, None, Some(missing), Some(process.clone())),
+            Some(process.clone())
+        );
+
+        for path in [startup, process] {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+
+    #[test]
+    fn inherit_cwd_setting_chooses_active_folder_or_launch_folder() {
+        let live = test_dir("inherit-live");
+        let ignored = test_dir("inherit-ignored");
+        let ignored_stored = test_dir("inherit-ignored-stored");
+        let startup = test_dir("inherit-startup");
+        let process = test_dir("inherit-process");
+
+        assert_eq!(
+            select_new_tab_cwd(
+                true,
+                Some(live.clone()),
+                Some(live.clone()),
+                Some(startup.clone()),
+                Some(process.clone()),
+            ),
+            Some(live),
+            "enabled inheritance uses the active shell folder"
+        );
+        assert_eq!(
+            select_new_tab_cwd(
+                false,
+                Some(ignored.clone()),
+                Some(ignored_stored.clone()),
+                Some(startup.clone()),
+                Some(process.clone()),
+            ),
+            Some(startup.clone()),
+            "disabled inheritance uses the launch folder, never the active tab"
+        );
+
+        for path in [ignored, ignored_stored, startup, process] {
+            let _ = std::fs::remove_dir(path);
+        }
+    }
+
+    #[test]
+    fn wsl_live_cwd_is_not_used() {
+        assert!(is_wsl_program(r"C:\Windows\System32\wsl.exe"));
+        assert!(is_wsl_program("WSL.EXE"));
+        assert!(!is_wsl_program(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+    }
+
+    #[test]
+    fn interactive_powershell_gets_the_cwd_prompt_hook() {
+        let mut profile = profile("PowerShell");
+        profile.program = r"C:\Program Files\PowerShell\7\pwsh.exe".to_string();
+
+        let args = shell_args(&profile, true);
+
+        assert_eq!(&args[..2], ["-NoExit", "-Command"]);
+        assert_eq!(args[2], POWERSHELL_CWD_HOOK);
+        assert_eq!(
+            shell_args(&profile, false),
+            profile.args,
+            "disabled inheritance needs no prompt hook"
+        );
+    }
+
+    #[test]
+    fn powershell_command_invocations_keep_their_arguments() {
+        let mut profile = profile("PowerShell");
+        profile.program = "pwsh.exe".to_string();
+        profile.args = vec!["-NoProfile".into(), "-Command".into(), "Get-Date".into()];
+
+        assert_eq!(shell_args(&profile, true), profile.args);
+    }
+
+    #[test]
+    fn other_shells_keep_their_arguments() {
+        let mut profile = profile("Command Prompt");
+        profile.program = "cmd.exe".to_string();
+        profile.args = vec!["/k".into(), "echo hello".into()];
+
+        assert_eq!(shell_args(&profile, true), profile.args);
     }
 }

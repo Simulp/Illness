@@ -5,9 +5,10 @@
 
 #![allow(unsafe_code)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use illness_core::{Material, Rgb};
 use raw_window_handle::HasWindowHandle;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
@@ -15,7 +16,7 @@ use raw_window_handle::RawWindowHandle;
 #[cfg(target_os = "windows")]
 use std::sync::OnceLock;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::HWND;
+use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DwmExtendFrameIntoClientArea,
@@ -210,6 +211,363 @@ pub fn wsl_profiles() -> Vec<illness_core::Profile> {
     // Safety: key was opened successfully above and is not used afterwards.
     unsafe { RegCloseKey(key) };
     profiles
+}
+
+/// Per-user Explorer verbs for opening a folder in Illness.
+///
+/// `Directory\Background` is the empty space inside a folder and receives
+/// `%V`; `Directory` is a selected folder and `Drive` a drive root, both of
+/// which receive `%1`. No file association is added, so double-clicking a file
+/// is unchanged.
+#[cfg(target_os = "windows")]
+const CONTEXT_MENU_VERBS: &[(&str, &str)] = &[
+    (r"Software\Classes\Directory\Background\shell\Illness", "%V"),
+    (r"Software\Classes\Directory\shell\Illness", "%1"),
+    (r"Software\Classes\Drive\shell\Illness", "%1"),
+];
+
+/// Build the Explorer command line for one verb.
+///
+/// Both the executable and the placeholder are quoted, so an install path
+/// containing spaces works and `%V`/`%1` stays one argument. Windows paths
+/// cannot contain `"`, so no escaping is required.
+fn context_menu_command(executable: &OsStr, placeholder: &str) -> String {
+    format!("\"{}\" \"{placeholder}\"", executable.to_string_lossy())
+}
+
+/// HKEY handle closed on every return path, including a failed value write.
+#[cfg(target_os = "windows")]
+struct RegistryKey(windows_sys::Win32::System::Registry::HKEY);
+
+#[cfg(target_os = "windows")]
+impl Drop for RegistryKey {
+    fn drop(&mut self) {
+        // Safety: `self.0` came from a successful `RegCreateKeyExW` and is
+        // closed exactly once here.
+        unsafe { windows_sys::Win32::System::Registry::RegCloseKey(self.0) };
+    }
+}
+
+/// Null-terminated UTF-16 for a registry path, value name or value.
+#[cfg(target_os = "windows")]
+fn registry_wide(value: &OsStr) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    value.encode_wide().chain(std::iter::once(0)).collect()
+}
+
+/// Create or open one per-user key for writing.
+///
+/// # Safety
+///
+/// The subkey buffer is null-terminated and live for the call. `key` and
+/// `disposition` are valid out-pointers, the class and security pointers are
+/// null as the API allows, and the returned handle is owned by
+/// [`RegistryKey`]. Only `HKEY_CURRENT_USER` is touched, so no elevation is
+/// needed.
+#[cfg(target_os = "windows")]
+fn create_registry_key(path: &str) -> Result<RegistryKey> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, KEY_WRITE, REG_OPTION_NON_VOLATILE, RegCreateKeyExW,
+    };
+
+    let key_path = registry_wide(OsStr::new(path));
+    let mut key: HKEY = std::ptr::null_mut();
+    let mut disposition = 0;
+    // Safety: see the function-level contract.
+    let status = unsafe {
+        RegCreateKeyExW(
+            windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            std::ptr::null(),
+            &mut key,
+            &mut disposition,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("could not open HKCU\\{path}: Windows error {status}");
+    }
+    Ok(RegistryKey(key))
+}
+
+/// Write one `REG_SZ` value, including its terminating NUL.
+///
+/// # Safety
+///
+/// `key` is a live key owned by [`RegistryKey`]. Both wide strings are
+/// null-terminated stack-owned buffers, and `data.len() * 2` is their exact
+/// byte length.
+#[cfg(target_os = "windows")]
+fn set_registry_string(key: &RegistryKey, name: &str, value: &OsStr) -> Result<()> {
+    use windows_sys::Win32::System::Registry::{REG_SZ, RegSetValueExW};
+
+    let value_name = registry_wide(OsStr::new(name));
+    let data = registry_wide(value);
+    let size = u32::try_from(data.len() * std::mem::size_of::<u16>())
+        .context("registry value exceeds the Win32 size limit")?;
+    // Safety: see the function-level contract.
+    let status = unsafe {
+        RegSetValueExW(
+            key.0,
+            value_name.as_ptr(),
+            0,
+            REG_SZ,
+            data.as_ptr().cast(),
+            size,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        anyhow::bail!("could not write registry value {name:?}: Windows error {status}");
+    }
+    Ok(())
+}
+
+/// Register the per-user "Open with Illness" verbs for folders and drives.
+///
+/// The current executable is written every time, so running an installer or
+/// switching between debug and release builds repairs a stale path. Existing
+/// unrelated classes and verbs are never touched.
+pub fn register_context_menu() -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let executable =
+            std::env::current_exe().context("could not resolve the Illness executable")?;
+        for (path, placeholder) in CONTEXT_MENU_VERBS {
+            let key =
+                create_registry_key(path).with_context(|| format!("registering HKCU\\{path}"))?;
+            set_registry_string(&key, "MUIVerb", OsStr::new("Open with Illness"))
+                .context("writing the context-menu label")?;
+            set_registry_string(&key, "Icon", executable.as_os_str())
+                .context("writing the context-menu icon")?;
+            let command = context_menu_command(executable.as_os_str(), placeholder);
+            set_registry_string(&key, "", OsStr::new(&command))
+                .context("writing the context-menu command")?;
+        }
+        log::info!(
+            "registered Explorer folder verbs for {}",
+            executable.display()
+        );
+        Ok(())
+    }
+}
+
+/// Remove only the Illness verbs created by [`register_context_menu`].
+///
+/// Each key is deleted recursively, but the `shell` parent keys are left in
+/// place so verbs from other applications survive.
+pub fn unregister_context_menu() -> Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, RegDeleteKeyW, RegDeleteTreeW,
+        };
+
+        for (path, _) in CONTEXT_MENU_VERBS {
+            let key_path = registry_wide(OsStr::new(path));
+            // Safety: key_path is null-terminated and live for the call.
+            let tree_status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key_path.as_ptr()) };
+            if tree_status != ERROR_SUCCESS && tree_status != ERROR_FILE_NOT_FOUND {
+                anyhow::bail!("could not clear HKCU\\{path}: Windows error {tree_status}");
+            }
+            // RegDeleteTree removes values and subkeys; this removes the now
+            // empty verb key itself. Safety: same null-terminated path.
+            let key_status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, key_path.as_ptr()) };
+            if key_status != ERROR_SUCCESS && key_status != ERROR_FILE_NOT_FOUND {
+                anyhow::bail!("could not remove HKCU\\{path}: Windows error {key_status}");
+            }
+        }
+        log::info!("removed Explorer folder verbs");
+        Ok(())
+    }
+}
+
+/// `PEB.ProcessParameters` offset on the native pointer size.
+#[cfg(target_os = "windows")]
+const PEB_PROCESS_PARAMETERS_OFFSET: usize = if cfg!(target_pointer_width = "64") {
+    0x20
+} else {
+    0x10
+};
+/// `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory` offset.
+#[cfg(target_os = "windows")]
+const CURRENT_DIRECTORY_OFFSET: usize = if cfg!(target_pointer_width = "64") {
+    0x38
+} else {
+    0x24
+};
+/// `UNICODE_STRING.Buffer` offset inside `CURDIR.DosPath`.
+#[cfg(target_os = "windows")]
+const CURRENT_DIRECTORY_BUFFER_OFFSET: usize = if cfg!(target_pointer_width = "64") {
+    8
+} else {
+    4
+};
+
+/// Owned process handle used by [`process_cwd`].
+#[cfg(target_os = "windows")]
+struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        // Safety: the handle came from a successful `OpenProcess` and is
+        // closed exactly once here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Read `buffer.len()` bytes from another process.
+///
+/// # Safety
+///
+/// `process` owns a handle opened with `PROCESS_VM_READ`. `address` is only
+/// interpreted as a pointer inside that process; `buffer` is a live writable
+/// slice and its full length is passed to `ReadProcessMemory`.
+#[cfg(target_os = "windows")]
+fn read_process_memory(process: &ProcessHandle, address: usize, buffer: &mut [u8]) -> Option<()> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+
+    let mut read = 0usize;
+    // Safety: see the function-level contract.
+    let ok = unsafe {
+        ReadProcessMemory(
+            process.0,
+            address as *const core::ffi::c_void,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut read,
+        )
+    };
+    (ok != 0 && read == buffer.len()).then_some(())
+}
+
+#[cfg(target_os = "windows")]
+fn read_process_usize(process: &ProcessHandle, address: usize) -> Option<usize> {
+    let mut bytes = [0u8; std::mem::size_of::<usize>()];
+    read_process_memory(process, address, &mut bytes)?;
+    Some(usize::from_ne_bytes(bytes))
+}
+
+#[cfg(target_os = "windows")]
+fn read_process_u16(process: &ProcessHandle, address: usize) -> Option<u16> {
+    let mut bytes = [0u8; std::mem::size_of::<u16>()];
+    read_process_memory(process, address, &mut bytes)?;
+    Some(u16::from_ne_bytes(bytes))
+}
+
+/// Strip the Win32 object-manager prefix from a `DosPath`.
+fn strip_nt_prefix(path: &str) -> PathBuf {
+    let path = path
+        .strip_prefix(r"\??\")
+        .or_else(|| path.strip_prefix(r"\\?\"))
+        .unwrap_or(path);
+    if let Some(unc) = path.strip_prefix(r"UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+/// Read a process's current working directory from its PEB.
+///
+/// Returns `None` when the process is gone, belongs to another user/elevation
+/// level, is a WOW64 target whose native PEB cannot be read, or exposes no
+/// usable DOS path. Callers must keep a stored fallback cwd.
+#[cfg(target_os = "windows")]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    if pid == 0 {
+        return None;
+    }
+    // Safety: no pointer arguments; the returned handle is null-checked and
+    // owned by ProcessHandle. Limited query plus VM read is the least access
+    // that lets a same-user process's PEB be read.
+    let process =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if process.is_null() {
+        return None;
+    }
+    let process = ProcessHandle(process);
+
+    // Safety: PROCESS_BASIC_INFORMATION is a plain C out-structure for which
+    // all-zero is valid; the API fills it and reports the length used.
+    let mut basic: PROCESS_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let mut returned = 0u32;
+    let size = u32::try_from(std::mem::size_of::<PROCESS_BASIC_INFORMATION>()).ok()?;
+    // Safety: `basic` and `returned` are live out-pointers with their exact
+    // sizes; the process handle grants the required query access.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.0,
+            ProcessBasicInformation,
+            (&raw mut basic).cast(),
+            size,
+            &mut returned,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+
+    let peb = basic.PebBaseAddress as usize;
+    if peb == 0 {
+        return None;
+    }
+    let parameters = read_process_usize(&process, peb.checked_add(PEB_PROCESS_PARAMETERS_OFFSET)?)?;
+    if parameters == 0 {
+        return None;
+    }
+    let current_directory = parameters.checked_add(CURRENT_DIRECTORY_OFFSET)?;
+    let length = read_process_u16(&process, current_directory)?;
+    if length == 0 || length % 2 != 0 {
+        return None;
+    }
+    let buffer = read_process_usize(
+        &process,
+        current_directory.checked_add(CURRENT_DIRECTORY_BUFFER_OFFSET)?,
+    )?;
+    if buffer == 0 {
+        return None;
+    }
+
+    let mut text = vec![0u8; usize::from(length)];
+    read_process_memory(&process, buffer, &mut text)?;
+    let units: Vec<u16> = text
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let text = text.trim_end_matches('\0');
+    if text.is_empty() {
+        return None;
+    }
+    Some(strip_nt_prefix(text))
+}
+
+/// Process inspection is Windows-only; other platforms use the stored cwd.
+#[cfg(not(target_os = "windows"))]
+pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
 }
 
 /// Path of the wallpaper Windows currently has registered, if any.
@@ -551,8 +909,61 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::{acrylic_tint, transparency_allowed};
+    use super::{
+        CONTEXT_MENU_VERBS, acrylic_tint, context_menu_command, process_cwd, strip_nt_prefix,
+        transparency_allowed,
+    };
     use illness_core::Rgb;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    #[test]
+    fn peb_dos_paths_lose_object_manager_prefixes() {
+        assert_eq!(
+            strip_nt_prefix(r"\??\C:\Users\Simulp\folder"),
+            PathBuf::from(r"C:\Users\Simulp\folder")
+        );
+        assert_eq!(strip_nt_prefix(r"\\?\E:\Files"), PathBuf::from(r"E:\Files"));
+        assert_eq!(
+            strip_nt_prefix(r"\??\UNC\server\share"),
+            PathBuf::from(r"\\server\share")
+        );
+        assert_eq!(strip_nt_prefix(r"C:\plain"), PathBuf::from(r"C:\plain"));
+    }
+
+    #[test]
+    fn process_cwd_reads_this_process() {
+        let expected = std::env::current_dir().expect("test process cwd");
+        let actual = process_cwd(std::process::id()).expect("own PEB is readable");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn context_menu_commands_quote_the_executable_and_placeholder() {
+        let exe = OsStr::new(r"C:\Program Files\Illness\illness.exe");
+
+        assert_eq!(
+            context_menu_command(exe, "%V"),
+            r#""C:\Program Files\Illness\illness.exe" "%V""#
+        );
+        assert_eq!(
+            context_menu_command(exe, "%1"),
+            r#""C:\Program Files\Illness\illness.exe" "%1""#
+        );
+    }
+
+    #[test]
+    fn context_menu_covers_folder_background_folder_and_drive() {
+        assert!(CONTEXT_MENU_VERBS.iter().any(|(key, placeholder)| {
+            key.ends_with(r"Directory\Background\shell\Illness") && *placeholder == "%V"
+        }));
+        assert!(CONTEXT_MENU_VERBS.iter().any(|(key, placeholder)| {
+            key.ends_with(r"Directory\shell\Illness") && *placeholder == "%1"
+        }));
+        assert!(CONTEXT_MENU_VERBS.iter().any(|(key, placeholder)| {
+            key.ends_with(r"Drive\shell\Illness") && *placeholder == "%1"
+        }));
+    }
 
     #[test]
     fn transparency_requires_composition_and_the_user_setting() {

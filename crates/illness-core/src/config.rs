@@ -41,6 +41,12 @@ pub enum BackgroundMode {
     None,
 }
 
+/// Serde default for options that stay enabled when an older config omits
+/// them.
+fn enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -58,6 +64,10 @@ pub struct Config {
     pub padding: f32,
     pub default_profile: String,
     pub copy_on_select: bool,
+    /// New tabs start in the active tab's shell folder. `false` uses the
+    /// launch folder instead. Missing in older configs means enabled.
+    #[serde(default = "enabled_by_default")]
+    pub inherit_cwd: bool,
     pub profiles: Vec<Profile>,
     /// Detected profile names the user removed or renamed away. They are
     /// filtered out when built-in profiles are merged on the next launch.
@@ -84,6 +94,7 @@ impl Default for Config {
             padding: 8.0,
             default_profile: String::new(),
             copy_on_select: false,
+            inherit_cwd: true,
             profiles: Vec::new(),
             hidden_profiles: Vec::new(),
             gpu_text: true,
@@ -330,6 +341,7 @@ mod tests {
         assert_eq!(config.padding, 8.0);
         assert!(config.default_profile.is_empty());
         assert!(!config.copy_on_select);
+        assert!(config.inherit_cwd);
         assert!(config.profiles.is_empty());
         assert!(config.hidden_profiles.is_empty());
         assert!(config.gpu_text);
@@ -349,6 +361,7 @@ mod tests {
                 .to_string(),
             background_opacity: 42.5,
             default_profile: "PowerShell".to_string(),
+            inherit_cwd: false,
             profiles: vec![sample_profile("PowerShell")],
             ..Config::default()
         };
@@ -373,6 +386,16 @@ mod tests {
     fn missing_gpu_text_defaults_to_enabled() {
         let parsed: Config = toml::from_str("theme = \"Nord\"\n").expect("parse config");
         assert!(parsed.gpu_text);
+    }
+
+    #[test]
+    fn missing_inherit_cwd_defaults_to_enabled() {
+        let parsed: Config = toml::from_str("theme = \"Nord\"\n").expect("parse config");
+        assert!(parsed.inherit_cwd, "older configs inherit the folder");
+
+        let disabled: Config =
+            toml::from_str("inherit_cwd = false\n").expect("parse explicit value");
+        assert!(!disabled.inherit_cwd);
     }
 
     #[test]

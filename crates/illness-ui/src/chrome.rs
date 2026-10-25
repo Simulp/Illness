@@ -30,7 +30,6 @@ pub struct TabInfo {
     pub title: String,
     pub profile: String,
     pub accent: Rgb,
-    pub exited: bool,
 }
 
 impl Default for TabInfo {
@@ -39,7 +38,6 @@ impl Default for TabInfo {
             title: String::new(),
             profile: String::new(),
             accent: Rgb::new(0x4c, 0x9a, 0xff),
-            exited: false,
         }
     }
 }
@@ -243,11 +241,7 @@ pub fn show(
             );
         }
 
-        let icon_color = if tab.exited {
-            tokens.danger
-        } else {
-            crate::design::color(tab.accent)
-        };
+        let icon_color = crate::design::color(tab.accent);
         icons::paint_icon(
             &tabs_painter,
             Rect::from_min_size(
@@ -269,9 +263,7 @@ pub fn show(
         let show_close = is_active || hovered || close_hovered;
         let title_left = rect.left() + 24.0;
         let title_right = (close_rect.left() - 4.0).max(title_left);
-        let title_color = if tab.exited {
-            tokens.text_dim
-        } else if is_active {
+        let title_color = if is_active {
             tokens.text
         } else {
             tokens.text_dim
@@ -936,13 +928,11 @@ mod tests {
                 title: "A very long PowerShell tab title that must ellipsize".to_owned(),
                 profile: "PowerShell".to_owned(),
                 accent: Rgb::new(0x7e, 0xe7, 0x87),
-                exited: false,
             },
             TabInfo {
                 title: "Command Prompt".to_owned(),
                 profile: "Command Prompt".to_owned(),
                 accent: Rgb::new(0xe3, 0xb3, 0x41),
-                exited: true,
             },
         ];
         let mut state = ChromeState::default();
