@@ -13,12 +13,16 @@ use std::path::PathBuf;
 #[cfg(target_os = "windows")]
 use raw_window_handle::RawWindowHandle;
 #[cfg(target_os = "windows")]
+use std::sync::OnceLock;
+#[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::HWND;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DwmExtendFrameIntoClientArea,
     DwmSetWindowAttribute,
 };
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 
 /// Fallback attribute used by Windows 10 builds that predate the documented dark-mode id.
 #[cfg(target_os = "windows")]
@@ -26,6 +30,71 @@ const DWMWA_USE_IMMERSIVE_DARK_MODE_OLD: u32 = 19;
 /// `DWMWCP_ROUND`: round the window corners where the compositor supports it.
 #[cfg(target_os = "windows")]
 const DWMWCP_ROUND: i32 = 2;
+
+/// `WCA_ACCENT_POLICY` from the undocumented `SetWindowCompositionAttribute` API.
+#[cfg(target_os = "windows")]
+const WCA_ACCENT_POLICY: u32 = 0x13;
+/// `ACCENT_ENABLE_ACRYLICBLURBEHIND`: the legacy acrylic blur used by
+/// Windows 10/11 for behind-window blur.
+#[cfg(target_os = "windows")]
+const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+/// `ACCENT_DISABLED`: clears any previously applied accent policy.
+#[cfg(target_os = "windows")]
+const ACCENT_DISABLED: u32 = 0;
+
+/// Fixed low-alpha tint handed to the legacy acrylic policy. The colour is
+/// packed as `AABBGGRR`, matching `ACCENT_POLICY::GradientColor`.
+#[cfg(target_os = "windows")]
+const ACRYLIC_TINT_DARK: u32 = 0x2030_2020;
+#[cfg(target_os = "windows")]
+const ACRYLIC_TINT_LIGHT: u32 = 0x20f5_f5f5;
+
+/// `ACCENT_POLICY` from `winuser.h`.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct AccentPolicy {
+    accent_state: u32,
+    accent_flags: u32,
+    gradient_color: u32,
+    animation_id: u32,
+}
+
+/// `WINDOWCOMPOSITIONATTRIBDATA` from `winuser.h`.
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct WindowCompositionAttribData {
+    attribute: u32,
+    data: *mut core::ffi::c_void,
+    size: usize,
+}
+
+#[cfg(target_os = "windows")]
+type SetWindowCompositionAttributeFn =
+    unsafe extern "system" fn(HWND, *mut WindowCompositionAttribData) -> i32;
+
+/// Resolve the undocumented export once. It lives in `user32.dll` on every
+/// supported Windows version; a missing export only disables Acrylic.
+#[cfg(target_os = "windows")]
+fn set_window_composition_attribute() -> Option<SetWindowCompositionAttributeFn> {
+    static FUNCTION: OnceLock<Option<SetWindowCompositionAttributeFn>> = OnceLock::new();
+    *FUNCTION.get_or_init(|| {
+        // Safety: `user32.dll` is loaded in every GUI process. The module
+        // handle is borrowed, never freed, and the export name is a
+        // null-terminated ASCII string. The returned address is only called
+        // with the signature documented for `SetWindowCompositionAttribute`.
+        let module_name: Vec<u16> = "user32.dll\0".encode_utf16().collect();
+        let module = unsafe { GetModuleHandleW(module_name.as_ptr()) };
+        if module.is_null() {
+            return None;
+        }
+        let function =
+            unsafe { GetProcAddress(module, c"SetWindowCompositionAttribute".as_ptr().cast()) };
+        // Safety: the export has the documented `BOOL WINAPI
+        // SetWindowCompositionAttribute(HWND, WINDOWCOMPOSITIONATTRIBDATA*)`
+        // signature; the cast only restores the concrete pointer type.
+        function.map(|function| unsafe { std::mem::transmute(function) })
+    })
+}
 
 /// Read WSL distributions from the per-user registry.
 ///
@@ -208,22 +277,39 @@ pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> R
             anyhow::bail!("window does not expose a Win32 handle");
         };
         let hwnd = win32.hwnd.get() as HWND;
-        apply_dwm(hwnd, dark);
+        apply_theme(hwnd, dark);
 
         match material {
-            Material::Mica => window_vibrancy::apply_mica(window, Some(dark))?,
+            Material::Mica => {
+                // Mica is the wallpaper-derived system backdrop. Extend the
+                // frame so DWM paints it through the whole client area.
+                let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
+                window_vibrancy::apply_mica(window, Some(dark))?;
+                extend_frame(hwnd, true);
+            }
             Material::Acrylic => {
+                // The system backdrop only samples the wallpaper; the legacy
+                // accent policy blurs whatever is actually behind the window.
+                // Never extend the frame here: DWM would paint an opaque layer
+                // over the accent.
+                let _ = window_vibrancy::clear_mica(window);
+                let _ = window_vibrancy::clear_acrylic(window);
+                extend_frame(hwnd, false);
                 let tint = if dark {
-                    (0x0c, 0x0c, 0x0f, 180)
+                    ACRYLIC_TINT_DARK
                 } else {
-                    (0xf5, 0xf5, 0xf5, 180)
+                    ACRYLIC_TINT_LIGHT
                 };
-                window_vibrancy::apply_acrylic(window, Some(tint))?;
+                if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
+                    anyhow::bail!("legacy acrylic accent policy is unavailable");
+                }
             }
             Material::Solid => {
                 // Clearing an effect that was never applied is not an error.
+                let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
                 let _ = window_vibrancy::clear_mica(window);
                 let _ = window_vibrancy::clear_acrylic(window);
+                extend_frame(hwnd, false);
             }
         }
 
@@ -231,10 +317,10 @@ pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> R
     }
 }
 
-/// Apply DWM dark mode and rounded corners. Failures are ignored: older Windows versions
-/// reject individual attributes without affecting the rest of the window.
+/// Set DWM dark mode and rounded corners. Failures are ignored: older Windows
+/// versions reject individual attributes without affecting the rest.
 #[cfg(target_os = "windows")]
-fn apply_dwm(hwnd: HWND, dark: bool) {
+fn apply_theme(hwnd: HWND, dark: bool) {
     let value = i32::from(dark);
     let attribute = u32::try_from(DWMWA_USE_IMMERSIVE_DARK_MODE).unwrap_or(20);
     if !set_attribute(hwnd, attribute, value) {
@@ -242,20 +328,57 @@ fn apply_dwm(hwnd: HWND, dark: bool) {
     }
     let corners = u32::try_from(DWMWA_WINDOW_CORNER_PREFERENCE).unwrap_or(33);
     let _ = set_attribute(hwnd, corners, DWMWCP_ROUND);
+}
 
-    // Let DWM composite the system backdrop through the whole client area.
-    // Without this, DWMWA_SYSTEMBACKDROP_TYPE only paints under the frame.
+/// Extend or reset the DWM frame.
+///
+/// Extending (negative margins) lets the system Mica backdrop reach the whole
+/// client area. Resetting to zero margins undoes that when switching to a
+/// material that must composite its own backdrop.
+#[cfg(target_os = "windows")]
+fn extend_frame(hwnd: HWND, extend: bool) {
+    let margin = if extend { -1 } else { 0 };
     let margins = windows_sys::Win32::UI::Controls::MARGINS {
-        cxLeftWidth: -1,
-        cxRightWidth: -1,
-        cyTopHeight: -1,
-        cyBottomHeight: -1,
+        cxLeftWidth: margin,
+        cxRightWidth: margin,
+        cyTopHeight: margin,
+        cyBottomHeight: margin,
     };
     // Safety: hwnd is live for the duration of this call; `margins` is a
     // correctly laid out MARGINS owned by this stack frame.
     unsafe {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
+}
+
+/// Apply one accent policy. Returns `false` when the undocumented API is
+/// unavailable on this Windows build.
+///
+/// # Safety
+///
+/// The call itself is the only unsafe operation. `hwnd` is a live window
+/// handle supplied by the caller. `WINDOWCOMPOSITIONATTRIBDATA` points at a
+/// stack `AccentPolicy` whose address and size are passed in the format the
+/// API documents. The resolved function address comes from `user32.dll` and
+/// is called with its documented signature.
+#[cfg(target_os = "windows")]
+fn apply_accent(hwnd: HWND, state: u32, flags: u32, gradient_color: u32) -> bool {
+    let Some(function) = set_window_composition_attribute() else {
+        return false;
+    };
+    let mut policy = AccentPolicy {
+        accent_state: state,
+        accent_flags: flags,
+        gradient_color,
+        animation_id: 0,
+    };
+    let mut data = WindowCompositionAttribData {
+        attribute: WCA_ACCENT_POLICY,
+        data: (&raw mut policy).cast(),
+        size: std::mem::size_of::<AccentPolicy>(),
+    };
+    // Safety: see the function-level safety contract.
+    unsafe { function(hwnd, &raw mut data) != 0 }
 }
 
 /// Set one 32-bit DWM attribute. Returns `true` when the compositor accepted it.

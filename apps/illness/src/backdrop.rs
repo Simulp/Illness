@@ -1,12 +1,11 @@
 //! In-window Mica/Acrylic backdrop.
 //!
-//! Native DWM transparency is not available through the wgpu surface used by
-//! eframe (the DX12 surface reports no transparent composite alpha mode), so
-//! Illness paints a blurred desktop wallpaper behind its semi-transparent
-//! terminal and chrome. It looks like Mica and, unlike a transparent window,
-//! works identically on every Windows 10/11 GPU backend.
+//! Mica and translucent image backgrounds still paint a blurred desktop
+//! wallpaper behind the terminal and chrome, so they look identical on every
+//! Windows 10/11 GPU backend. Acrylic instead uses native behind-window blur
+//! (see `platform.rs`), so the desktop background is skipped for that material.
 
-use eframe::egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
+use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use illness_core::config::BackgroundMode;
 use illness_core::{Material, Theme};
 use std::path::{Path, PathBuf};

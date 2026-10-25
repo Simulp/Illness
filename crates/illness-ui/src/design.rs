@@ -212,7 +212,7 @@ fn style_widget(widget: &mut egui::style::WidgetVisuals, fill: Color32, tokens: 
     widget.expansion = 0.0;
 }
 
-pub fn install(ctx: &egui::Context, theme: &Theme, _config: &Config) {
+pub fn install(ctx: &egui::Context, theme: &Theme, config: &Config) {
     fonts::install(ctx);
 
     let tokens = Tokens::from_theme(theme);
@@ -233,7 +233,11 @@ pub fn install(ctx: &egui::Context, theme: &Theme, _config: &Config) {
     visuals.text_options.font_hinting = true;
     visuals.text_options.subpixel_binning = false;
     visuals.override_text_color = Some(tokens.text);
-    visuals.panel_fill = tokens.bg;
+    visuals.panel_fill = if config.material == Material::Solid {
+        tokens.bg
+    } else {
+        Color32::TRANSPARENT
+    };
     visuals.window_fill = Color32::TRANSPARENT;
     visuals.window_stroke = Stroke::new(1.0, tokens.border);
     visuals.window_corner_radius = CornerRadius::same(tokens.radius_md as u8);

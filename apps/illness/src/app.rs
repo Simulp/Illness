@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use eframe::egui::{
+use egui::{
     self, Align2, Color32, Event, FontId, Id, Key, Modifiers, Order, Rect, RichText, Sense, Stroke,
     StrokeKind, Vec2, ViewportCommand, pos2, vec2,
 };
@@ -18,6 +18,7 @@ use illness_ui::{
     TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas, gpu::GpuText,
 };
 use raw_window_handle::HasWindowHandle;
+use winit::window::Window;
 
 use crate::{backdrop, platform};
 
@@ -81,9 +82,10 @@ enum TabEntry {
     Settings,
 }
 
-/// The eframe application shell and all cross-module state.
+/// The winit/egui application shell and all cross-module state.
 pub struct IllnessApp {
     ctx: egui::Context,
+    window: Arc<Window>,
     config: Config,
     profiles: Vec<Profile>,
     theme: &'static Theme,
@@ -118,7 +120,11 @@ pub struct IllnessApp {
 }
 
 impl IllnessApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        render_state: Option<&egui_wgpu::RenderState>,
+        window: Arc<Window>,
+    ) -> Self {
         let mut config = Config::load();
         let mut detected = detect_profiles();
         #[cfg(target_os = "windows")]
@@ -132,7 +138,7 @@ impl IllnessApp {
 
         let theme = Theme::by_name(&config.theme);
         let tokens = Tokens::from_theme(theme);
-        let ctx = cc.egui_ctx.clone();
+        let ctx = ctx.clone();
         let profiles = config.profiles.clone();
 
         fonts::install(&ctx);
@@ -160,9 +166,7 @@ impl IllnessApp {
         let line_height = config.line_height;
         let background_opacity = config.background_opacity;
         let gpu_text = if config.gpu_text {
-            cc.wgpu_render_state
-                .as_ref()
-                .map(|state| Arc::new(GpuText::new(state)))
+            render_state.map(|state| Arc::new(GpuText::new(state)))
         } else {
             None
         };
@@ -178,6 +182,7 @@ impl IllnessApp {
 
         let mut app = Self {
             ctx,
+            window: Arc::clone(&window),
             config,
             profiles,
             theme,
@@ -208,7 +213,7 @@ impl IllnessApp {
         };
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
-        app.apply_material_to(cc);
+        app.apply_material_to(window.as_ref());
         app.rebuild_backdrop();
         app.open_tab(None);
         app
@@ -416,6 +421,11 @@ impl IllnessApp {
             );
         }
         self.applied_material = self.config.material;
+        // The panel fill follows the material: opaque for Solid, transparent
+        // so the native backdrop can show through otherwise. This also covers
+        // a fallback to Solid when the requested material is unavailable.
+        design::install(&self.ctx, self.theme, &self.config);
+        self.ctx.request_repaint();
     }
 
     /// Reload the backdrop for the current mode and path.
@@ -561,7 +571,7 @@ impl IllnessApp {
         }
     }
 
-    fn shutdown_and_save(&mut self) {
+    pub fn shutdown_and_save(&mut self) {
         if self.saved {
             return;
         }
@@ -1133,8 +1143,8 @@ impl IllnessApp {
     }
 }
 
-impl eframe::App for IllnessApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+impl IllnessApp {
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if ctx.input(|input| input.viewport().close_requested()) {
             self.shutdown_and_save();
@@ -1153,8 +1163,13 @@ impl eframe::App for IllnessApp {
 
         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
+        // Acrylic blurs the actual windows behind this one; painting the
+        // desktop wallpaper here would hide that. Image backgrounds still
+        // draw, because the user explicitly chose them.
         if self.config.material != Material::Solid
             && self.config.background != BackgroundMode::None
+            && !(self.config.material == Material::Acrylic
+                && self.config.background == BackgroundMode::Desktop)
             && let Some(backdrop) = &self.backdrop
         {
             let screen = ui.max_rect();
@@ -1386,7 +1401,8 @@ impl eframe::App for IllnessApp {
 
         if self.pending_material {
             self.pending_material = false;
-            self.apply_material_to(frame);
+            let window = Arc::clone(&self.window);
+            self.apply_material_to(window.as_ref());
         }
 
         self.clamp_active();
@@ -1394,12 +1410,11 @@ impl eframe::App for IllnessApp {
         self.sync_focus();
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        design::color(self.theme.bg).to_normalized_gamma_f32()
-    }
-
-    fn on_exit(&mut self) {
-        self.shutdown_and_save();
+    pub fn clear_color(&self) -> [f32; 4] {
+        match self.config.material {
+            Material::Solid => design::color(self.theme.bg).to_normalized_gamma_f32(),
+            Material::Mica | Material::Acrylic => [0.0, 0.0, 0.0, 0.0],
+        }
     }
 }
 

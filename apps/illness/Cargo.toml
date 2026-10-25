@@ -15,8 +15,12 @@ env_logger.workspace = true
 crossbeam-channel.workspace = true
 arboard.workspace = true
 open.workspace = true
-eframe.workspace = true
 egui.workspace = true
+egui-wgpu = { workspace = true, features = ["winit"] }
+egui-winit.workspace = true
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true
 image.workspace = true
 window-vibrancy.workspace = true
 windows-sys.workspace = true

@@ -2,11 +2,9 @@
 
 mod app;
 mod backdrop;
+mod host;
 mod platform;
 
-use eframe::egui;
-use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
-use eframe::wgpu;
 use std::sync::Arc;
 
 /// Initialise stderr logging in debug builds and a file log in release builds,
@@ -110,7 +108,7 @@ fn load_icon() -> Option<egui::IconData> {
     }
 }
 
-fn main() -> eframe::Result<()> {
+fn main() -> anyhow::Result<()> {
     init_logging();
     log::info!("Illness {} starting", env!("CARGO_PKG_VERSION"));
 
@@ -121,55 +119,7 @@ fn main() -> eframe::Result<()> {
     result
 }
 
-fn run() -> eframe::Result<()> {
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_title("Illness")
-        .with_inner_size([1180.0, 760.0])
-        .with_min_inner_size([720.0, 480.0])
-        .with_decorations(false)
-        .with_transparent(false)
-        .with_has_shadow(false)
-        .with_resizable(true);
-    if let Some(icon) = load_icon() {
-        viewport = viewport.with_icon(icon);
-    }
-
-    // Terminal mask glyphs need dual-source blending for true per-channel
-    // ClearType coverage. Request it when the adapter offers it; the GPU text
-    // compositor checks the resulting device feature and falls back to CPU
-    // text otherwise.
-    let mut wgpu_options = WgpuConfiguration::default()
-        .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
-    if let WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
-        let base = Arc::clone(&setup.device_descriptor);
-        setup.device_descriptor = Arc::new(move |adapter| {
-            let mut descriptor = base(adapter);
-            if adapter
-                .features()
-                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
-            {
-                descriptor.required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
-            }
-            descriptor
-        });
-    }
-
-    let options = eframe::NativeOptions {
-        viewport,
-        renderer: eframe::Renderer::Wgpu,
-        wgpu_options,
-        // Keep Ctrl+C/V/X as terminal input. The app handles Ctrl+Shift+C/V
-        // itself; letting egui-winit intercept them would swallow Ctrl+C
-        // (0x03) and Ctrl+V (0x16) before the session sees them.
-        clipboard_shortcuts: false,
-        // Text is alpha-blended at 1:1 physical pixels; dithering adds noise to glyph edges.
-        dithering: false,
-        ..Default::default()
-    };
-
-    eframe::run_native(
-        "Illness",
-        options,
-        Box::new(|cc| Ok(Box::new(app::IllnessApp::new(cc)))),
-    )
+fn run() -> anyhow::Result<()> {
+    let icon = load_icon().map(Arc::new);
+    host::run(icon)
 }
