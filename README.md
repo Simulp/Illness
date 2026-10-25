@@ -65,6 +65,20 @@ cargo build --release -p illness
 The binary is `target\release\illness.exe`. Release builds use the Windows GUI subsystem, so
 double-clicking it opens Illness directly instead of hosting a console in Windows Terminal.
 
+### Windows installer
+
+Build a machine-wide NSIS installer with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager) 0.11.8:
+
+```pwsh
+cargo install cargo-packager --version 0.11.8 --locked   # once
+.\apps\illness\build-installer.ps1
+```
+
+The result is `dist\illness_0.1.0_x64-setup.exe`. It installs to `%ProgramFiles%\Illness` for all
+users (UAC prompt), creates an All Users Start Menu shortcut, and registers an uninstaller in
+Programs and Features. Settings remain per-user in `%APPDATA%\illness`; the uninstaller offers to
+remove them but keeps them by default.
+
 ## Prescription
 
 | Action | Shortcut |

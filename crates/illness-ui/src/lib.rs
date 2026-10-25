@@ -10,7 +10,7 @@ pub mod terminal;
 
 pub use chrome::{Action, ChromeState, TabInfo};
 pub use design::Tokens;
-pub use glyph::{CellMetrics, Glyph, GlyphAtlas, GlyphStyle, SoftGlyph};
+pub use glyph::{CellMetrics, FontFace, Glyph, GlyphAtlas, GlyphStyle, SoftGlyph};
 pub use gpu::{GpuFrame, GpuText};
 pub use icons::Icon;
 pub use terminal::{TerminalAction, TerminalResponse, TerminalView};

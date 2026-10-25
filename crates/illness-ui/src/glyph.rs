@@ -61,7 +61,8 @@ const DEFAULT_LINE_HEIGHT: f32 = 1.2;
 /// Cascadia's variable default (400) reads slightly light after the fixed-pixel
 /// grid and alpha transfer; 450 restores stem density without looking semibold.
 const REGULAR_WEIGHT: f32 = 450.0;
-/// Weight used for bold cells.
+/// Weight used for bold cells when the face has a `wght` axis. Families that
+/// install real bold faces use those faces instead.
 const BOLD_WEIGHT: f32 = 700.0;
 /// Glyph sources, in priority order.
 const SOURCES: [Source; 3] = [
@@ -163,10 +164,51 @@ impl SoftGlyph {
     }
 }
 
+/// Font data and face index for one primary font style.
+///
+/// The `Arc` lets regular, bold, italic, and bold-italic share one font file
+/// when a family is a single variable font.
+#[derive(Clone)]
+pub struct FontFace {
+    pub data: Arc<Vec<u8>>,
+    pub index: u32,
+}
+
+impl FontFace {
+    pub fn new(data: Vec<u8>, index: u32) -> Self {
+        Self {
+            data: Arc::new(data),
+            index,
+        }
+    }
+
+    fn font(&self) -> Option<FontRef<'_>> {
+        FontRef::from_index(&self.data, self.index as usize)
+    }
+}
+
 /// Font data and face index of a system fallback face.
 struct FallbackFace {
     data: Vec<u8>,
     index: usize,
+}
+
+/// Which primary face serves a glyph request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaceSlot {
+    Regular,
+    Bold,
+    Italic,
+    BoldItalic,
+    Fallback(usize),
+}
+
+/// Styles that must be synthesized because the selected face is not the real
+/// styled face.
+#[derive(Debug, Clone, Copy, Default)]
+struct Synthetic {
+    bold: bool,
+    italic: bool,
 }
 
 /// Simple shelf allocator over the atlas texture.
@@ -219,10 +261,14 @@ pub struct GlyphAtlas {
     cache: HashMap<(char, GlyphStyle), Glyph>,
     soft_cache: HashMap<(char, GlyphStyle), Arc<SoftGlyph>>,
     scale: ScaleContext,
-    /// Primary font file bytes. Owned so the family can be swapped at runtime
-    /// without self-referential font references.
-    font_data: Arc<Vec<u8>>,
-    font_index: usize,
+    /// Primary regular font face. Cell metrics always come from this face.
+    regular: FontFace,
+    /// Real bold face, when the family installs one.
+    bold: Option<FontFace>,
+    /// Real italic face, when the family installs one.
+    italic: Option<FontFace>,
+    /// Real bold-italic face, when the family installs one.
+    bold_italic: Option<FontFace>,
     fallback_faces: Vec<FallbackFace>,
     font_db: Option<fontdb::Database>,
     next_fallback_family: usize,
@@ -247,13 +293,8 @@ impl GlyphAtlas {
         let ppp = normalize_ppp(ppp);
         let size_px = normalize_size(size_px);
         let physical_size = size_px * ppp;
-        let font_data = Arc::new(mono_bytes.to_vec());
-        let font_index = 0usize;
-        let metrics = metrics_for(
-            FontRef::from_index(&font_data, font_index).as_ref(),
-            physical_size,
-            ppp,
-        );
+        let regular = FontFace::new(mono_bytes.to_vec(), 0);
+        let metrics = metrics_for(regular.font().as_ref(), physical_size, ppp);
 
         Self {
             texture: None,
@@ -263,8 +304,10 @@ impl GlyphAtlas {
             cache: HashMap::new(),
             soft_cache: HashMap::new(),
             scale: ScaleContext::new(),
-            font_data,
-            font_index,
+            regular,
+            bold: None,
+            italic: None,
+            bold_italic: None,
             fallback_faces: Vec::new(),
             font_db: None,
             next_fallback_family: 0,
@@ -290,14 +333,31 @@ impl GlyphAtlas {
     /// Replaces the primary font face and rebuilds metrics and caches.
     ///
     /// `data` must contain at least the face at `index`; invalid data is ignored
-    /// so a bad selection cannot break an otherwise working grid.
+    /// so a bad selection cannot break an otherwise working grid. Styled faces
+    /// are cleared, so bold and italic fall back to synthesis.
     pub fn set_font(&mut self, data: Vec<u8>, index: u32) {
-        if FontRef::from_index(&data, index as usize).is_none() {
-            log::warn!("ignoring unreadable terminal font face {index}");
+        self.set_font_faces(FontFace::new(data, index), None, None, None);
+    }
+
+    /// Replaces all primary faces and rebuilds metrics and caches.
+    ///
+    /// The regular face is required. Missing or unreadable styled faces are
+    /// ignored; the matching style is then synthesized from the closest face.
+    pub fn set_font_faces(
+        &mut self,
+        regular: FontFace,
+        bold: Option<FontFace>,
+        italic: Option<FontFace>,
+        bold_italic: Option<FontFace>,
+    ) {
+        if regular.font().is_none() {
+            log::warn!("ignoring unreadable terminal font face {}", regular.index);
             return;
         }
-        self.font_data = Arc::new(data);
-        self.font_index = index as usize;
+        self.regular = regular;
+        self.bold = valid_face(bold, "bold");
+        self.italic = valid_face(italic, "italic");
+        self.bold_italic = valid_face(bold_italic, "bold italic");
         self.rebuild_metrics();
         self.ctx.request_repaint();
     }
@@ -305,8 +365,7 @@ impl GlyphAtlas {
     /// Rebuilds cell metrics for the current face, size, and line height, then
     /// clears every cached glyph and the atlas texture.
     fn rebuild_metrics(&mut self) {
-        let font = FontRef::from_index(&self.font_data, self.font_index);
-        self.metrics = metrics_for(font.as_ref(), self.physical_size, self.ppp);
+        self.metrics = metrics_for(self.regular.font().as_ref(), self.physical_size, self.ppp);
         self.base_height_px = self.metrics.height_px as f32;
         self.baseline_px = self.metrics.baseline * self.ppp;
         self.apply_line_height();
@@ -342,6 +401,85 @@ impl GlyphAtlas {
         self.metrics
     }
 
+    /// The primary face that serves `style`, preferring a real styled face.
+    fn style_face_slot(&self, style: GlyphStyle) -> FaceSlot {
+        match style {
+            GlyphStyle::Regular => FaceSlot::Regular,
+            GlyphStyle::Bold => {
+                if self.bold.is_some() {
+                    FaceSlot::Bold
+                } else {
+                    FaceSlot::Regular
+                }
+            }
+            GlyphStyle::Italic => {
+                if self.italic.is_some() {
+                    FaceSlot::Italic
+                } else {
+                    FaceSlot::Regular
+                }
+            }
+            GlyphStyle::BoldItalic => {
+                if self.bold_italic.is_some() {
+                    FaceSlot::BoldItalic
+                } else if self.bold.is_some() {
+                    FaceSlot::Bold
+                } else if self.italic.is_some() {
+                    FaceSlot::Italic
+                } else {
+                    FaceSlot::Regular
+                }
+            }
+        }
+    }
+
+    fn face_for_slot(&self, slot: FaceSlot) -> Option<&FontFace> {
+        match slot {
+            FaceSlot::Regular => Some(&self.regular),
+            FaceSlot::Bold => self.bold.as_ref(),
+            FaceSlot::Italic => self.italic.as_ref(),
+            FaceSlot::BoldItalic => self.bold_italic.as_ref(),
+            FaceSlot::Fallback(_) => None,
+        }
+    }
+
+    /// Resolves the face and glyph id for `ch`, preferring the real styled face.
+    fn resolve_glyph(&mut self, ch: char, style: GlyphStyle) -> Option<(FaceSlot, GlyphId)> {
+        let style_slot = self.style_face_slot(style);
+        if let Some(font) = self.face_for_slot(style_slot).and_then(FontFace::font) {
+            let id = font.charmap().map(ch);
+            if id != 0 {
+                return Some((style_slot, id));
+            }
+        }
+
+        // A styled face can have a smaller character map than the regular face
+        // (patched Nerd Fonts occasionally differ between weights).
+        if style_slot != FaceSlot::Regular
+            && let Some(font) = self.regular.font()
+        {
+            let id = font.charmap().map(ch);
+            if id != 0 {
+                return Some((FaceSlot::Regular, id));
+            }
+        }
+
+        if let Some(index) = self.find_fallback(ch)
+            && let Some(face) = self.fallback_faces.get(index)
+            && let Some(font) = FontRef::from_index(&face.data, face.index)
+        {
+            let id = font.charmap().map(ch);
+            if id != 0 {
+                return Some((FaceSlot::Fallback(index), id));
+            }
+        }
+
+        // Preserve the previous behavior for missing glyphs: rasterize the
+        // primary face's .notdef rather than dropping the cell.
+        let font = self.regular.font()?;
+        Some((FaceSlot::Regular, font.charmap().map(ch)))
+    }
+
     /// Rasterizes and caches a glyph, returning `None` only if the atlas cannot
     /// make room even after a reset.
     pub fn glyph(&mut self, ch: char, style: GlyphStyle) -> Option<Glyph> {
@@ -350,37 +488,28 @@ impl GlyphAtlas {
             return Some(*glyph);
         }
 
-        let mut glyph_id = {
-            let primary = FontRef::from_index(&self.font_data, self.font_index)?;
-            primary.charmap().map(ch)
+        let (slot, glyph_id) = self.resolve_glyph(ch, style)?;
+        let synthetic = Synthetic {
+            bold: style.is_bold() && !matches!(slot, FaceSlot::Bold | FaceSlot::BoldItalic),
+            italic: style.is_italic() && !matches!(slot, FaceSlot::Italic | FaceSlot::BoldItalic),
         };
-        let mut fallback_index = None;
-
-        if glyph_id == 0
-            && let Some(index) = self.find_fallback(ch)
-            && let Some(font) = self
-                .fallback_faces
-                .get(index)
-                .and_then(|face| FontRef::from_index(&face.data, face.index))
-        {
-            let id = font.charmap().map(ch);
-            if id != 0 {
-                glyph_id = id;
-                fallback_index = Some(index);
-            }
-        }
 
         let physical_size = self.physical_size;
         let ppp = self.ppp;
 
-        // Keep the borrow of the primary/fallback font data inside this block
-        // so the rest of the method can mutate the atlas.
+        // Keep the borrow of the selected font data inside this block so the
+        // rest of the method can mutate the atlas.
         let (image, advance_px) = {
-            let primary = FontRef::from_index(&self.font_data, self.font_index);
-            let source_font = fallback_index
-                .and_then(|index| self.fallback_faces.get(index))
-                .and_then(|face| FontRef::from_index(&face.data, face.index))
-                .or(primary)?;
+            let source_font = match slot {
+                FaceSlot::Regular => self.regular.font(),
+                FaceSlot::Bold => self.bold.as_ref().and_then(FontFace::font),
+                FaceSlot::Italic => self.italic.as_ref().and_then(FontFace::font),
+                FaceSlot::BoldItalic => self.bold_italic.as_ref().and_then(FontFace::font),
+                FaceSlot::Fallback(index) => self
+                    .fallback_faces
+                    .get(index)
+                    .and_then(|face| FontRef::from_index(&face.data, face.index)),
+            }?;
 
             let advance_px = source_font
                 .glyph_metrics(&[])
@@ -393,6 +522,7 @@ impl GlyphAtlas {
                 style,
                 physical_size,
                 ppp,
+                synthetic,
             );
             (image, advance_px)
         };
@@ -478,34 +608,25 @@ impl GlyphAtlas {
             return Some(Arc::clone(glyph));
         }
 
-        let mut glyph_id = {
-            let primary = FontRef::from_index(&self.font_data, self.font_index)?;
-            primary.charmap().map(ch)
+        let (slot, glyph_id) = self.resolve_glyph(ch, style)?;
+        let synthetic = Synthetic {
+            bold: style.is_bold() && !matches!(slot, FaceSlot::Bold | FaceSlot::BoldItalic),
+            italic: style.is_italic() && !matches!(slot, FaceSlot::Italic | FaceSlot::BoldItalic),
         };
-        let mut fallback_index = None;
-
-        if glyph_id == 0
-            && let Some(index) = self.find_fallback(ch)
-            && let Some(font) = self
-                .fallback_faces
-                .get(index)
-                .and_then(|face| FontRef::from_index(&face.data, face.index))
-        {
-            let id = font.charmap().map(ch);
-            if id != 0 {
-                glyph_id = id;
-                fallback_index = Some(index);
-            }
-        }
 
         let physical_size = self.physical_size;
         let ppp = self.ppp;
         let image = {
-            let primary = FontRef::from_index(&self.font_data, self.font_index);
-            let source_font = fallback_index
-                .and_then(|index| self.fallback_faces.get(index))
-                .and_then(|face| FontRef::from_index(&face.data, face.index))
-                .or(primary)?;
+            let source_font = match slot {
+                FaceSlot::Regular => self.regular.font(),
+                FaceSlot::Bold => self.bold.as_ref().and_then(FontFace::font),
+                FaceSlot::Italic => self.italic.as_ref().and_then(FontFace::font),
+                FaceSlot::BoldItalic => self.bold_italic.as_ref().and_then(FontFace::font),
+                FaceSlot::Fallback(index) => self
+                    .fallback_faces
+                    .get(index)
+                    .and_then(|face| FontRef::from_index(&face.data, face.index)),
+            }?;
             rasterize(
                 &mut self.scale,
                 source_font,
@@ -513,6 +634,7 @@ impl GlyphAtlas {
                 style,
                 physical_size,
                 ppp,
+                synthetic,
             )
         };
 
@@ -685,7 +807,13 @@ impl GlyphAtlas {
 struct RasterOptions {
     hint: bool,
     weight: f32,
+    synthetic_bold: bool,
+    synthetic_italic: bool,
 }
+
+/// Fraction of a pixel of extra coverage added to the right edge of a
+/// synthetic bold glyph.
+const SYNTHETIC_BOLD_STRENGTH: f32 = 0.5;
 
 /// Rasterizes one glyph at `physical_size`, applying bold/italic synthesis.
 fn rasterize(
@@ -695,6 +823,7 @@ fn rasterize(
     style: GlyphStyle,
     physical_size: f32,
     ppp: f32,
+    synthetic: Synthetic,
 ) -> Option<Image> {
     let weight = if style.is_bold() {
         BOLD_WEIGHT
@@ -708,7 +837,12 @@ fn rasterize(
         style,
         physical_size,
         ppp,
-        RasterOptions { hint: true, weight },
+        RasterOptions {
+            hint: true,
+            weight,
+            synthetic_bold: synthetic.bold,
+            synthetic_italic: synthetic.italic,
+        },
     )
 }
 
@@ -753,14 +887,60 @@ fn rasterize_format(
 
     let mut render = Render::new(&SOURCES);
     render.format(format);
-    if style.is_italic() {
+    if options.synthetic_italic {
         render.transform(Some(Transform::skew(Angle::from_radians(0.2), Angle::ZERO)));
     }
-    if style.is_bold() && !weight_axis {
-        render.embolden(0.4 * ppp);
+
+    let mut image = render.render(&mut scaler, glyph_id)?;
+    if style.is_bold() && options.synthetic_bold && !weight_axis {
+        // swash's `Render::embolden` misplaces the two components of Caskaydia's
+        // hinted `i` and leaves it *lighter* than regular at 18 px. Widening
+        // every mask by a fraction of a pixel is uniform across glyphs and has
+        // no interaction with hinting.
+        let strength = (SYNTHETIC_BOLD_STRENGTH * ppp).min(1.0);
+        synthesized_bold_mask(&mut image, strength);
+    }
+    Some(image)
+}
+
+/// Adds `strength` of the left neighbor's coverage to each mask pixel.
+///
+/// The mask grows one column to the right; the placement's left edge and the
+/// baseline stay fixed. Color glyphs (emoji) are left untouched.
+fn synthesized_bold_mask(image: &mut Image, strength: f32) {
+    if image.content != Content::Mask || strength <= 0.0 {
+        return;
+    }
+    let width = image.placement.width as usize;
+    let height = image.placement.height as usize;
+    if width == 0 || height == 0 {
+        return;
     }
 
-    render.render(&mut scaler, glyph_id)
+    let source = &image.data[..image.data.len().min(width * height)];
+    let out_width = width + 1;
+    let mut data = vec![0u8; out_width * height];
+    for y in 0..height {
+        for x in 0..out_width {
+            let a = if x < width {
+                source.get(y * width + x).copied().unwrap_or(0)
+            } else {
+                0
+            };
+            let b = if x == 0 {
+                0
+            } else {
+                let previous =
+                    f32::from(source.get(y * width + x - 1).copied().unwrap_or(0)) * strength;
+                previous.round().clamp(0.0, 255.0) as u8
+            };
+            let union = u32::from(a) + u32::from(b) - (u32::from(a) * u32::from(b) + 127) / 255;
+            data[y * out_width + x] = union.min(255) as u8;
+        }
+    }
+
+    image.data = data;
+    image.placement.width = out_width as u32;
 }
 
 /// Converts one swash image into a padded, premultiplied RGBA tile.
@@ -923,6 +1103,17 @@ fn metrics_for(font: Option<&FontRef<'_>>, physical_size: f32, ppp: f32) -> Cell
     }
 }
 
+fn valid_face(face: Option<FontFace>, style: &str) -> Option<FontFace> {
+    face.filter(|face| {
+        if face.font().is_none() {
+            log::warn!("ignoring unreadable terminal {style} face {}", face.index);
+            false
+        } else {
+            true
+        }
+    })
+}
+
 fn normalize_ppp(ppp: f32) -> f32 {
     if ppp.is_finite() && ppp > 0.0 {
         ppp.clamp(0.5, 8.0)
@@ -942,12 +1133,36 @@ fn normalize_size(size_px: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fonts::CASCADIA_MONO;
+    use crate::fonts::{self, CASCADIA_MONO};
 
     fn atlas(size_px: f32, ppp: f32) -> (egui::Context, GlyphAtlas) {
         let ctx = egui::Context::default();
         let atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, size_px, ppp);
         (ctx, atlas)
+    }
+
+    fn ink(glyph: &SoftGlyph) -> u64 {
+        glyph.data.iter().map(|&alpha| u64::from(alpha)).sum()
+    }
+
+    fn row_ink(glyph: &SoftGlyph, y: usize) -> u64 {
+        let width = glyph.width as usize;
+        glyph.data[y * width..(y + 1) * width]
+            .iter()
+            .map(|&alpha| u64::from(alpha))
+            .sum()
+    }
+
+    /// Ink in the detached dot and in the first full stem row.
+    fn dot_and_stem_ink(glyph: &SoftGlyph) -> (u64, u64) {
+        let height = glyph.height as usize;
+        let gap = (1..height)
+            .find(|&y| row_ink(glyph, y) == 0)
+            .expect("lowercase i should have a blank row under the dot");
+        let dot = (0..gap).map(|y| row_ink(glyph, y)).sum();
+        let stem_row = gap + 2;
+        assert!(stem_row < height, "i stem missing below the dot gap");
+        (dot, row_ink(glyph, stem_row))
     }
 
     #[test]
@@ -1275,6 +1490,8 @@ mod tests {
         let options = |hint| RasterOptions {
             hint,
             weight: 400.0,
+            synthetic_bold: false,
+            synthetic_italic: false,
         };
         let hinted = rasterize_with(
             &mut scale,
@@ -1310,6 +1527,218 @@ mod tests {
     }
 
     #[test]
+    fn test_bold_i_has_more_ink_than_regular() {
+        for ppp in [1.0, 1.25, 1.5] {
+            let (_ctx, mut atlas) = atlas(18.0, ppp);
+            let regular = atlas
+                .soft_glyph('i', GlyphStyle::Regular)
+                .expect("regular i");
+            let bold = atlas.soft_glyph('i', GlyphStyle::Bold).expect("bold i");
+
+            assert_ne!(
+                regular.data, bold.data,
+                "bold i reused the regular mask at ppp {ppp}"
+            );
+            let (regular_dot, regular_stem) = dot_and_stem_ink(&regular);
+            let (bold_dot, bold_stem) = dot_and_stem_ink(&bold);
+            assert!(
+                bold_dot > regular_dot,
+                "bold i dot ink {bold_dot} <= regular {regular_dot} at ppp {ppp}"
+            );
+            assert!(
+                bold_stem > regular_stem,
+                "bold i stem ink {bold_stem} <= regular {regular_stem} at ppp {ppp}"
+            );
+            assert!(
+                ink(&bold) > ink(&regular),
+                "bold i total ink {} <= regular {} at ppp {ppp}",
+                ink(&bold),
+                ink(&regular)
+            );
+        }
+    }
+
+    #[test]
+    fn test_bold_i_does_not_reuse_regular_atlas_glyph() {
+        let (_ctx, mut atlas) = atlas(18.0, 1.0);
+        let regular = atlas.glyph('i', GlyphStyle::Regular).expect("regular i");
+        let bold = atlas.glyph('i', GlyphStyle::Bold).expect("bold i");
+        assert_ne!(regular, bold, "bold i returned the regular atlas glyph");
+
+        let regular_soft = atlas
+            .soft_glyph('i', GlyphStyle::Regular)
+            .expect("regular i");
+        let bold_soft = atlas.soft_glyph('i', GlyphStyle::Bold).expect("bold i");
+        assert!(!Arc::ptr_eq(&regular_soft, &bold_soft));
+    }
+
+    /// Synthetic bold must thicken every mask uniformly. A one-pixel stem plus
+    /// a detached dot is the shape that swash's embolden used to collapse.
+    #[test]
+    fn test_synthetic_bold_widens_a_thin_stem_and_dot() {
+        let mut image = Image {
+            content: Content::Mask,
+            ..Image::default()
+        };
+        image.placement.width = 4;
+        image.placement.height = 7;
+        image.data = vec![0; 4 * 7];
+        for y in 0..2 {
+            for x in 1..3 {
+                image.data[y * 4 + x] = 255;
+            }
+        }
+        for y in 3..7 {
+            image.data[y * 4 + 1] = 255;
+        }
+        let before = ink_pixels(&image);
+
+        synthesized_bold_mask(&mut image, 0.5);
+
+        assert_eq!(image.placement.width, 5);
+        assert!(ink_pixels(&image) > before);
+        for y in 0..2 {
+            assert!(image.data[y * 5 + 1] > 0 && image.data[y * 5 + 2] > 0);
+            assert!(image.data[y * 5 + 3] > 0, "dot did not widen right");
+        }
+        for y in 3..7 {
+            assert!(image.data[y * 5 + 1] > 0 && image.data[y * 5 + 2] > 0);
+        }
+
+        let mut color = Image {
+            content: Content::Color,
+            ..Image::default()
+        };
+        color.placement.width = 1;
+        color.placement.height = 1;
+        color.data = vec![1, 2, 3, 4];
+        synthesized_bold_mask(&mut color, 1.0);
+        assert_eq!(color.data, vec![1, 2, 3, 4]);
+        assert_eq!(color.placement.width, 1);
+    }
+
+    fn ink_pixels(image: &Image) -> u64 {
+        image.data.iter().map(|&alpha| u64::from(alpha)).sum()
+    }
+
+    /// The installed Nerd Font ships real static Bold/BoldItalic/Italic faces.
+    /// Bold must use the real face with no extra synthetic widening.
+    #[test]
+    fn test_real_bold_face_is_used_when_installed() {
+        let Some(font) = fonts::load_terminal_font_faces("CaskaydiaCove Nerd Font") else {
+            eprintln!("skipping real bold-face assertion: Nerd Font is not installed");
+            return;
+        };
+        let Some(bold) = font.bold.clone() else {
+            eprintln!("skipping real bold-face assertion: Nerd Font has no Bold face");
+            return;
+        };
+        assert!(
+            font.italic.is_some(),
+            "Nerd Font Italic face was not loaded"
+        );
+        assert!(
+            font.bold_italic.is_some(),
+            "Nerd Font BoldItalic face was not loaded"
+        );
+
+        let ctx = egui::Context::default();
+        let mut styled = GlyphAtlas::new(&ctx, CASCADIA_MONO, 18.0, 1.0);
+        styled.set_font_faces(
+            font.regular.clone(),
+            Some(bold.clone()),
+            font.italic.clone(),
+            font.bold_italic.clone(),
+        );
+        styled.set_size(&ctx, 18.0, 1.0);
+        for ch in ['i', 'l', 'M', 'n'] {
+            let regular = styled
+                .soft_glyph(ch, GlyphStyle::Regular)
+                .expect("regular glyph");
+            let bold = styled.soft_glyph(ch, GlyphStyle::Bold).expect("bold glyph");
+            assert!(
+                ink(&bold) > ink(&regular),
+                "{ch:?}: real bold ink {} <= regular {}",
+                ink(&bold),
+                ink(&regular)
+            );
+        }
+        let bold_i = styled
+            .soft_glyph('i', GlyphStyle::Bold)
+            .expect("bold i from real face");
+
+        let mut control = GlyphAtlas::new(&ctx, CASCADIA_MONO, 18.0, 1.0);
+        control.set_font_faces(bold, None, None, None);
+        control.set_size(&ctx, 18.0, 1.0);
+        let control_i = control
+            .soft_glyph('i', GlyphStyle::Regular)
+            .expect("bold face as regular");
+
+        assert_eq!(
+            bold_i.data, control_i.data,
+            "bold i did not use the real Bold face unchanged"
+        );
+        assert_eq!(bold_i.width, control_i.width);
+        assert_eq!(bold_i.left, control_i.left);
+        assert_eq!(bold_i.top, control_i.top);
+    }
+
+    /// Without a real bold face, all synthetic bold glyphs must thicken even
+    /// when the regular face is a static font with a one-pixel `i` stem.
+    #[test]
+    fn test_synthetic_bold_strengthens_i_l_m_n() {
+        let Some((data, index)) = fonts::load_terminal_font("CaskaydiaCove Nerd Font") else {
+            eprintln!("skipping synthetic bold assertion: Nerd Font is not installed");
+            return;
+        };
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 18.0, 1.0);
+        atlas.set_font(data, index);
+        atlas.set_size(&ctx, 18.0, 1.0);
+
+        for ch in ['i', 'l', 'M', 'n'] {
+            let regular = atlas
+                .soft_glyph(ch, GlyphStyle::Regular)
+                .expect("regular glyph");
+            let bold = atlas
+                .soft_glyph(ch, GlyphStyle::Bold)
+                .expect("synthetic bold glyph");
+            assert!(
+                ink(&bold) > ink(&regular),
+                "{ch:?}: synthetic bold ink {} <= regular {}",
+                ink(&bold),
+                ink(&regular)
+            );
+            assert!(
+                bold.width > regular.width,
+                "{ch:?}: synthetic bold width {} <= regular {}",
+                bold.width,
+                regular.width
+            );
+        }
+
+        let regular_i = atlas
+            .soft_glyph('i', GlyphStyle::Regular)
+            .expect("regular i");
+        let bold_i = atlas.soft_glyph('i', GlyphStyle::Bold).expect("bold i");
+        let gap = (1..regular_i.height as usize)
+            .find(|&y| row_ink(&regular_i, y) == 0)
+            .expect("regular i should have a blank row under the dot");
+        let regular_dot: u64 = (0..gap).map(|y| row_ink(&regular_i, y)).sum();
+        let bold_dot: u64 = (0..gap).map(|y| row_ink(&bold_i, y)).sum();
+        let stem_row = gap + 2;
+        assert!(stem_row < regular_i.height as usize);
+        assert!(
+            bold_dot > regular_dot,
+            "synthetic bold dot ink {bold_dot} <= regular {regular_dot}"
+        );
+        assert!(
+            row_ink(&bold_i, stem_row) > row_ink(&regular_i, stem_row),
+            "synthetic bold stem did not thicken"
+        );
+    }
+
+    #[test]
     fn test_regular_weight_450_adds_core() {
         let font = FontRef::from_index(CASCADIA_MONO, 0).expect("Cascadia Mono");
         let mut scale = ScaleContext::new();
@@ -1322,7 +1751,12 @@ mod tests {
                 GlyphStyle::Regular,
                 14.0,
                 1.0,
-                RasterOptions { hint: true, weight },
+                RasterOptions {
+                    hint: true,
+                    weight,
+                    synthetic_bold: false,
+                    synthetic_italic: false,
+                },
             )
             .expect("H glyph")
         };
@@ -1361,6 +1795,8 @@ mod tests {
             RasterOptions {
                 hint: true,
                 weight: 450.0,
+                synthetic_bold: false,
+                synthetic_italic: false,
             },
         )
         .expect("H glyph");

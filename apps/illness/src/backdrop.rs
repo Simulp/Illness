@@ -14,6 +14,8 @@ use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use illness_core::config::BackgroundMode;
 use illness_core::{Material, Theme};
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -45,10 +47,12 @@ pub const WARM_CANCELLED: &str = "background warm cancelled";
 const WARM_FAILED: &str = "Background warm failed unexpectedly";
 
 /// A loaded backdrop texture and whether it came from an image (as opposed to
-/// the theme colour gradient). Theme changes only rebuild gradients.
+/// the theme colour gradient). `key` identifies the cache entry that produced
+/// the texture so the app can detect a late decode replacing the painted one.
 pub struct Backdrop {
     pub texture: TextureHandle,
     pub from_image: bool,
+    pub(crate) key: CacheKey,
 }
 
 /// What a UI-thread backdrop build could do for this material/mode pair.
@@ -64,17 +68,42 @@ pub enum BackdropBuild {
 
 /// What a detached warm did to the cache.
 ///
-/// `changed` is true when the cache now holds a different decode or a new
-/// fallback. Revalidation warms usually report `false`, which lets the app skip
-/// a redundant texture upload for an unchanged file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// `changed` is true only when the selected cache entry is new. A revalidation
+/// that merely finds the same gradient or transcoded copy reports `false`, so
+/// the app can skip a redundant texture upload. `key` identifies the entry the
+/// warm selected; comparing it with the painted key catches a late decode that
+/// replaced the cache after the UI already uploaded an older entry. `failed`
+/// records an all-candidates-failed Desktop attempt even when a stable gradient
+/// fallback was returned.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WarmOutcome {
     pub changed: bool,
+    pub key: Option<CacheKey>,
+    pub failed: bool,
 }
 
 impl WarmOutcome {
-    const UNCHANGED: Self = Self { changed: false };
-    const CHANGED: Self = Self { changed: true };
+    pub(crate) const UNCHANGED: Self = Self {
+        changed: false,
+        key: None,
+        failed: false,
+    };
+
+    fn changed(key: CacheKey) -> Self {
+        Self {
+            changed: true,
+            key: Some(key),
+            failed: false,
+        }
+    }
+
+    fn unchanged(key: CacheKey) -> Self {
+        Self {
+            changed: false,
+            key: Some(key),
+            failed: false,
+        }
+    }
 }
 
 /// Cancellation handle for one detached warm.
@@ -154,8 +183,8 @@ pub fn build_with(
             if trimmed.is_empty() {
                 return BackdropBuild::Failed("Choose a background image".to_string());
             }
-            match cached_image_path(Path::new(trimmed)) {
-                Some(image) => BackdropBuild::Ready(Some(upload(ctx, image, true))),
+            match cached_image_path_with_key(Path::new(trimmed)) {
+                Some((image, key)) => BackdropBuild::Ready(Some(upload(ctx, image, true, key))),
                 None => BackdropBuild::Warming,
             }
         }
@@ -163,29 +192,31 @@ pub fn build_with(
 }
 
 fn build_desktop(ctx: &Context, theme: &Theme, candidates: &[PathBuf]) -> BackdropBuild {
-    if let Some((image, _)) = first_cached_desktop(candidates) {
-        return BackdropBuild::Ready(Some(upload(ctx, image, true)));
+    if let Some((image, _, key)) = first_cached_desktop(candidates) {
+        return BackdropBuild::Ready(Some(upload(ctx, image, true, key)));
     }
     if candidates.is_empty() {
+        let key = gradient_key(theme);
         let image = desktop_gradient(theme);
-        cache_put(gradient_key(theme), image.clone());
-        return BackdropBuild::Ready(Some(upload(ctx, image, false)));
+        cache_put(key.clone(), image.clone());
+        return BackdropBuild::Ready(Some(upload(ctx, image, false, key)));
     }
     if all_candidates_failed(candidates) {
         // Every reported wallpaper source failed recently. The gradient is a
         // real fallback now; it must not short-circuit a cache lookup above.
         let key = gradient_key(theme);
         let image = cached_key(&key).unwrap_or_else(|| desktop_gradient(theme));
-        cache_put(key, image.clone());
-        return BackdropBuild::Ready(Some(upload(ctx, image, false)));
+        cache_put(key.clone(), image.clone());
+        return BackdropBuild::Ready(Some(upload(ctx, image, false, key)));
     }
     BackdropBuild::Warming
 }
 
-fn upload(ctx: &Context, image: ColorImage, from_image: bool) -> Backdrop {
+fn upload(ctx: &Context, image: ColorImage, from_image: bool, key: CacheKey) -> Backdrop {
     Backdrop {
         texture: ctx.load_texture("illness_backdrop", image, TextureOptions::LINEAR),
         from_image,
+        key,
     }
 }
 
@@ -219,6 +250,8 @@ pub fn warm_cache(
             }
             load_blurred(Path::new(trimmed), token).map(|loaded| WarmOutcome {
                 changed: loaded.changed,
+                key: Some(loaded.key),
+                failed: false,
             })
         }
         BackgroundMode::None => Ok(WarmOutcome::UNCHANGED),
@@ -231,43 +264,58 @@ fn warm_desktop(
     token: &WarmToken,
 ) -> Result<WarmOutcome, String> {
     if candidates.is_empty() {
-        cache_gradient(theme);
-        return Ok(WarmOutcome::CHANGED);
+        let (key, changed) = cache_gradient(theme);
+        return Ok(if changed {
+            WarmOutcome::changed(key)
+        } else {
+            WarmOutcome::unchanged(key)
+        });
     }
 
     // Try highest priority first. If a lower-priority transcoded copy is cached
     // but the reported wallpaper is not, this still refreshes the preferred
-    // candidate before falling back to the cached copy.
-    let mut saw_failure = false;
+    // candidate before falling back to the cached copy. A candidate that failed
+    // within the cooldown is skipped without another stat: an unavailable UNC
+    // path must not be probed again just because a revalidation is due.
     for candidate in candidates {
         if token.is_cancelled() {
             return Err(WARM_CANCELLED.to_string());
         }
+        if desktop_failure_active(candidates, candidate) {
+            continue;
+        }
         match load_blurred(candidate, token) {
             Ok(loaded) => {
                 clear_desktop_failure(candidates, candidate);
-                return Ok(WarmOutcome {
-                    // A failed preferred source means the UI may still paint
-                    // the old one; report a change so it switches to this one.
-                    changed: loaded.changed || saw_failure,
+                // Only a new decode changes what should be painted. A missing
+                // preferred candidate that falls back to an unchanged
+                // transcoded/gradient cache must not re-upload every 45 s.
+                return Ok(if loaded.changed {
+                    WarmOutcome::changed(loaded.key)
+                } else {
+                    WarmOutcome::unchanged(loaded.key)
                 });
             }
             Err(error) if error == WARM_CANCELLED => return Err(error),
             Err(error) => {
-                saw_failure = true;
                 record_desktop_failure(candidates, candidate);
                 log::debug!("background {} unavailable: {error}", candidate.display());
             }
         }
     }
 
-    // No reported wallpaper could be used. Cache the theme gradient so the
+    // No usable reported wallpaper. Cache the theme gradient so the
     // native/theme fallback stays stable; record that this whole candidate set
     // failed, which lets the next warm after the cooldown retry a source that
-    // has become available.
+    // has become available. `failed` makes the app count this toward the warm
+    // retry cap even though the gradient itself is a valid paint.
     record_desktop_attempt_failed(candidates);
-    cache_gradient(theme);
-    Ok(WarmOutcome::CHANGED)
+    let (key, changed) = cache_gradient(theme);
+    Ok(WarmOutcome {
+        changed,
+        key: Some(key),
+        failed: true,
+    })
 }
 
 /// Whether a detached warm is needed for this pair.
@@ -342,11 +390,42 @@ pub fn is_cached(_theme: &Theme, mode: BackgroundMode, path: &str) -> bool {
     }
 }
 
-fn first_cached_desktop(candidates: &[PathBuf]) -> Option<(ColorImage, usize)> {
+fn first_cached_desktop(candidates: &[PathBuf]) -> Option<(ColorImage, usize, CacheKey)> {
     candidates
         .iter()
         .enumerate()
-        .find_map(|(index, candidate)| cached_image_path(candidate).map(|image| (image, index)))
+        .find_map(|(index, candidate)| {
+            cached_image_path_with_key(candidate).map(|(image, key)| (image, index, key))
+        })
+}
+
+/// The cache entry the UI would paint for this pair right now, resolved without
+/// touching the filesystem. Used to compare against the painted key after a
+/// late warm result replaced the cache.
+pub(crate) fn current_key(
+    theme: &Theme,
+    mode: BackgroundMode,
+    path: &str,
+    desktop: &[PathBuf],
+) -> Option<CacheKey> {
+    match mode {
+        BackgroundMode::None => None,
+        BackgroundMode::Image => {
+            let trimmed = path.trim();
+            (!trimmed.is_empty())
+                .then(|| cached_image_key(Path::new(trimmed)))
+                .flatten()
+        }
+        BackgroundMode::Desktop => {
+            if let Some(key) = desktop
+                .iter()
+                .find_map(|candidate| cached_image_key(candidate))
+            {
+                return Some(key);
+            }
+            (desktop.is_empty() || all_candidates_failed(desktop)).then(|| gradient_key(theme))
+        }
+    }
 }
 
 pub fn desktop_candidates() -> Vec<PathBuf> {
@@ -380,10 +459,12 @@ fn desktop_wallpaper_candidates(
     candidates
 }
 
-/// Whether a load decoded a fresh image or reused the cache.
+/// Whether a load decoded a fresh image or reused the cache, and the exact
+/// cache entry that satisfied it.
 #[derive(Debug)]
 struct LoadedImage {
     changed: bool,
+    key: CacheKey,
 }
 
 /// Bounded decode admission. Held across `decode_image` (and the image blur),
@@ -468,7 +549,10 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
         }
         if let Some(cached) = cached_key(&key) {
             let _ = cached;
-            return Ok(LoadedImage { changed: takeover });
+            return Ok(LoadedImage {
+                changed: takeover,
+                key,
+            });
         }
 
         let warm_key = WarmKey::Image(path.to_path_buf());
@@ -488,6 +572,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                         let _ = cached;
                         return Ok(LoadedImage {
                             changed: outcome.changed || takeover,
+                            key,
                         });
                     }
                     continue;
@@ -520,7 +605,10 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                 Err(format!("Could not load \"{}\"", path.display()))
             } else if let Some(cached) = cached_key(&key) {
                 let _ = cached;
-                Ok(LoadedImage { changed: takeover })
+                Ok(LoadedImage {
+                    changed: takeover,
+                    key,
+                })
             } else {
                 match acquire_decode_slot(token) {
                     Err(error) => Err(error),
@@ -536,7 +624,10 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                             Err(format!("Could not load \"{}\"", path.display()))
                         } else if let Some(cached) = cached_key(&key) {
                             let _ = cached;
-                            Ok(LoadedImage { changed: takeover })
+                            Ok(LoadedImage {
+                                changed: takeover,
+                                key,
+                            })
                         } else {
                             #[cfg(test)]
                             DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -548,7 +639,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                                     // Cache completed work before honoring
                                     // cancellation, so a takeover/joiner can
                                     // reuse it instead of decoding twice.
-                                    cache_put(key, image.clone());
+                                    cache_put(key.clone(), image.clone());
                                     #[cfg(test)]
                                     if let Some(hook) = CANCEL_AFTER_DECODE
                                         .lock()
@@ -560,7 +651,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                                     if token.is_cancelled() {
                                         Err(WARM_CANCELLED.to_string())
                                     } else {
-                                        Ok(LoadedImage { changed: true })
+                                        Ok(LoadedImage { changed: true, key })
                                     }
                                 }
                                 Err(error) => {
@@ -577,6 +668,8 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
         let published = match &outcome {
             Ok(loaded) => Ok(WarmOutcome {
                 changed: loaded.changed,
+                key: Some(loaded.key.clone()),
+                failed: false,
             }),
             Err(error) => Err(error.clone()),
         };
@@ -621,17 +714,20 @@ pub fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Cache identity: `(image path, mtime, length)` for decoded wallpapers, or the
-/// theme name for a synthesized gradient. Blurred/downscaled images are ~0.9 MB,
-/// so a small LRU keeps a Desktop wallpaper alive across an Image load without
-/// retaining full-size decodes. The mtime and length are resolved on the warm
-/// thread only; the UI path lookup stays path-only.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CacheKey {
+/// Cache identity: `(image path, mtime, length, content digest)` for decoded
+/// wallpapers, or the theme name for a synthesized gradient. The digest covers
+/// the head and tail of the file so a same-length replacement with a coarse or
+/// restored mtime still invalidates the decode. Blurred/downscaled images are
+/// ~0.9 MB, so a small LRU keeps a Desktop wallpaper alive across an Image load
+/// without retaining full-size decodes. Metadata and digest are resolved on the
+/// warm thread only; the UI path lookup stays path-only.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum CacheKey {
     Image {
         path: PathBuf,
         modified: Option<SystemTime>,
         len: Option<u64>,
+        digest: Option<u64>,
     },
     Gradient {
         theme: &'static str,
@@ -832,6 +928,14 @@ fn record_desktop_failure(candidates: &[PathBuf], path: &Path) {
     state.failed.insert(path.to_path_buf(), Instant::now());
 }
 
+fn desktop_failure_active(candidates: &[PathBuf], path: &Path) -> bool {
+    let mut state = desktop_failures()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    sync_failure_candidates(&mut state, candidates);
+    state.failed.contains_key(path)
+}
+
 fn record_desktop_attempt_failed(candidates: &[PathBuf]) {
     let mut state = desktop_failures()
         .lock()
@@ -855,7 +959,7 @@ fn clear_desktop_failure(candidates: &[PathBuf], path: &Path) {
     state.all_failed_at = None;
 }
 
-fn all_candidates_failed(candidates: &[PathBuf]) -> bool {
+pub(crate) fn all_candidates_failed(candidates: &[PathBuf]) -> bool {
     if candidates.is_empty() {
         return false;
     }
@@ -869,11 +973,13 @@ fn all_candidates_failed(candidates: &[PathBuf]) -> bool {
     state.all_failed_at.is_some()
 }
 
-fn cache_gradient(theme: &Theme) {
+fn cache_gradient(theme: &Theme) -> (CacheKey, bool) {
     let key = gradient_key(theme);
-    if cached_key(&key).is_none() {
-        cache_put(key, desktop_gradient(theme));
+    let cached = cached_key(&key).is_some();
+    if !cached {
+        cache_put(key.clone(), desktop_gradient(theme));
     }
+    (key, !cached)
 }
 
 fn image_key_state(path: &Path) -> (CacheKey, bool) {
@@ -881,18 +987,45 @@ fn image_key_state(path: &Path) -> (CacheKey, bool) {
     METADATA_COUNT.fetch_add(1, Ordering::Relaxed);
     let metadata = std::fs::metadata(path);
     let exists = metadata.is_ok();
-    let (modified, len) = metadata
-        .ok()
-        .map(|metadata| (metadata.modified().ok(), Some(metadata.len())))
-        .unwrap_or((None, None));
+    let (modified, len, digest) = match metadata {
+        Ok(metadata) => {
+            let len = metadata.len();
+            (
+                metadata.modified().ok(),
+                Some(len),
+                content_digest(path, len),
+            )
+        }
+        Err(_) => (None, None, None),
+    };
     (
         CacheKey::Image {
             path: path.to_path_buf(),
             modified,
             len,
+            digest,
         },
         exists,
     )
+}
+
+/// Hash the first and last 4 KiB plus the length. The whole wallpaper is not
+/// read: this catches a same-length rewrite even when the filesystem timestamp
+/// is coarse or has been restored.
+fn content_digest(path: &Path, len: u64) -> Option<u64> {
+    const SAMPLE: usize = 4096;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    len.hash(&mut hasher);
+    let mut buffer = [0_u8; SAMPLE];
+    let head = file.read(&mut buffer).ok()?;
+    buffer[..head].hash(&mut hasher);
+    if len > SAMPLE as u64 {
+        file.seek(SeekFrom::End(-(SAMPLE as i64))).ok()?;
+        let tail = file.read(&mut buffer).ok()?;
+        buffer[..tail].hash(&mut hasher);
+    }
+    Some(hasher.finish())
 }
 
 #[cfg(test)]
@@ -930,6 +1063,10 @@ fn cached_key(key: &CacheKey) -> Option<ColorImage> {
 /// Path-only image lookup for the UI thread. Deliberately does not stat: a
 /// disconnected UNC/%APPDATA% path must never block a frame.
 fn cached_image_path(path: &Path) -> Option<ColorImage> {
+    cached_image_path_with_key(path).map(|(image, _)| image)
+}
+
+fn cached_image_path_with_key(path: &Path) -> Option<(ColorImage, CacheKey)> {
     let mut cache = cache()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -938,8 +1075,19 @@ fn cached_image_path(path: &Path) -> Option<ColorImage> {
     )?;
     let entry = cache.remove(index);
     let image = entry.image.clone();
+    let key = entry.key.clone();
     cache.push(entry);
-    Some(image)
+    Some((image, key))
+}
+
+fn cached_image_key(path: &Path) -> Option<CacheKey> {
+    let cache = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache
+        .iter()
+        .rfind(|entry| matches!(&entry.key, CacheKey::Image { path: cached, .. } if cached == path))
+        .map(|entry| entry.key.clone())
 }
 
 fn cache_put(key: CacheKey, image: ColorImage) {
@@ -1234,6 +1382,7 @@ mod tests {
                 path: PathBuf::from(format!("lru-{index}.png")),
                 modified: None,
                 len: None,
+                digest: None,
             };
             cache_put(
                 key,
@@ -1244,12 +1393,14 @@ mod tests {
             path: PathBuf::from("lru-0.png"),
             modified: None,
             len: None,
+            digest: None,
         };
         assert!(cached_key(&first).is_none(), "oldest entry is evicted");
         let last = CacheKey::Image {
             path: PathBuf::from(format!("lru-{CACHE_CAPACITY}.png")),
             modified: None,
             len: None,
+            digest: None,
         };
         assert!(cached_key(&last).is_some());
     }
@@ -1732,6 +1883,140 @@ mod tests {
             "a timestamp-preserving replacement must change the cache key"
         );
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_identity_digest_catches_a_same_length_replacement() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = dir.join("same-length.bin");
+        std::fs::write(&path, [b'a'; 128]).expect("write first payload");
+        let metadata = std::fs::metadata(&path).expect("metadata");
+        let modified = metadata.modified().expect("mtime");
+        let before = image_key(&path);
+
+        std::fs::write(&path, [b'b'; 128]).expect("write second payload");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open replacement");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore mtime");
+        drop(file);
+
+        let after = image_key(&path);
+        assert_eq!(
+            std::fs::metadata(&path).expect("metadata").len(),
+            128,
+            "the replacement must keep the same length"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            modified,
+            "the replacement must keep the same coarse mtime"
+        );
+        assert!(
+            before != after,
+            "the head/tail digest must distinguish a same-length replacement"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn desktop_gradient_revalidation_reports_unchanged() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let theme = Theme::by_name("Illness Dark");
+        let candidates = vec![dir.join("disconnected.png")];
+
+        // The fallback gradient is already cached/painted.
+        let (key, _) = cache_gradient(theme);
+
+        let first = warm_desktop(theme, &candidates, &WarmToken::new()).expect("first fallback");
+        assert!(
+            first.failed,
+            "an all-failed attempt counts as a warm failure"
+        );
+        assert_eq!(first.key, Some(key.clone()));
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let second = warm_desktop(theme, &candidates, &WarmToken::new()).expect("second fallback");
+        assert!(
+            !second.changed,
+            "an already painted gradient must not be reported as changed"
+        );
+        assert!(second.failed);
+        assert_eq!(second.key, Some(key));
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            decodes,
+            "revalidating a missing Desktop candidate must not decode the gradient"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn missing_preferred_desktop_candidate_keeps_the_transcoded_texture_unchanged() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let theme = Theme::by_name("Illness Dark");
+        let preferred = dir.join("disconnected.png");
+        let transcoded = write_solid(&dir, "transcoded.png", [12, 34, 56, 255]);
+        let candidates = vec![preferred, transcoded.clone()];
+
+        load_blurred(&transcoded, &WarmToken::new()).expect("cache transcoded");
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let first = warm_desktop(theme, &candidates, &WarmToken::new()).expect("first revalidate");
+        assert!(
+            !first.failed,
+            "a usable transcoded copy is a successful warm"
+        );
+        assert!(
+            !first.changed,
+            "the cached transcoded texture did not change"
+        );
+        let second =
+            warm_desktop(theme, &candidates, &WarmToken::new()).expect("second revalidate");
+        assert!(!second.changed);
+        assert_eq!(first.key, second.key);
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            decodes,
+            "the missing preferred candidate must not force a second upload/decode"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_late_decode_after_supersede_changes_the_current_key() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_solid(&dir, "late.png", [255, 0, 0, 255]);
+        let text = path.to_string_lossy().into_owned();
+        let theme = Theme::by_name("Illness Dark");
+
+        let first =
+            warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new()).expect("cache red");
+        let painted = first.key.expect("red cache key");
+        assert_eq!(
+            current_key(theme, BackgroundMode::Image, &text, &[]),
+            Some(painted.clone())
+        );
+
+        // Replace the painted image while the UI keeps the old texture. A
+        // late warm fills the cache with a different entry; the path-only key
+        // lookup must notice so the app uploads it.
+        write_solid(&dir, "late.png", [0, 0, 255, 255]);
+        let late =
+            warm_cache(theme, BackgroundMode::Image, &text, &WarmToken::new()).expect("cache blue");
+        let current =
+            current_key(theme, BackgroundMode::Image, &text, &[]).expect("blue cache key");
+        assert_ne!(current, painted);
+        assert_eq!(late.key, Some(current));
         let _ = std::fs::remove_dir_all(dir);
     }
 
