@@ -58,10 +58,13 @@ pub struct IllnessApp {
     chrome: ChromeState,
     overlays: OverlayState,
     applied_theme: String,
+    applied_font_family: String,
     applied_font_size: f32,
     applied_ppp: f32,
     applied_line_height: f32,
     applied_material: Material,
+    /// Family whose load failed, so the toast is not repeated every change.
+    font_failure: Option<String>,
     window_title: String,
     backdrop: egui::TextureHandle,
 
@@ -95,6 +98,19 @@ impl IllnessApp {
             ctx.pixels_per_point(),
         );
         atlas.set_line_height(config.line_height);
+        let mut applied_font_family = "Cascadia Mono".to_string();
+        if config.font_family != applied_font_family {
+            match fonts::load_terminal_font(&config.font_family) {
+                Some((data, index)) => {
+                    atlas.set_font(data, index);
+                    applied_font_family = config.font_family.clone();
+                }
+                None => log::warn!(
+                    "font family {:?} is unavailable; using bundled Cascadia Mono",
+                    config.font_family
+                ),
+            }
+        }
         let line_height = config.line_height;
         let backdrop = backdrop::build(&ctx, theme);
 
@@ -110,10 +126,12 @@ impl IllnessApp {
             chrome: ChromeState::default(),
             overlays: OverlayState::default(),
             applied_theme: theme.name.to_string(),
+            applied_font_family,
             applied_font_size: 0.0,
             applied_ppp: 0.0,
             applied_line_height: line_height,
             applied_material: Material::Mica,
+            font_failure: None,
             window_title: "Illness".to_string(),
             backdrop,
             window_focused: false,
@@ -345,6 +363,35 @@ impl IllnessApp {
             self.ctx.request_repaint();
         }
 
+        if self.config.font_family != self.applied_font_family {
+            match fonts::load_terminal_font(&self.config.font_family) {
+                Some((data, index)) => {
+                    self.atlas.set_font(data, index);
+                    self.atlas.set_size(
+                        &self.ctx,
+                        self.config.font_size,
+                        self.ctx.pixels_per_point(),
+                    );
+                    self.atlas.set_line_height(self.config.line_height);
+                    self.applied_font_family = self.config.font_family.clone();
+                    self.applied_font_size = self.config.font_size;
+                    self.applied_line_height = self.config.line_height;
+                    self.font_failure = None;
+                    self.invalidate_terminal_surfaces();
+                }
+                None => {
+                    let family = self.config.font_family.clone();
+                    if self.font_failure.as_deref() != Some(family.as_str()) {
+                        self.overlays.toast = Some(format!(
+                            "Font \"{family}\" is unavailable; keeping {}",
+                            self.applied_font_family
+                        ));
+                        self.font_failure = Some(family);
+                    }
+                }
+            }
+        }
+
         if (self.config.font_size - self.applied_font_size).abs() > f32::EPSILON {
             self.atlas.set_size(
                 &self.ctx,
@@ -400,6 +447,24 @@ impl IllnessApp {
             .set_size(&self.ctx, size, self.ctx.pixels_per_point());
         self.applied_font_size = size;
         self.persist();
+    }
+
+    /// Drops per-tab software surfaces after a font swap.
+    ///
+    /// The surface cache key covers font geometry but not the face identity, so
+    /// two faces with identical metrics would otherwise keep the old pixels.
+    /// Public view state (scroll, search, pointer/IME anchors) is preserved.
+    fn invalidate_terminal_surfaces(&mut self) {
+        for entry in &mut self.tabs {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
+            let previous = std::mem::take(&mut tab.view);
+            tab.view.scroll_target = previous.scroll_target;
+            tab.view.search = previous.search;
+            tab.view.last_click = previous.last_click;
+            tab.view.ime_pos = previous.ime_pos;
+        }
     }
 
     fn close_tab(&mut self, index: usize) {

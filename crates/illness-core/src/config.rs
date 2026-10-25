@@ -142,6 +142,11 @@ impl Config {
 
     /// Clamp values into supported ranges, resolve the theme, and dedup profiles.
     pub fn sanitized(mut self) -> Self {
+        if self.font_family.trim().is_empty() {
+            self.font_family = "Cascadia Mono".to_string();
+        } else {
+            self.font_family = self.font_family.trim().to_string();
+        }
         self.font_size = finite_or(self.font_size, 18.0).clamp(8.0, 40.0);
         self.line_height = finite_or(self.line_height, 1.2).clamp(1.0, 2.0);
         self.padding = finite_or(self.padding, 8.0).clamp(0.0, 32.0);
@@ -309,5 +314,22 @@ mod tests {
         }
         .sanitized();
         assert_eq!(config.theme, "Illness Dark");
+    }
+
+    #[test]
+    fn sanitize_font_family_keeps_a_name() {
+        let empty = Config {
+            font_family: "   ".to_string(),
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(empty.font_family, "Cascadia Mono");
+
+        let named = Config {
+            font_family: "  CaskaydiaCove Nerd Font  ".to_string(),
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(named.font_family, "CaskaydiaCove Nerd Font");
     }
 }

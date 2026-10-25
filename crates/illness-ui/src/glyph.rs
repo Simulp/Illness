@@ -201,11 +201,15 @@ impl ShelfAllocator {
 pub struct GlyphAtlas {
     texture: TextureHandle,
     options: TextureOptions,
+    ctx: egui::Context,
     metrics: CellMetrics,
     cache: HashMap<(char, GlyphStyle), Glyph>,
     soft_cache: HashMap<(char, GlyphStyle), Arc<SoftGlyph>>,
     scale: ScaleContext,
-    font: Option<FontRef<'static>>,
+    /// Primary font file bytes. Owned so the family can be swapped at runtime
+    /// without self-referential font references.
+    font_data: Arc<Vec<u8>>,
+    font_index: usize,
     fallback_faces: Vec<FallbackFace>,
     font_db: Option<fontdb::Database>,
     next_fallback_family: usize,
@@ -230,8 +234,13 @@ impl GlyphAtlas {
         let ppp = normalize_ppp(ppp);
         let size_px = normalize_size(size_px);
         let physical_size = size_px * ppp;
-        let font = FontRef::from_index(mono_bytes, 0);
-        let metrics = metrics_for(font.as_ref(), physical_size, ppp);
+        let font_data = Arc::new(mono_bytes.to_vec());
+        let font_index = 0usize;
+        let metrics = metrics_for(
+            FontRef::from_index(&font_data, font_index).as_ref(),
+            physical_size,
+            ppp,
+        );
         let texture = ctx.load_texture(
             ATLAS_NAME,
             ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
@@ -241,11 +250,13 @@ impl GlyphAtlas {
         Self {
             texture,
             options: TextureOptions::NEAREST,
+            ctx: ctx.clone(),
             metrics,
             cache: HashMap::new(),
             soft_cache: HashMap::new(),
             scale: ScaleContext::new(),
-            font,
+            font_data,
+            font_index,
             fallback_faces: Vec::new(),
             font_db: None,
             next_fallback_family: 0,
@@ -264,9 +275,30 @@ impl GlyphAtlas {
     /// Changes the point size and device scale, dropping every cached glyph.
     pub fn set_size(&mut self, _ctx: &egui::Context, size_px: f32, ppp: f32) {
         self.ppp = normalize_ppp(ppp);
-        let size_px = normalize_size(size_px);
-        self.physical_size = size_px * self.ppp;
-        self.metrics = metrics_for(self.font.as_ref(), self.physical_size, self.ppp);
+        self.physical_size = normalize_size(size_px) * self.ppp;
+        self.rebuild_metrics();
+    }
+
+    /// Replaces the primary font face and rebuilds metrics and caches.
+    ///
+    /// `data` must contain at least the face at `index`; invalid data is ignored
+    /// so a bad selection cannot break an otherwise working grid.
+    pub fn set_font(&mut self, data: Vec<u8>, index: u32) {
+        if FontRef::from_index(&data, index as usize).is_none() {
+            log::warn!("ignoring unreadable terminal font face {index}");
+            return;
+        }
+        self.font_data = Arc::new(data);
+        self.font_index = index as usize;
+        self.rebuild_metrics();
+        self.ctx.request_repaint();
+    }
+
+    /// Rebuilds cell metrics for the current face, size, and line height, then
+    /// clears every cached glyph and the atlas texture.
+    fn rebuild_metrics(&mut self) {
+        let font = FontRef::from_index(&self.font_data, self.font_index);
+        self.metrics = metrics_for(font.as_ref(), self.physical_size, self.ppp);
         self.base_height_px = self.metrics.height_px as f32;
         self.baseline_px = self.metrics.baseline * self.ppp;
         self.apply_line_height();
@@ -310,8 +342,10 @@ impl GlyphAtlas {
             return Some(*glyph);
         }
 
-        let primary = self.font?;
-        let mut glyph_id = primary.charmap().map(ch);
+        let mut glyph_id = {
+            let primary = FontRef::from_index(&self.font_data, self.font_index)?;
+            primary.charmap().map(ch)
+        };
         let mut fallback_index = None;
 
         if glyph_id == 0
@@ -331,13 +365,14 @@ impl GlyphAtlas {
         let physical_size = self.physical_size;
         let ppp = self.ppp;
 
-        // Keep the borrow of `fallback_faces` inside this block so the rest of
-        // the method can mutate the atlas.
+        // Keep the borrow of the primary/fallback font data inside this block
+        // so the rest of the method can mutate the atlas.
         let (image, advance_px) = {
+            let primary = FontRef::from_index(&self.font_data, self.font_index);
             let source_font = fallback_index
                 .and_then(|index| self.fallback_faces.get(index))
                 .and_then(|face| FontRef::from_index(&face.data, face.index))
-                .unwrap_or(primary);
+                .or(primary)?;
 
             let advance_px = source_font
                 .glyph_metrics(&[])
@@ -434,8 +469,10 @@ impl GlyphAtlas {
             return Some(Arc::clone(glyph));
         }
 
-        let primary = self.font?;
-        let mut glyph_id = primary.charmap().map(ch);
+        let mut glyph_id = {
+            let primary = FontRef::from_index(&self.font_data, self.font_index)?;
+            primary.charmap().map(ch)
+        };
         let mut fallback_index = None;
 
         if glyph_id == 0
@@ -455,10 +492,11 @@ impl GlyphAtlas {
         let physical_size = self.physical_size;
         let ppp = self.ppp;
         let image = {
+            let primary = FontRef::from_index(&self.font_data, self.font_index);
             let source_font = fallback_index
                 .and_then(|index| self.fallback_faces.get(index))
                 .and_then(|face| FontRef::from_index(&face.data, face.index))
-                .unwrap_or(primary);
+                .or(primary)?;
             rasterize_subpixel(
                 &mut self.scale,
                 source_font,
@@ -955,6 +993,35 @@ mod tests {
         let second = atlas.glyph('M', GlyphStyle::Regular).expect("M glyph");
         assert_eq!(first, second);
         assert_eq!(first.uv, second.uv);
+    }
+
+    #[test]
+    fn test_set_font_bundled_renders_m() {
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        atlas.set_font(CASCADIA_MONO.to_vec(), 0);
+
+        let glyph = atlas.glyph('M', GlyphStyle::Regular).expect("M glyph");
+        assert!(glyph.size.x > 0.0, "set_font produced an empty 'M'");
+        assert!(glyph.size.y > 0.0, "set_font produced an empty 'M'");
+        let (covered, max_alpha) = atlas.last_coverage;
+        assert!(
+            covered >= 20,
+            "'M' covered only {covered} pixels after set_font"
+        );
+        assert!(
+            max_alpha > 128,
+            "'M' peak alpha was only {max_alpha} after set_font"
+        );
+    }
+
+    #[test]
+    fn test_set_font_rejects_invalid_data() {
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        let before = atlas.metrics();
+        atlas.set_font(vec![0, 1, 2, 3], 0);
+        assert_eq!(atlas.metrics(), before, "invalid font changed metrics");
+        let glyph = atlas.glyph('M', GlyphStyle::Regular).expect("M glyph");
+        assert!(glyph.size.x > 0.0);
     }
 
     #[test]

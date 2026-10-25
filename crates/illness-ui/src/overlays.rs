@@ -9,6 +9,7 @@ use illness_core::{Config, CursorKind, Material, Profile, Rgb, Theme};
 
 use crate::chrome::{Action, TabInfo};
 use crate::design::{self, Tokens};
+use crate::fonts;
 use crate::icons::{self, Icon};
 
 pub const PALETTE_WIDTH: f32 = 640.0;
@@ -700,6 +701,34 @@ fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool
             });
         if chosen != config.material {
             config.material = chosen;
+            true
+        } else {
+            false
+        }
+    });
+
+    changed |= setting_row(ui, tokens, "Font", |ui| {
+        let families = fonts::installed_families();
+        let mut chosen = config.font_family.clone();
+        ComboBox::from_id_salt("illness_settings_font")
+            .width(220.0)
+            .height(320.0)
+            .selected_text(chosen.clone())
+            .popup_style(popup_style(tokens))
+            .show_ui(ui, |ui| {
+                if !families
+                    .iter()
+                    .any(|family| family.eq_ignore_ascii_case(&chosen))
+                {
+                    let current = chosen.clone();
+                    ui.selectable_value(&mut chosen, current.clone(), current);
+                }
+                for family in &families {
+                    ui.selectable_value(&mut chosen, family.clone(), family);
+                }
+            });
+        if chosen != config.font_family {
+            config.font_family = chosen;
             true
         } else {
             false
