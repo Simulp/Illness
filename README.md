@@ -28,8 +28,9 @@ antialiasing (no ClearType color fringing).
   blur where Windows 10/11 expose it, and also falls back to Solid. Acrylic's Desktop mode is
   native behind-window blur; Mica's Desktop mode paints a decoded, blurred snapshot of the
   current wallpaper that is refreshed when the backdrop is rebuilt, not continuously live.
-  Image uses the chosen custom image. Wallpapers are decoded and blurred on a detached thread,
-  so switching to Mica or Image uploads an already-warmed texture instead of stalling the UI.
+  Image uses the chosen custom image. Wallpapers are decoded and blurred on a detached thread;
+  Solid and fallback Solid never decode one, Acrylic's Desktop mode prewarms for a later switch,
+  and a cold Mica/Image switch paints the native material until the warmed texture uploads.
   The opacity slider affects a painted backdrop (Mica with Desktop or a loaded image) and
   Acrylic (including Acrylic with Background set to None, through its accent tint); Solid,
   Mica with no background, and Mica with an image that failed to load ignore it. Native
