@@ -1,9 +1,8 @@
-//! In-window Mica/Acrylic backdrop.
+//! In-window backdrop for translucent materials.
 //!
-//! Mica and translucent image backgrounds still paint a blurred desktop
-//! wallpaper behind the terminal and chrome, so they look identical on every
-//! Windows 10/11 GPU backend. Acrylic instead uses native behind-window blur
-//! (see `platform.rs`), so the desktop background is skipped for that material.
+//! Mica/Image backgrounds paint a blurred wallpaper behind the terminal and
+//! chrome, tinted by the configured opacity. Acrylic+Desktop skips this texture
+//! because `platform.rs` applies native behind-window blur instead.
 
 use egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use illness_core::config::BackgroundMode;

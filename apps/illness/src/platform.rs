@@ -42,12 +42,12 @@ const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
 #[cfg(target_os = "windows")]
 const ACCENT_DISABLED: u32 = 0;
 
-/// Fixed low-alpha tint handed to the legacy acrylic policy. The colour is
-/// packed as `AABBGGRR`, matching `ACCENT_POLICY::GradientColor`.
+/// Acrylic tint RGB packed as the low 24 bits of an `AABBGGRR` gradient
+/// colour. The alpha byte is derived from the configured opacity.
 #[cfg(target_os = "windows")]
-const ACRYLIC_TINT_DARK: u32 = 0x2030_2020;
+const ACRYLIC_RGB_DARK: u32 = 0x0030_2020;
 #[cfg(target_os = "windows")]
-const ACRYLIC_TINT_LIGHT: u32 = 0x20f5_f5f5;
+const ACRYLIC_RGB_LIGHT: u32 = 0x00f5_f5f5;
 
 /// `ACCENT_POLICY` from `winuser.h`.
 #[cfg(target_os = "windows")]
@@ -261,12 +261,19 @@ pub fn current_wallpaper_path() -> Option<PathBuf> {
 
 /// Apply the requested backdrop to `window`.
 ///
-/// Mica failing on Windows 10 is expected; the caller falls back to [`Material::Solid`] and
+/// `opacity` is the user's background-opacity percentage (0-100); Acrylic uses
+/// it to derive the alpha byte of the legacy accent tint. Mica failing on
+/// Windows 10 is expected; the caller falls back to [`Material::Solid`] and
 /// reports a toast. On non-Windows platforms this is a no-op.
-pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> Result<()> {
+pub fn apply(
+    window: &impl HasWindowHandle,
+    material: Material,
+    dark: bool,
+    opacity: f32,
+) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = (window, material, dark);
+        let _ = (window, material, dark, opacity);
         Ok(())
     }
 
@@ -281,11 +288,12 @@ pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> R
 
         match material {
             Material::Mica => {
-                // Mica is the wallpaper-derived system backdrop. Extend the
-                // frame so DWM paints it through the whole client area.
+                // Mica is the wallpaper-derived system backdrop. Disable any
+                // legacy accent first, then extend the frame so DWM paints
+                // Mica through the whole client area, and apply it last.
                 let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
-                window_vibrancy::apply_mica(window, Some(dark))?;
                 extend_frame(hwnd, true);
+                window_vibrancy::apply_mica(window, Some(dark))?;
             }
             Material::Acrylic => {
                 // The system backdrop only samples the wallpaper; the legacy
@@ -295,11 +303,7 @@ pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> R
                 let _ = window_vibrancy::clear_mica(window);
                 let _ = window_vibrancy::clear_acrylic(window);
                 extend_frame(hwnd, false);
-                let tint = if dark {
-                    ACRYLIC_TINT_DARK
-                } else {
-                    ACRYLIC_TINT_LIGHT
-                };
+                let tint = acrylic_tint(dark, opacity);
                 if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
                     anyhow::bail!("legacy acrylic accent policy is unavailable");
                 }
@@ -315,6 +319,50 @@ pub fn apply(window: &impl HasWindowHandle, material: Material, dark: bool) -> R
 
         Ok(())
     }
+}
+
+/// Build the `AABBGGRR` gradient colour for the legacy acrylic policy.
+///
+/// The RGB tint stays dark or light with the theme; the alpha follows the
+/// background-opacity slider the same way the in-window tint does.
+#[cfg(target_os = "windows")]
+fn acrylic_tint(dark: bool, opacity: f32) -> u32 {
+    let rgb = if dark {
+        ACRYLIC_RGB_DARK
+    } else {
+        ACRYLIC_RGB_LIGHT
+    };
+    let alpha = u32::from(crate::backdrop::tint_alpha(Material::Acrylic, opacity));
+    (alpha << 24) | rgb
+}
+
+/// Show a blocking native error dialog for a failure that prevents startup.
+///
+/// Uses `MessageBoxW` so a debug build without a console and a release build
+/// without any console both report the cause. The dialog owns no Rust memory
+/// after it returns.
+#[cfg(target_os = "windows")]
+pub fn show_startup_error(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+
+    let text: Vec<u16> = format!("{message}\0").encode_utf16().collect();
+    let caption: Vec<u16> = "Illness\0".encode_utf16().collect();
+    // Safety: both wide buffers are live, null-terminated, and outlive the
+    // call; the owner handle is null because no app window exists yet.
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text.as_ptr(),
+            caption.as_ptr(),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+/// Show a startup failure when no native dialog API is available.
+#[cfg(not(target_os = "windows"))]
+pub fn show_startup_error(message: &str) {
+    log::error!("{message}");
 }
 
 /// Set DWM dark mode and rounded corners. Failures are ignored: older Windows
@@ -394,4 +442,22 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
     let result =
         unsafe { DwmSetWindowAttribute(hwnd, attribute, &value as *const i32 as *const _, size) };
     result >= 0
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::acrylic_tint;
+
+    #[test]
+    fn acrylic_tint_alpha_follows_opacity() {
+        let transparent_tint = acrylic_tint(true, 0.0);
+        let full_blur = acrylic_tint(true, 100.0);
+
+        assert_eq!(transparent_tint >> 24, 255, "0% must be opaque");
+        assert_eq!(full_blur >> 24, 50, "100% keeps Acrylic strength");
+        assert_ne!(transparent_tint, full_blur);
+        assert_eq!(transparent_tint & 0x00ff_ffff, 0x0030_2020);
+        assert_eq!(full_blur & 0x00ff_ffff, 0x0030_2020);
+        assert_eq!(acrylic_tint(false, 100.0) & 0x00ff_ffff, 0x00f5_f5f5);
+    }
 }

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use egui::{ViewportCommand, ViewportEvent, ViewportId, ViewportInfo};
-use egui_wgpu::{RendererOptions, SurfaceConfig, WgpuConfiguration, WgpuSetup, WgpuSetupCreateNew};
+use egui_wgpu::{RendererOptions, WgpuConfiguration};
+#[cfg(target_os = "windows")]
+use egui_wgpu::{SurfaceConfig, WgpuSetup, WgpuSetupCreateNew};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -53,19 +55,29 @@ pub fn run(icon: Option<Arc<egui::IconData>>) -> anyhow::Result<()> {
 }
 
 fn wgpu_configuration(display_handle: winit::event_loop::OwnedDisplayHandle) -> WgpuConfiguration {
-    let mut setup = WgpuSetupCreateNew::from_display_handle(display_handle);
-    setup.instance_descriptor.backends = wgpu::Backends::DX12;
-    // A DXGI swapchain created from a DirectComposition visual is the only
-    // DX12 presentation path that supports a transparent swapchain.
-    setup
-        .instance_descriptor
-        .backend_options
-        .dx12
-        .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = display_handle;
+        WgpuConfiguration::default()
+    }
 
-    let mut config = WgpuConfiguration::default().with_surface_config(SurfaceConfig::LOW_LATENCY);
-    config.wgpu_setup = WgpuSetup::CreateNew(setup);
-    config
+    #[cfg(target_os = "windows")]
+    {
+        let mut setup = WgpuSetupCreateNew::from_display_handle(display_handle);
+        setup.instance_descriptor.backends = wgpu::Backends::DX12;
+        // A DXGI swapchain created from a DirectComposition visual is the only
+        // DX12 presentation path that supports a transparent swapchain.
+        setup
+            .instance_descriptor
+            .backend_options
+            .dx12
+            .presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+
+        let mut config =
+            WgpuConfiguration::default().with_surface_config(SurfaceConfig::LOW_LATENCY);
+        config.wgpu_setup = WgpuSetup::CreateNew(setup);
+        config
+    }
 }
 
 struct Host {
@@ -145,6 +157,9 @@ impl Host {
             Ok(window) => Arc::new(window),
             Err(error) => {
                 log::error!("failed to create window: {error}");
+                crate::platform::show_startup_error(&format!(
+                    "The application window could not be created.\n\n{error}"
+                ));
                 event_loop.exit();
                 return;
             }
@@ -156,6 +171,9 @@ impl Host {
                 .set_window(ViewportId::ROOT, Some(window.clone())),
         ) {
             log::error!("failed to create the wgpu surface: {error}");
+            crate::platform::show_startup_error(&format!(
+                "The GPU surface could not be created.\n\n{error}"
+            ));
             event_loop.exit();
             return;
         }
@@ -175,6 +193,19 @@ impl Host {
         state.set_clipboard_shortcuts(false);
 
         egui_winit::update_viewport_info(&mut self.info, &self.ctx, &window, true);
+        // `IllnessApp::new` reads `Context::pixels_per_point` for the initial
+        // glyph atlas and PTY cell metrics. The viewport information has not
+        // reached egui's input state yet, so seed it with the real scale first.
+        // Read the scale before taking the input write lock: querying it from
+        // inside `input_mut` would deadlock on the context lock.
+        let pixels_per_point = egui_winit::pixels_per_point(&self.ctx, &window);
+        self.ctx.input_mut(|input| {
+            input
+                .raw
+                .viewports
+                .insert(ViewportId::ROOT, self.info.clone());
+            input.pixels_per_point = pixels_per_point;
+        });
         let render_state = self.painter.render_state();
         let app = app::IllnessApp::new(&self.ctx, render_state.as_ref(), window.clone());
 
@@ -273,8 +304,7 @@ impl Host {
         }
 
         if self.close_requested {
-            app.shutdown_and_save();
-            event_loop.exit();
+            self.finish_close(event_loop);
             return;
         }
 
@@ -287,6 +317,15 @@ impl Host {
                 window.request_redraw();
             }
         }
+    }
+
+    /// Save the session and stop the loop. `shutdown_and_save` is idempotent,
+    /// so every close path can route here without double-saving.
+    fn finish_close(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(app) = self.app.as_mut() {
+            app.shutdown_and_save();
+        }
+        event_loop.exit();
     }
 }
 
@@ -320,18 +359,22 @@ impl ApplicationHandler<UserEvent> for Host {
 
         match event {
             WindowEvent::RedrawRequested => self.redraw(event_loop),
-            WindowEvent::Resized(size) => {
+            WindowEvent::Resized(_) => {
                 if let Some(state) = self.state.as_mut() {
                     let _ = state.on_window_event(&window, &event);
                 }
+                // Winit can deliver a stale size; query the live client area.
                 // A zero size is winit's minimize marker on Windows; there is
                 // no surface to resize in that case.
+                let size = window.inner_size();
                 if let (Some(width), Some(height)) =
                     (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
                 {
                     self.painter
                         .on_window_resized(ViewportId::ROOT, width, height);
-                    window.request_redraw();
+                    // Paint once now so the swapchain is never presented at
+                    // the old size while a redraw is still pending.
+                    self.redraw(event_loop);
                 }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
@@ -344,11 +387,20 @@ impl ApplicationHandler<UserEvent> for Host {
                 if let Some(state) = self.state.as_mut() {
                     let _ = state.on_window_event(&window, &event);
                 }
-                // Give the app one last pass so it can save before the loop
-                // exits. `IllnessApp::shutdown_and_save` is idempotent.
+                // Give the app one last pass so it can save and honor a
+                // CancelClose. Windows withholds `RedrawRequested` for a
+                // minimized or hidden window, so run the pass synchronously.
                 self.info.events.push(ViewportEvent::Close);
                 self.close_requested = true;
-                window.request_redraw();
+                let can_paint = self.state.is_some()
+                    && self.app.is_some()
+                    && !window.is_minimized().unwrap_or(false)
+                    && window.is_visible().unwrap_or(true);
+                if can_paint {
+                    self.redraw(event_loop);
+                } else {
+                    self.finish_close(event_loop);
+                }
             }
             WindowEvent::Occluded(occluded) => {
                 self.info.occluded = Some(occluded);
@@ -402,6 +454,12 @@ impl ApplicationHandler<UserEvent> for Host {
         if let Some(app) = &mut self.app {
             app.shutdown_and_save();
         }
+        // `Painter::destroy` is a no-op; releasing the surface first lets the
+        // swapchain and its DirectComposition visual go away with the window.
+        let _ = pollster::block_on(self.painter.set_window(ViewportId::ROOT, None));
+        self.app = None;
+        self.state = None;
+        self.window = None;
         self.painter.destroy();
     }
 }

@@ -400,14 +400,15 @@ impl IllnessApp {
 
     fn apply_material_to(&mut self, window: &impl HasWindowHandle) {
         let dark = !self.theme.is_light();
+        let opacity = self.config.background_opacity;
         let requested = self.config.material;
-        if let Err(error) = platform::apply(window, requested, dark) {
+        if let Err(error) = platform::apply(window, requested, dark, opacity) {
             log::warn!(
                 "window material {} (dark={dark}) failed: {error}",
                 material_name(requested)
             );
             self.config.material = Material::Solid;
-            if let Err(error) = platform::apply(window, Material::Solid, dark) {
+            if let Err(error) = platform::apply(window, Material::Solid, dark, opacity) {
                 log::warn!("solid material unavailable: {error}");
             }
             self.overlays.toast = Some(format!(
@@ -436,6 +437,15 @@ impl IllnessApp {
     fn rebuild_backdrop(&mut self) {
         let mode = self.config.background;
         let path = self.config.background_path.clone();
+        // Native Acrylic already blurs the real desktop. Decoding and painting
+        // the wallpaper here would cover that behind-window blur.
+        if self.config.material == Material::Acrylic && mode == BackgroundMode::Desktop {
+            self.backdrop = None;
+            self.applied_background = Some((mode, path));
+            self.applied_background_opacity = self.config.background_opacity;
+            self.ctx.request_repaint();
+            return;
+        }
         match backdrop::build(&self.ctx, self.theme, mode, &path) {
             Ok(backdrop) => {
                 self.backdrop = backdrop;
@@ -456,6 +466,14 @@ impl IllnessApp {
         self.applied_background = Some((mode, path));
         self.applied_background_opacity = self.config.background_opacity;
         self.ctx.request_repaint();
+    }
+
+    /// Load an in-window backdrop after a material change when the new
+    /// material/mode needs one and none is currently loaded.
+    fn sync_backdrop_for_material(&mut self) {
+        if needs_backdrop(self.config.material, self.config.background) && self.backdrop.is_none() {
+            self.rebuild_backdrop();
+        }
     }
 
     fn reapply_config(&mut self) {
@@ -532,16 +550,26 @@ impl IllnessApp {
         }
 
         let background = (self.config.background, self.config.background_path.clone());
+        let opacity_changed =
+            (self.config.background_opacity - self.applied_background_opacity).abs() > f32::EPSILON;
         if background_dirty || self.applied_background.as_ref() != Some(&background) {
             self.rebuild_backdrop();
-        } else if (self.config.background_opacity - self.applied_background_opacity).abs()
-            > f32::EPSILON
-        {
+        } else if opacity_changed {
             self.applied_background_opacity = self.config.background_opacity;
             self.ctx.request_repaint();
         }
 
         if self.config.material != self.applied_material {
+            self.pending_material = true;
+            // Acrylic+Desktop has no in-window backdrop, so switching to Mica
+            // or Image must load one now. An existing texture is reused to
+            // avoid decoding the wallpaper twice.
+            self.sync_backdrop_for_material();
+        }
+
+        // The legacy acrylic accent carries its own tint, so opacity changes
+        // must re-apply it even though the in-window tint is painted live.
+        if opacity_changed && self.config.material == Material::Acrylic {
             self.pending_material = true;
         }
 
@@ -641,7 +669,8 @@ impl IllnessApp {
         if self.tabs.len() == 1 {
             self.tabs.remove(index);
             self.active = 0;
-            self.shutdown_and_save();
+            // The host saves and exits after this pass; shutting down here
+            // would break a later CancelClose.
             self.ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
@@ -885,13 +914,15 @@ impl IllnessApp {
                     .send_viewport_cmd(ViewportCommand::Maximized(!maximized));
             }
             Action::CloseWindow => {
-                self.shutdown_and_save();
+                // Let the host run the pass, collect the Close command and
+                // save/exit afterwards so a CancelClose can still win.
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
             }
             Action::ConfigChanged => self.reapply_config(),
             Action::ToggleMaterial => {
                 self.config.material = next_material(self.config.material);
                 self.pending_material = true;
+                self.sync_backdrop_for_material();
                 self.persist();
             }
             Action::Copy => self.copy_selection(),
@@ -1146,10 +1177,6 @@ impl IllnessApp {
 impl IllnessApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if ctx.input(|input| input.viewport().close_requested()) {
-            self.shutdown_and_save();
-            return;
-        }
 
         let ppp = ctx.pixels_per_point();
         if (ppp - self.applied_ppp).abs() > f32::EPSILON {
@@ -1413,9 +1440,22 @@ impl IllnessApp {
     pub fn clear_color(&self) -> [f32; 4] {
         match self.config.material {
             Material::Solid => design::color(self.theme.bg).to_normalized_gamma_f32(),
+            // Mica without a backdrop paints nothing in the UI, so a
+            // transparent clear would leave a fully see-through window.
+            Material::Mica if self.backdrop.is_none() => {
+                design::color(self.theme.bg).to_normalized_gamma_f32()
+            }
             Material::Mica | Material::Acrylic => [0.0, 0.0, 0.0, 0.0],
         }
     }
+}
+
+/// Whether the app should hold an in-window backdrop texture for this
+/// material/mode pair. Acrylic+Desktop uses native behind-window blur.
+fn needs_backdrop(material: Material, mode: BackgroundMode) -> bool {
+    material != Material::Solid
+        && mode != BackgroundMode::None
+        && !(material == Material::Acrylic && mode == BackgroundMode::Desktop)
 }
 
 fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
@@ -2186,6 +2226,16 @@ mod tests {
         assert_eq!(next_material(Material::Mica), Material::Acrylic);
         assert_eq!(next_material(Material::Acrylic), Material::Solid);
         assert_eq!(next_material(Material::Solid), Material::Mica);
+    }
+
+    #[test]
+    fn backdrop_is_needed_except_for_native_acrylic_desktop() {
+        assert!(!needs_backdrop(Material::Acrylic, BackgroundMode::Desktop));
+        assert!(!needs_backdrop(Material::Solid, BackgroundMode::Desktop));
+        assert!(!needs_backdrop(Material::Mica, BackgroundMode::None));
+        assert!(needs_backdrop(Material::Mica, BackgroundMode::Desktop));
+        assert!(needs_backdrop(Material::Mica, BackgroundMode::Image));
+        assert!(needs_backdrop(Material::Acrylic, BackgroundMode::Image));
     }
 
     #[test]

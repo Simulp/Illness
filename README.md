@@ -19,12 +19,14 @@ antialiasing (no ClearType color fringing).
 
 ## Symptoms
 
-- Custom frameless window with a real tab strip, profile accents and native caption buttons.
+- Custom winit/egui window host with a frameless window, a real tab strip, profile accents and
+  native caption buttons.
 - Settings opens as its own tab, with right-aligned dropdowns, an editable shell profile list,
   an installed-font picker (Nerd Fonts included), and background controls.
-- Mica by default; Acrylic or Solid in Settings. Windows 10 falls back to Solid. Desktop mode
-  uses the live Windows wallpaper, with custom images and an opacity slider; true DWM
-  behind-window blur is not available through the current wgpu surface.
+- Mica by default; Acrylic or Solid in Settings. Mica uses the Windows system backdrop, and
+  Acrylic uses the native legacy behind-window blur on Windows 11, falling back to Solid when
+  that API is unavailable. Desktop mode uses the live Windows wallpaper for Mica and Image;
+  custom images and their opacity slider still work.
 - Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and Settings (`Ctrl+,`).
 - Seven themes: Illness Dark, Campbell, One Half Dark, Nord, Gruvbox Dark, Solarized Dark, Light.
 - Crisp terminal grid with system fallback for CJK and emoji; wide cells, combining marks,
@@ -75,9 +77,9 @@ detected from the shells installed on the machine: PowerShell 7, Windows PowerSh
 Prompt and WSL.
 
 Known limitations in this dose: no split panes, no sixel/kitty graphics, no vi mode, and no
-tested Unix build. Mica/Acrylic are an in-window approximation of the system materials rather
-than OS-composited DWM blur. The VT core is Alacritty's, so the usual escape-sequence coverage
-applies.
+tested Unix build. Mica is a system backdrop; Acrylic uses the legacy native behind-window
+blur on Windows 11 and falls back to Solid if that API is unavailable. The VT core is
+Alacritty's, so the usual escape-sequence coverage applies.
 
 ## Prognosis
 
