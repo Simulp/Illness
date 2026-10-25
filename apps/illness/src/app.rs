@@ -146,9 +146,9 @@ impl IllnessApp {
         atlas.set_line_height(config.line_height);
         let mut applied_font_family = "Cascadia Mono".to_string();
         if config.font_family != applied_font_family {
-            match fonts::load_terminal_font(&config.font_family) {
-                Some((data, index)) => {
-                    atlas.set_font(data, index);
+            match fonts::load_terminal_font_faces(&config.font_family) {
+                Some(font) => {
+                    atlas.set_font_faces(font.regular, font.bold, font.italic, font.bold_italic);
                     applied_font_family = config.font_family.clone();
                 }
                 None => log::warn!(
@@ -472,9 +472,14 @@ impl IllnessApp {
         }
 
         if self.config.font_family != self.applied_font_family {
-            match fonts::load_terminal_font(&self.config.font_family) {
-                Some((data, index)) => {
-                    self.atlas.set_font(data, index);
+            match fonts::load_terminal_font_faces(&self.config.font_family) {
+                Some(font) => {
+                    self.atlas.set_font_faces(
+                        font.regular,
+                        font.bold,
+                        font.italic,
+                        font.bold_italic,
+                    );
                     self.atlas.set_size(
                         &self.ctx,
                         self.config.font_size,

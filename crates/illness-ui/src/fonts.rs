@@ -3,6 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use egui::{FontData, FontDefinitions, FontFamily, FontTweak};
 
+use crate::glyph::FontFace;
+
 pub const CASCADIA_MONO: &[u8] = include_bytes!("../../../assets/fonts/CascadiaMono.ttf");
 pub const INTER: &[u8] = include_bytes!("../../../assets/fonts/InterVariable.ttf");
 pub const INTER_ITALIC: &[u8] = include_bytes!("../../../assets/fonts/InterVariable-Italic.ttf");
@@ -132,37 +134,127 @@ fn load_installed_families() -> Vec<String> {
 
 /// Loads a font family for the terminal grid.
 ///
-/// Returns the font file bytes plus the face index within that file, or `None`
-/// when no installed face matches `family`. Typographic and legacy family
-/// names are both considered by `fontdb`; matching here is case-insensitive.
+/// Returns the regular font file bytes plus the face index within that file,
+/// or `None` when no installed face matches `family`. Typographic and legacy
+/// family names are both considered by `fontdb`; matching here is
+/// case-insensitive.
 pub fn load_terminal_font(family: &str) -> Option<(Vec<u8>, u32)> {
+    let font = load_terminal_font_faces(family)?;
+    Some(((*font.regular.data).clone(), font.regular.index))
+}
+
+/// The regular and real styled faces of one terminal font family.
+#[derive(Clone)]
+pub struct TerminalFont {
+    pub regular: FontFace,
+    pub bold: Option<FontFace>,
+    pub italic: Option<FontFace>,
+    pub bold_italic: Option<FontFace>,
+}
+
+/// Loads a terminal family together with any real bold and italic faces.
+///
+/// A family that only ships one face (or a variable font whose bold comes from
+/// the `wght` axis) returns `None` for the styles it does not install; the
+/// atlas synthesizes those styles instead.
+pub fn load_terminal_font_faces(family: &str) -> Option<TerminalFont> {
     let requested = family.trim();
     if requested.is_empty() {
         return None;
     }
 
     let db = database();
+    let resolved = resolve_family(db, requested)?;
+    let regular = load_face(
+        db,
+        &resolved,
+        fontdb::Weight::NORMAL,
+        fontdb::Style::Normal,
+        false,
+        false,
+    )?;
 
-    // `fontdb` matches names exactly, so resolve the requested spelling first.
-    let resolved = db
-        .faces()
+    Some(TerminalFont {
+        regular,
+        bold: load_face(
+            db,
+            &resolved,
+            fontdb::Weight::BOLD,
+            fontdb::Style::Normal,
+            true,
+            false,
+        ),
+        italic: load_face(
+            db,
+            &resolved,
+            fontdb::Weight::NORMAL,
+            fontdb::Style::Italic,
+            false,
+            true,
+        ),
+        bold_italic: load_face(
+            db,
+            &resolved,
+            fontdb::Weight::BOLD,
+            fontdb::Style::Italic,
+            true,
+            true,
+        ),
+    })
+}
+
+/// Resolves a user-supplied family spelling to the installed family name.
+fn resolve_family(db: &fontdb::Database, requested: &str) -> Option<String> {
+    db.faces()
         .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
         .find(|name| *name == requested)
         .or_else(|| {
             db.faces()
                 .flat_map(|face| face.families.iter().map(|(name, _)| name.as_str()))
                 .find(|name| name.eq_ignore_ascii_case(requested))
-        })?;
+        })
+        .map(str::to_owned)
+}
 
-    let families = [fontdb::Family::Name(resolved)];
+/// Loads one face and rejects a closest-weight fallback that is not actually
+/// the requested style (for example a regular face when bold was asked for).
+fn load_face(
+    db: &fontdb::Database,
+    family: &str,
+    weight: fontdb::Weight,
+    style: fontdb::Style,
+    bold: bool,
+    italic: bool,
+) -> Option<FontFace> {
+    let families = [fontdb::Family::Name(family)];
     let query = fontdb::Query {
         families: &families,
-        weight: fontdb::Weight::NORMAL,
+        weight,
         stretch: fontdb::Stretch::Normal,
-        style: fontdb::Style::Normal,
+        style,
     };
     let id = db.query(&query)?;
-    db.with_face_data(id, |data, index| (data.to_vec(), index))
+    let face = db.face(id)?;
+
+    if !face
+        .families
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(family))
+    {
+        return None;
+    }
+    let is_italic = matches!(face.style, fontdb::Style::Italic | fontdb::Style::Oblique);
+    if italic != is_italic {
+        return None;
+    }
+    if bold && face.weight < fontdb::Weight(600) {
+        return None;
+    }
+    if italic && !bold && face.weight >= fontdb::Weight(600) {
+        return None;
+    }
+
+    db.with_face_data(id, |data, index| FontFace::new(data.to_vec(), index))
 }
 
 #[cfg(test)]
@@ -276,6 +368,47 @@ mod tests {
         assert!(
             swash::FontRef::from_index(&data, index as usize).is_some(),
             "{family:?} face index {index} is not readable"
+        );
+    }
+
+    #[test]
+    fn test_load_terminal_font_faces_nerd_font_styles() {
+        let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+            return;
+        };
+        let user_fonts = std::path::PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("Windows")
+            .join("Fonts");
+        let installed = user_fonts.join("CaskaydiaCoveNerdFont-Regular.ttf");
+        if !installed.is_file() {
+            eprintln!("skipping styled-face assertion: Nerd Font is not installed");
+            return;
+        }
+
+        let font =
+            load_terminal_font_faces("CaskaydiaCove Nerd Font").expect("Nerd Font should load");
+        let bold = font.bold.expect("Nerd Font should load its Bold face");
+        let italic = font.italic.expect("Nerd Font should load its Italic face");
+        let bold_italic = font
+            .bold_italic
+            .expect("Nerd Font should load its BoldItalic face");
+
+        for (label, face) in [
+            ("regular", &font.regular),
+            ("bold", &bold),
+            ("italic", &italic),
+            ("bold italic", &bold_italic),
+        ] {
+            assert!(
+                swash::FontRef::from_index(&face.data, face.index as usize).is_some(),
+                "{label} face index {} is not readable",
+                face.index
+            );
+        }
+        assert!(
+            !Arc::ptr_eq(&font.regular.data, &bold.data),
+            "Bold should be a separate static font file"
         );
     }
 

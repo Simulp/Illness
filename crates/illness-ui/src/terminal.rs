@@ -1882,6 +1882,14 @@ mod tests {
     }
 
     #[test]
+    fn cell_flags_map_to_glyph_styles() {
+        assert_eq!(glyph_style(CellFlags::empty()), GlyphStyle::Regular);
+        assert_eq!(glyph_style(CellFlags::BOLD), GlyphStyle::Bold);
+        assert_eq!(glyph_style(CellFlags::ITALIC), GlyphStyle::Italic);
+        assert_eq!(glyph_style(CellFlags::BOLD_ITALIC), GlyphStyle::BoldItalic);
+    }
+
+    #[test]
     fn scroll_target_accumulates_three_lines_per_notch() {
         assert_eq!(apply_wheel(0, 3), 9);
         assert_eq!(apply_wheel(9, -2), 3);

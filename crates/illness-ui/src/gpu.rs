@@ -1344,6 +1344,48 @@ mod tests {
         }
     }
 
+    /// Bold and regular must occupy separate atlas slots, and the GPU upload
+    /// must match the CPU mask byte for byte. A regular `i` reused for bold
+    /// would silently drop the bold face.
+    #[test]
+    fn bold_glyph_has_its_own_slot_and_cpu_matching_upload() {
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 18.0, 1.0);
+        let mut cache = GlyphCache::new();
+        cache.begin_frame(atlas.metrics(), 1.0);
+
+        let regular = cache
+            .slot(&mut atlas, 'i', GlyphStyle::Regular)
+            .expect("packed regular i");
+        let regular_upload = cache.uploads.last().expect("regular upload").data.clone();
+        let bold = cache
+            .slot(&mut atlas, 'i', GlyphStyle::Bold)
+            .expect("packed bold i");
+        let bold_upload = cache.uploads.last().expect("bold upload").data.clone();
+
+        assert_eq!(cache.uploads.len(), 2, "bold reused the regular glyph slot");
+        assert!(
+            regular.x != bold.x || regular.y != bold.y,
+            "bold and regular share an atlas position"
+        );
+        assert_ne!(
+            regular_upload, bold_upload,
+            "bold uploaded the regular mask"
+        );
+
+        for (slot, upload, style) in [
+            (regular, regular_upload, GlyphStyle::Regular),
+            (bold, bold_upload, GlyphStyle::Bold),
+        ] {
+            let soft = atlas.soft_glyph('i', style).expect("soft glyph");
+            assert_eq!(upload.len(), soft.data.len() * 4);
+            for (&coverage, pixel) in soft.data.iter().zip(upload.as_chunks::<4>().0) {
+                assert_eq!(pixel, &[coverage, coverage, coverage, 255]);
+            }
+            assert_eq!(slot.width as usize * slot.height as usize, soft.data.len());
+        }
+    }
+
     /// The 1-texel gutter between shelf tiles keeps nearest sampling from
     /// reading a neighbor when a quad is drawn at a rounded edge.
     #[test]
