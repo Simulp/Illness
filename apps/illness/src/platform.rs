@@ -257,6 +257,68 @@ pub fn current_wallpaper_path() -> Option<PathBuf> {
     None
 }
 
+/// Add up DWM composition and the user's transparency-effects setting.
+///
+/// A missing `EnableTransparency` value predates the setting and defaults to
+/// enabled. `Some(0)` is the only value that disables the effects.
+#[cfg(target_os = "windows")]
+fn transparency_allowed(composition_enabled: bool, enable_transparency: Option<u32>) -> bool {
+    composition_enabled && enable_transparency != Some(0)
+}
+
+/// Whether Windows will actually draw a native Mica/Acrylic backdrop.
+///
+/// Surface alpha capabilities only prove that a transparent backbuffer can be
+/// created; they say nothing about DWM. `apply_mica` can also return `S_OK`
+/// while Settings > Personalization > Colors > Transparency effects is off,
+/// leaving an opaque window behind the material. Require DWM composition and
+/// the per-user transparency value as well.
+#[cfg(target_os = "windows")]
+pub fn transparency_effects_enabled() -> bool {
+    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Graphics::Dwm::DwmIsCompositionEnabled;
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW};
+
+    let mut composition: windows_sys::core::BOOL = 0;
+    // Safety: `composition` is a live BOOL and the call only writes to it.
+    let result = unsafe { DwmIsCompositionEnabled(&mut composition) };
+    let composition_enabled = result >= 0 && composition != 0;
+
+    let key_path: Vec<u16> = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let value_name: Vec<u16> = "EnableTransparency"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut value: u32 = 1;
+    let mut size = u32::try_from(std::mem::size_of::<u32>()).unwrap_or(4);
+    // Safety: both strings are null-terminated, `value` is a live u32, and
+    // `size` is its size in bytes. RRF_RT_REG_DWORD makes the API reject a
+    // value of another type instead of writing past the buffer.
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key_path.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_DWORD,
+            std::ptr::null_mut(),
+            (&raw mut value).cast(),
+            &mut size,
+        )
+    };
+    let enable_transparency = (status == ERROR_SUCCESS).then_some(value);
+
+    transparency_allowed(composition_enabled, enable_transparency)
+}
+
+/// Native materials are Windows-only.
+#[cfg(not(target_os = "windows"))]
+pub fn transparency_effects_enabled() -> bool {
+    false
+}
+
 /// Apply the requested backdrop to `window`.
 ///
 /// `theme_bg` is the theme background tint used by the legacy acrylic accent;
@@ -489,8 +551,20 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
-    use super::acrylic_tint;
+    use super::{acrylic_tint, transparency_allowed};
     use illness_core::Rgb;
+
+    #[test]
+    fn transparency_requires_composition_and_the_user_setting() {
+        assert!(!transparency_allowed(false, None));
+        assert!(!transparency_allowed(false, Some(1)));
+        assert!(
+            transparency_allowed(true, None),
+            "missing value defaults on"
+        );
+        assert!(transparency_allowed(true, Some(1)));
+        assert!(!transparency_allowed(true, Some(0)));
+    }
 
     #[test]
     fn acrylic_tint_alpha_follows_opacity() {

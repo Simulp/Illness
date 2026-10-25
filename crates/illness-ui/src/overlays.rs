@@ -625,6 +625,7 @@ pub fn show_settings_panel(
     theme: &Theme,
     config: &mut Config,
     state: &mut OverlayState,
+    backdrop_present: bool,
 ) -> bool {
     let mut changed = false;
 
@@ -666,7 +667,8 @@ pub fn show_settings_panel(
                             .max_height(ui.available_height())
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                changed |= appearance_section(ui, tokens, config, state);
+                                changed |=
+                                    appearance_section(ui, tokens, config, state, backdrop_present);
                                 changed |= terminal_section(ui, tokens, config);
                                 changed |= profiles_section(ui, tokens, config, state);
                                 about_section(ui, tokens, theme, state);
@@ -684,6 +686,7 @@ fn appearance_section(
     tokens: &Tokens,
     config: &mut Config,
     state: &mut OverlayState,
+    backdrop_present: bool,
 ) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Appearance");
@@ -756,7 +759,8 @@ fn appearance_section(
             .inner;
     }
 
-    let opacity_enabled = background_opacity_enabled(config.material, config.background);
+    let opacity_enabled =
+        background_opacity_enabled(config.material, config.background, backdrop_present);
     changed |= setting_row(ui, tokens, "Background opacity", |ui| {
         ui.add_enabled_ui(opacity_enabled, |ui| {
             ui.spacing_mut().slider_width = 150.0;
@@ -786,11 +790,14 @@ fn appearance_section(
             "Solid paints an opaque theme background. Choose Mica or Acrylic to use a wallpaper.",
         );
     } else if !opacity_enabled {
-        muted_label(
-            ui,
-            tokens,
-            "Mica with no background ignores opacity. Choose Desktop or Image, or use Acrylic, to enable it.",
-        );
+        let message = if config.material == Material::Mica
+            && config.background == BackgroundMode::Image
+        {
+            "The image could not be loaded, so Mica paints only its native backdrop and ignores opacity."
+        } else {
+            "Mica with no background ignores opacity. Choose Desktop or Image, or use Acrylic, to enable it."
+        };
+        muted_label(ui, tokens, message);
     } else {
         muted_label(
             ui,
@@ -973,13 +980,25 @@ pub fn background_controls_enabled(material: Material) -> bool {
 
 /// Whether the opacity slider has any visible effect.
 ///
-/// Solid ignores it. Mica with no background paints only the native Mica
-/// backdrop, which has no opacity hook (the slider previously looked live but
-/// changed nothing). Acrylic keeps working even with `None` because the accent
-/// tint consumes the opacity.
-fn background_opacity_enabled(material: Material, mode: BackgroundMode) -> bool {
-    background_controls_enabled(material)
-        && !(material == Material::Mica && mode == BackgroundMode::None)
+/// Solid ignores it. Mica consumes opacity only through a painted backdrop:
+/// no background paints only the native Mica backdrop, and an Image whose
+/// decode failed has nothing to paint. Acrylic keeps working even with `None`
+/// because the accent tint consumes the opacity. `backdrop_present` is whether
+/// the app currently holds a backdrop texture.
+fn background_opacity_enabled(
+    material: Material,
+    mode: BackgroundMode,
+    backdrop_present: bool,
+) -> bool {
+    match material {
+        Material::Solid => false,
+        Material::Acrylic => true,
+        Material::Mica => match mode {
+            BackgroundMode::None => false,
+            BackgroundMode::Desktop => true,
+            BackgroundMode::Image => backdrop_present,
+        },
+    }
 }
 
 /// Copy a chosen image into `%APPDATA%\illness\backgrounds` under a safe,
@@ -1840,34 +1859,46 @@ mod tests {
     }
 
     #[test]
-    fn opacity_is_disabled_only_for_mica_without_a_backdrop() {
+    fn opacity_requires_a_painted_backdrop_or_the_acrylic_accent() {
         assert!(!background_opacity_enabled(
             Material::Mica,
-            BackgroundMode::None
+            BackgroundMode::None,
+            false
         ));
         assert!(background_opacity_enabled(
             Material::Mica,
-            BackgroundMode::Desktop
+            BackgroundMode::Desktop,
+            false
+        ));
+        // An Image whose decode failed paints only native Mica.
+        assert!(!background_opacity_enabled(
+            Material::Mica,
+            BackgroundMode::Image,
+            false
         ));
         assert!(background_opacity_enabled(
             Material::Mica,
-            BackgroundMode::Image
+            BackgroundMode::Image,
+            true
         ));
-        assert!(background_opacity_enabled(
-            Material::Acrylic,
-            BackgroundMode::None
-        ));
-        assert!(background_opacity_enabled(
-            Material::Acrylic,
-            BackgroundMode::Desktop
+        // Acrylic's accent tint consumes opacity even without a texture.
+        for mode in [
+            BackgroundMode::Desktop,
+            BackgroundMode::Image,
+            BackgroundMode::None,
+        ] {
+            assert!(background_opacity_enabled(Material::Acrylic, mode, false));
+            assert!(background_opacity_enabled(Material::Acrylic, mode, true));
+        }
+        assert!(!background_opacity_enabled(
+            Material::Solid,
+            BackgroundMode::Desktop,
+            true
         ));
         assert!(!background_opacity_enabled(
             Material::Solid,
-            BackgroundMode::Desktop
-        ));
-        assert!(!background_opacity_enabled(
-            Material::Solid,
-            BackgroundMode::None
+            BackgroundMode::None,
+            false
         ));
     }
 

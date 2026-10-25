@@ -265,6 +265,14 @@ impl Host {
         let Some(window) = self.window.clone() else {
             return;
         };
+        // A buffered `RedrawRequested` can still arrive after minimize. A
+        // paint then sees the 160x28 minimized client area and reflows the
+        // terminal to a 1-row grid. The forced resize/redraw on restore paints
+        // the restored size instead.
+        if window.is_minimized().unwrap_or(false) {
+            log::debug!("redraw ignored while minimized");
+            return;
+        }
         let Some(state) = self.state.as_mut() else {
             return;
         };
@@ -393,53 +401,66 @@ impl ApplicationHandler<UserEvent> for Host {
 
         match event {
             WindowEvent::RedrawRequested => self.redraw(event_loop),
-            WindowEvent::Resized(_) => {
+            WindowEvent::Resized(event_size) => {
                 if let Some(state) = self.state.as_mut() {
                     let _ = state.on_window_event(&window, &event);
                 }
-                // Winit can deliver a stale size; query the live client area.
-                // A zero size is winit's minimize marker on Windows; there is
-                // no surface to resize in that case. Windows can also replay a
+                // winit reports `Resized(0, 0)` when Windows minimizes or
+                // hides the window, but `inner_size()` on Windows 11 reports
+                // the 160x28 client area of the minimized window. Use the
+                // event for the zero/minimized test; query the live client
+                // area only for a real resize. Windows can also replay a
                 // buffered `WM_SIZE` for the current size: resizing and
-                // repainting then would multiply paints during a resize storm.
-                let size = window.inner_size();
-                if size.width == 0 || size.height == 0 {
-                    self.restore_pending = true;
-                    log::debug!(
-                        "surface minimized or hidden: {}x{} (surface {:?})",
-                        size.width,
-                        size.height,
-                        self.last_surface_size
-                    );
-                    return;
-                }
-                // A restore after minimize may report the pre-minimize size.
-                // That still needs one resize/repaint pass: otherwise the
-                // dedupe below would swallow the only restore paint.
-                let restored = std::mem::take(&mut self.restore_pending);
-                let Some((width, height)) =
-                    changed_surface_size(self.last_surface_size, restored, size.width, size.height)
-                else {
-                    log::debug!(
-                        "resize event ignored: {}x{} (surface {:?})",
-                        size.width,
-                        size.height,
-                        self.last_surface_size
-                    );
-                    return;
-                };
-                log::debug!(
-                    "surface resized {:?} -> {}x{} (restore={restored})",
+                // repainting then would multiply paints during a resize
+                // storm.
+                let minimized = window.is_minimized().unwrap_or(false);
+                let live = window.inner_size();
+                match surface_resize(
                     self.last_surface_size,
-                    width.get(),
-                    height.get()
-                );
-                self.painter
-                    .on_window_resized(ViewportId::ROOT, width, height);
-                self.last_surface_size = Some((width.get(), height.get()));
-                // Paint once now so the swapchain is never presented at the
-                // old size while a redraw is still pending.
-                self.redraw(event_loop);
+                    self.restore_pending,
+                    minimized,
+                    (event_size.width, event_size.height),
+                    (live.width, live.height),
+                ) {
+                    SurfaceResize::Deferred => {
+                        self.restore_pending = true;
+                        log::debug!(
+                            "surface minimized or hidden: event {}x{}, live {}x{} (surface {:?})",
+                            event_size.width,
+                            event_size.height,
+                            live.width,
+                            live.height,
+                            self.last_surface_size
+                        );
+                    }
+                    SurfaceResize::Ignore => {
+                        log::debug!(
+                            "resize event ignored: {}x{} (surface {:?})",
+                            live.width,
+                            live.height,
+                            self.last_surface_size
+                        );
+                    }
+                    SurfaceResize::Resize(width, height) => {
+                        // A restore after minimize may report the
+                        // pre-minimize size. That still needs one
+                        // resize/repaint pass: otherwise the unchanged-size
+                        // dedupe would swallow the only restore paint.
+                        let restored = std::mem::take(&mut self.restore_pending);
+                        log::debug!(
+                            "surface resized {:?} -> {}x{} (restore={restored})",
+                            self.last_surface_size,
+                            width.get(),
+                            height.get()
+                        );
+                        self.painter
+                            .on_window_resized(ViewportId::ROOT, width, height);
+                        self.last_surface_size = Some((width.get(), height.get()));
+                        // Paint once now so the swapchain is never presented
+                        // at the old size while a redraw is still pending.
+                        self.redraw(event_loop);
+                    }
+                }
             }
             WindowEvent::ScaleFactorChanged { .. } => {
                 if let Some(state) = self.state.as_mut() {
@@ -576,19 +597,44 @@ fn cancel_close_requested(commands: &[ViewportCommand]) -> bool {
             .any(|command| matches!(command, ViewportCommand::CancelClose))
 }
 
-/// Return the surface size when a non-zero size differs from the one already
-/// applied, or when this is the first restore after a minimize/hide. Zero is
-/// winit's minimize marker; an equal size is a buffered `WM_SIZE` replay
-/// except when `restored` demands one repaint at the unchanged size.
-fn changed_surface_size(
+/// What a `Resized` event should do to the swapchain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SurfaceResize {
+    /// A zero-sized or minimized event. Do not touch the surface; remember
+    /// that the next real event must repaint.
+    Deferred,
+    /// A buffered `WM_SIZE` replay of the size already applied.
+    Ignore,
+    /// Resize to these non-zero live client-area dimensions and repaint.
+    Resize(NonZeroU32, NonZeroU32),
+}
+
+/// Decide whether a `Resized` event resizes the surface.
+///
+/// `event` is winit's reported size and `live` is `Window::inner_size()`.
+/// winit sends `(0, 0)` on minimize, while `inner_size()` can still report a
+/// non-zero minimized client area (160x28 on Windows 11), so the event and
+/// [`Window::is_minimized`] decide whether the surface may be resized. A
+/// real resize uses the live size. The first non-zero event after a
+/// minimize/hide always resizes and repaints, even at an unchanged size.
+fn surface_resize(
     last: Option<(u32, u32)>,
-    restored: bool,
-    width: u32,
-    height: u32,
-) -> Option<(NonZeroU32, NonZeroU32)> {
-    let width = NonZeroU32::new(width)?;
-    let height = NonZeroU32::new(height)?;
-    (restored || last != Some((width.get(), height.get()))).then_some((width, height))
+    restore_pending: bool,
+    minimized: bool,
+    event: (u32, u32),
+    live: (u32, u32),
+) -> SurfaceResize {
+    if minimized || event.0 == 0 || event.1 == 0 {
+        return SurfaceResize::Deferred;
+    }
+    let (Some(width), Some(height)) = (NonZeroU32::new(live.0), NonZeroU32::new(live.1)) else {
+        return SurfaceResize::Deferred;
+    };
+    if restore_pending || last != Some((width.get(), height.get())) {
+        SurfaceResize::Resize(width, height)
+    } else {
+        SurfaceResize::Ignore
+    }
 }
 
 fn clear_repaint_deadline(deadline: &Mutex<Option<Instant>>) {
@@ -622,16 +668,24 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
     match render_state.instance.create_surface(Arc::clone(window)) {
         Ok(surface) => {
             let modes = surface.get_capabilities(&render_state.adapter).alpha_modes;
-            let (chosen, transparent) = if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied)
-            {
-                ("PreMultiplied", true)
-            } else if modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-                ("PostMultiplied", true)
-            } else {
-                ("Auto (no transparent mode)", false)
-            };
-            log::info!("surface alpha modes {modes:?}; transparent backbuffer: {chosen}");
-            transparent
+            let (chosen, alpha_transparent) =
+                if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
+                    ("PreMultiplied", true)
+                } else if modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
+                    ("PostMultiplied", true)
+                } else {
+                    ("Auto (no transparent mode)", false)
+                };
+            // wgpu-hal reports PreMultiplied from the DXGI format list, not
+            // from whether DWM will composite the result. A transparent
+            // backbuffer with transparency effects off (or composition
+            // disabled) still presents an opaque window, so both are needed.
+            let effects_enabled = crate::platform::transparency_effects_enabled();
+            log::info!(
+                "surface alpha modes {modes:?}; transparent backbuffer: {chosen}; \
+                 Windows transparency effects: {effects_enabled}"
+            );
+            alpha_transparent && effects_enabled
         }
         Err(error) => {
             log::warn!("failed to query surface alpha modes: {error}");
@@ -642,8 +696,15 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{cancel_close_requested, changed_surface_size};
+    use super::{SurfaceResize, cancel_close_requested, surface_resize};
     use egui::ViewportCommand;
+
+    fn resized(width: u32, height: u32) -> SurfaceResize {
+        SurfaceResize::Resize(
+            std::num::NonZeroU32::new(width).expect("width"),
+            std::num::NonZeroU32::new(height).expect("height"),
+        )
+    }
 
     #[test]
     fn close_wins_over_cancel_close_in_the_same_pass() {
@@ -659,32 +720,64 @@ mod tests {
     #[test]
     fn surface_size_change_dedupes_replays_and_skips_zero() {
         assert_eq!(
-            changed_surface_size(None, false, 1180, 760).map(|(w, h)| (w.get(), h.get())),
-            Some((1180, 760))
+            surface_resize(None, false, false, (1180, 760), (1180, 760)),
+            resized(1180, 760)
         );
-        assert!(changed_surface_size(Some((1180, 760)), false, 1180, 760).is_none());
-        assert!(changed_surface_size(Some((1180, 760)), false, 0, 0).is_none());
-        assert!(changed_surface_size(Some((1180, 760)), false, 0, 400).is_none());
         assert_eq!(
-            changed_surface_size(Some((1180, 760)), false, 800, 600)
-                .map(|(w, h)| (w.get(), h.get())),
-            Some((800, 600))
+            surface_resize(Some((1180, 760)), false, false, (1180, 760), (1180, 760)),
+            SurfaceResize::Ignore
+        );
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, false, (0, 0), (160, 28)),
+            SurfaceResize::Deferred
+        );
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, false, (0, 400), (0, 400)),
+            SurfaceResize::Deferred
+        );
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, false, (800, 600), (800, 600)),
+            resized(800, 600)
+        );
+    }
+
+    #[test]
+    fn minimized_events_never_resize_to_the_live_client_area() {
+        // winit says 0x0 while Windows 11's inner_size() reports 160x28.
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, true, (0, 0), (160, 28)),
+            SurfaceResize::Deferred
+        );
+        // Even a non-zero event must not resize while IsIconic is true.
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, true, (1180, 760), (160, 28)),
+            SurfaceResize::Deferred
+        );
+    }
+
+    #[test]
+    fn real_resizes_use_the_live_size_not_the_event_size() {
+        assert_eq!(
+            surface_resize(Some((1180, 760)), false, false, (100, 100), (800, 600)),
+            resized(800, 600),
+            "the buffered event size is stale; the client area is authoritative"
         );
     }
 
     #[test]
     fn restore_after_minimize_repaints_at_an_unchanged_size() {
         assert_eq!(
-            changed_surface_size(Some((1180, 760)), true, 1180, 760)
-                .map(|(w, h)| (w.get(), h.get())),
-            Some((1180, 760))
+            surface_resize(Some((1180, 760)), true, false, (1180, 760), (1180, 760)),
+            resized(1180, 760)
         );
         assert_eq!(
-            changed_surface_size(Some((1180, 760)), true, 800, 600)
-                .map(|(w, h)| (w.get(), h.get())),
-            Some((800, 600))
+            surface_resize(Some((1180, 760)), true, false, (800, 600), (800, 600)),
+            resized(800, 600)
         );
         // A zero-size marker is still not applicable.
-        assert!(changed_surface_size(Some((1180, 760)), true, 0, 760).is_none());
+        assert_eq!(
+            surface_resize(Some((1180, 760)), true, false, (0, 760), (0, 760)),
+            SurfaceResize::Deferred
+        );
     }
 }

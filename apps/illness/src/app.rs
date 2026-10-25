@@ -106,6 +106,12 @@ pub struct IllnessApp {
     applied_ppp: f32,
     applied_line_height: f32,
     applied_material: Material,
+    /// The material the user asked for. Unlike `config.material`, this keeps
+    /// the original choice when this session falls back to Solid so the next
+    /// healthy launch can retry it.
+    requested_material: Material,
+    /// True while `config.material` is a session-only Solid fallback.
+    material_fallback: bool,
     /// `(mode, path)` that produced the current backdrop texture.
     applied_background: Option<(BackgroundMode, String)>,
     applied_background_opacity: f32,
@@ -171,6 +177,7 @@ impl IllnessApp {
         }
         let line_height = config.line_height;
         let background_opacity = config.background_opacity;
+        let config_material = config.material;
         let gpu_text = if config.gpu_text {
             render_state.map(|state| Arc::new(GpuText::new(state)))
         } else {
@@ -205,6 +212,8 @@ impl IllnessApp {
             applied_ppp: 0.0,
             applied_line_height: line_height,
             applied_material: Material::Mica,
+            requested_material: config_material,
+            material_fallback: false,
             applied_background: None,
             applied_background_opacity: background_opacity,
             font_failure: None,
@@ -221,7 +230,9 @@ impl IllnessApp {
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
         app.apply_material_to(window.as_ref());
-        app.rebuild_backdrop();
+        // Startup may prewarm an acrylic desktop texture for a later switch;
+        // runtime material changes never do (see `sync_backdrop_for_material`).
+        app.rebuild_backdrop(true);
         app.open_tab(None);
         app
     }
@@ -409,14 +420,24 @@ impl IllnessApp {
         let dark = !self.theme.is_light();
         let theme_bg = self.theme.bg;
         let opacity = self.config.background_opacity;
-        let requested = self.config.material;
+        // `config.material` may already be the session's Solid fallback. A
+        // replay must not overwrite the user's request with that Solid; a real
+        // user change (to a non-Solid material) becomes the new request.
+        let requested = if self.material_fallback && self.config.material == Material::Solid {
+            self.requested_material
+        } else {
+            self.config.material
+        };
+        self.requested_material = requested;
+        let attempted_native = self.config.material != Material::Solid;
         let (effective, native_unavailable) =
-            material_for_surface(requested, self.native_transparency);
+            material_for_surface(self.config.material, self.native_transparency);
+        let mut fell_back = native_unavailable;
         if native_unavailable {
             self.config.material = effective;
             self.overlays.toast = Some("Native materials unavailable; using Solid".to_string());
             log::warn!(
-                "surface has no transparent alpha mode; {} forced to Solid",
+                "surface alpha or Windows transparency effects unavailable; {} forced to Solid",
                 material_name(requested)
             );
         }
@@ -426,6 +447,9 @@ impl IllnessApp {
                 material_name(effective)
             );
             self.config.material = Material::Solid;
+            if attempted_native {
+                fell_back = true;
+            }
             if let Err(error) = platform::apply(window, Material::Solid, dark, theme_bg, opacity) {
                 log::warn!("solid material unavailable: {error}");
             }
@@ -439,9 +463,14 @@ impl IllnessApp {
                 material_name(effective)
             );
         }
+        // A successful native apply clears an earlier fallback; replaying the
+        // session's Solid does not change it.
+        if attempted_native {
+            self.material_fallback = fell_back;
+        }
         self.applied_material = self.config.material;
-        // A failed native material leaves any prewarmed texture unused. Drop
-        // it without decoding or toasting.
+        // A fallback to Solid leaves any prewarmed texture unused; drop it
+        // without decoding or toasting. Acrylic+Desktop keeps its texture.
         self.drop_unneeded_backdrop();
         // The panel fill follows the material: opaque for Solid, transparent
         // so the native backdrop can show through otherwise. This also covers
@@ -455,30 +484,46 @@ impl IllnessApp {
     /// Called only when the mode, path, a gradient-producing theme, or the
     /// material changes; opacity is applied at paint time. Images are decoded
     /// once per `(path, mtime)` and rejected when larger than the texture cap.
-    /// A pair that paints no backdrop -- Solid, or any material with
-    /// `BackgroundMode::None` -- returns immediately without decoding.
+    /// A pair that paints no backdrop -- Solid, any material with
+    /// `BackgroundMode::None`, or Acrylic+Desktop -- returns without decoding.
     ///
-    /// Acrylic+Desktop also keeps a prewarmed texture even though the paint
-    /// guard suppresses it. The first switch away from native Acrylic then
-    /// reuses the path+mtime cache instead of paying for a cold wallpaper
-    /// decode in the middle of a frame. Startup thereby avoids the decode for
-    /// Solid but keeps the accepted Acrylic+Desktop prewarm.
-    fn rebuild_backdrop(&mut self) {
+    /// `prewarm` is true only for the initial startup build, where
+    /// Acrylic+Desktop may still decode the wallpaper for a later switch. A
+    /// runtime material change must not pay that decode: entering
+    /// Acrylic+Desktop keeps whatever texture already exists and builds
+    /// nothing. The first switch away from native Acrylic reuses the
+    /// path+mtime cache, so leaving Acrylic stays fast.
+    fn rebuild_backdrop(&mut self, prewarm: bool) {
         let mode = self.config.background;
         let path = self.config.background_path.clone();
-        if !needs_backdrop(self.config.material, mode) {
-            // Solid never paints a texture and a None background has nothing
-            // to paint. Drop it without decoding the wallpaper or reporting a
-            // misleading image failure.
-            self.backdrop = None;
-            self.applied_background = Some((mode, path));
-            self.applied_background_opacity = self.config.background_opacity;
-            self.ctx.request_repaint();
-            log::debug!(
-                "backdrop skipped for {:?}+{mode:?}: not needed",
-                self.config.material
-            );
-            return;
+        match backdrop_plan(self.config.material, mode, prewarm) {
+            BackdropPlan::Drop => {
+                // Solid never paints a texture and a None background has
+                // nothing to paint. Drop it without decoding the wallpaper or
+                // reporting a misleading image failure.
+                self.backdrop = None;
+                self.applied_background = Some((mode, path));
+                self.applied_background_opacity = self.config.background_opacity;
+                self.ctx.request_repaint();
+                log::debug!(
+                    "backdrop dropped for {:?}+{mode:?}: not needed",
+                    self.config.material
+                );
+                return;
+            }
+            BackdropPlan::Keep => {
+                // Acrylic+Desktop paints native blur instead, but an existing
+                // texture is retained for a later switch to Mica/Image.
+                self.applied_background = Some((mode, path));
+                self.applied_background_opacity = self.config.background_opacity;
+                self.ctx.request_repaint();
+                log::debug!(
+                    "backdrop kept for {:?}+{mode:?}: not painted",
+                    self.config.material
+                );
+                return;
+            }
+            BackdropPlan::Build => {}
         }
 
         let started = std::time::Instant::now();
@@ -511,11 +556,11 @@ impl IllnessApp {
         );
     }
 
-    /// Drop a backdrop texture the current material/mode cannot paint.
+    /// Drop a backdrop texture the current material/mode cannot keep.
     ///
     /// Returns whether a texture was dropped. No decode or toast occurs.
     fn drop_unneeded_backdrop(&mut self) -> bool {
-        if needs_backdrop(self.config.material, self.config.background) || self.backdrop.is_none() {
+        if keeps_backdrop(self.config.material, self.config.background) || self.backdrop.is_none() {
             return false;
         }
         self.backdrop = None;
@@ -533,9 +578,10 @@ impl IllnessApp {
 
     /// Keep the in-window backdrop in step with a material change.
     ///
-    /// Entering Acrylic keeps the existing texture (the paint guard suppresses
-    /// it) and leaving Acrylic rebuilds only when the new pair actually paints
-    /// a backdrop. Leaving for Solid or None drops it without decoding.
+    /// Entering Acrylic+Desktop keeps the existing texture (native blur paints
+    /// instead) and never builds one. Leaving Acrylic rebuilds only when the
+    /// new pair actually paints a backdrop, reusing the path+mtime cache.
+    /// Leaving for Solid or None drops it without decoding.
     /// `background_changed` means `reapply_config` already rebuilt for the new
     /// background; rebuilding again here would decode the same wallpaper twice.
     fn sync_backdrop_for_material(&mut self, background_changed: bool) {
@@ -544,11 +590,11 @@ impl IllnessApp {
         if self.drop_unneeded_backdrop() {
             return;
         }
-        if !needs_backdrop(self.config.material, self.config.background) {
+        if background_changed || !paints_backdrop(self.config.material, self.config.background) {
             return;
         }
-        if !background_changed && (leaving_acrylic || self.backdrop.is_none()) {
-            self.rebuild_backdrop();
+        if leaving_acrylic || self.backdrop.is_none() {
+            self.rebuild_backdrop(false);
         }
     }
 
@@ -631,7 +677,7 @@ impl IllnessApp {
         let opacity_changed =
             (self.config.background_opacity - self.applied_background_opacity).abs() > f32::EPSILON;
         if background_changed {
-            self.rebuild_backdrop();
+            self.rebuild_backdrop(false);
         } else if opacity_changed {
             self.applied_background_opacity = self.config.background_opacity;
             self.ctx.request_repaint();
@@ -664,6 +710,9 @@ impl IllnessApp {
                 // reapplied: fall back exactly like a failed material apply.
                 log::warn!("failed to re-apply the acrylic tint: {error}");
                 self.config.material = Material::Solid;
+                // A session fallback, not a new user choice: persist the
+                // requested Acrylic so a healthy launch retries it.
+                self.material_fallback = true;
                 self.pending_material = true;
                 self.overlays.toast =
                     Some("Acrylic tint is unavailable here; using Solid".to_string());
@@ -683,6 +732,20 @@ impl IllnessApp {
             .request_repaint_after(Duration::from_millis(SAVE_DEBOUNCE_MS));
     }
 
+    /// Save the config, writing the user's requested material rather than a
+    /// session-only Solid fallback. `config.material` itself keeps driving the
+    /// live window and is restored after the write. Background mode and path
+    /// are never rewritten here, so a transient fallback keeps an Image
+    /// background for the next healthy launch.
+    fn save_config(&mut self) -> anyhow::Result<()> {
+        let live = self.config.material;
+        self.config.material =
+            material_to_persist(live, self.requested_material, self.material_fallback);
+        let result = self.config.save();
+        self.config.material = live;
+        result
+    }
+
     fn persist(&mut self) {
         self.save_debounce.clear();
         // An empty name only exists while its text field is being edited.
@@ -691,7 +754,7 @@ impl IllnessApp {
             log::debug!("skipping config save while a profile name is empty");
             return;
         }
-        if let Err(error) = self.config.save() {
+        if let Err(error) = self.save_config() {
             log::warn!("failed to save config: {error}");
             self.overlays.toast = Some(format!("Could not save config: {error}"));
         }
@@ -719,7 +782,7 @@ impl IllnessApp {
             profile.name = start;
         }
 
-        if let Err(error) = self.config.save() {
+        if let Err(error) = self.save_config() {
             log::warn!("failed to save config on exit: {error}");
         }
     }
@@ -1291,10 +1354,7 @@ impl IllnessApp {
         // Acrylic blurs the actual windows behind this one; painting the
         // desktop wallpaper here would hide that. Image backgrounds still
         // draw, because the user explicitly chose them.
-        if self.config.material != Material::Solid
-            && self.config.background != BackgroundMode::None
-            && !(self.config.material == Material::Acrylic
-                && self.config.background == BackgroundMode::Desktop)
+        if paints_backdrop(self.config.material, self.config.background)
             && let Some(backdrop) = &self.backdrop
         {
             let screen = ui.max_rect();
@@ -1363,13 +1423,20 @@ impl IllnessApp {
         let mut settings_changed = false;
 
         if settings_active {
+            let backdrop_present = self.backdrop.is_some();
             let tokens = &self.tokens;
             let theme = self.theme;
             let config = &mut self.config;
             let overlay_state = &mut self.overlays;
             egui::CentralPanel::no_frame().show(ui, |ui| {
-                settings_changed =
-                    overlays::show_settings_panel(ui, tokens, theme, config, overlay_state);
+                settings_changed = overlays::show_settings_panel(
+                    ui,
+                    tokens,
+                    theme,
+                    config,
+                    overlay_state,
+                    backdrop_present,
+                );
             });
         } else {
             let active = self.active;
@@ -1568,12 +1635,44 @@ fn material_for_surface(requested: Material, native_transparency: bool) -> (Mate
     }
 }
 
-/// Whether the app should hold an in-window backdrop texture for this
-/// material/mode pair. Acrylic+Desktop keeps a prewarmed texture but never
-/// paints it (native behind-window blur draws instead); Solid and None never
-/// need one.
-fn needs_backdrop(material: Material, mode: BackgroundMode) -> bool {
+/// Whether the app should keep an in-window backdrop texture for this
+/// material/mode pair. Acrylic+Desktop keeps one for a later switch but never
+/// paints it (native behind-window blur draws instead); Solid and None keep
+/// none.
+fn keeps_backdrop(material: Material, mode: BackgroundMode) -> bool {
     material != Material::Solid && mode != BackgroundMode::None
+}
+
+/// Whether this material/mode pair paints the in-window texture. This is the
+/// paint guard from [`IllnessApp::ui`]: native Acrylic+Desktop would hide the
+/// desktop blur behind a painted wallpaper.
+fn paints_backdrop(material: Material, mode: BackgroundMode) -> bool {
+    keeps_backdrop(material, mode)
+        && !(material == Material::Acrylic && mode == BackgroundMode::Desktop)
+}
+
+/// What a backdrop rebuild should do for this material/mode pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackdropPlan {
+    /// No texture is kept: Solid or `BackgroundMode::None`.
+    Drop,
+    /// Keep the current texture but decode nothing: Acrylic+Desktop.
+    Keep,
+    /// Decode (or reuse the path+mtime cache) and paint the texture.
+    Build,
+}
+
+/// Acrylic+Desktop is the only pair that keeps without painting. `prewarm`
+/// permits the accepted startup decode for an initial Acrylic+Desktop; runtime
+/// material changes pass `false` so entering that pair never decodes.
+fn backdrop_plan(material: Material, mode: BackgroundMode, prewarm: bool) -> BackdropPlan {
+    if paints_backdrop(material, mode) || (prewarm && keeps_backdrop(material, mode)) {
+        BackdropPlan::Build
+    } else if keeps_backdrop(material, mode) {
+        BackdropPlan::Keep
+    } else {
+        BackdropPlan::Drop
+    }
 }
 
 fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
@@ -1676,6 +1775,13 @@ fn material_name(material: Material) -> &'static str {
         Material::Acrylic => "Acrylic",
         Material::Solid => "Solid",
     }
+}
+
+/// Material to write to `config.toml`. A session fallback keeps the user's
+/// request; an intentional Solid was already copied into `requested_material`
+/// by `apply_material_to` and persists as Solid.
+fn material_to_persist(current: Material, requested: Material, fallback: bool) -> Material {
+    if fallback { requested } else { current }
 }
 
 fn next_material(material: Material) -> Material {
@@ -2347,15 +2453,87 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_is_needed_only_for_non_solid_materials_with_a_background() {
-        assert!(!needs_backdrop(Material::Solid, BackgroundMode::Desktop));
-        assert!(!needs_backdrop(Material::Solid, BackgroundMode::Image));
-        assert!(!needs_backdrop(Material::Solid, BackgroundMode::None));
+    fn backdrop_is_kept_only_for_non_solid_materials_with_a_background() {
+        assert!(!keeps_backdrop(Material::Solid, BackgroundMode::Desktop));
+        assert!(!keeps_backdrop(Material::Solid, BackgroundMode::Image));
+        assert!(!keeps_backdrop(Material::Solid, BackgroundMode::None));
         for material in [Material::Mica, Material::Acrylic] {
-            assert!(!needs_backdrop(material, BackgroundMode::None));
-            assert!(needs_backdrop(material, BackgroundMode::Desktop));
-            assert!(needs_backdrop(material, BackgroundMode::Image));
+            assert!(!keeps_backdrop(material, BackgroundMode::None));
+            assert!(keeps_backdrop(material, BackgroundMode::Desktop));
+            assert!(keeps_backdrop(material, BackgroundMode::Image));
         }
+    }
+
+    #[test]
+    fn acrylic_desktop_keeps_a_backdrop_but_never_paints_it() {
+        assert!(keeps_backdrop(Material::Acrylic, BackgroundMode::Desktop));
+        assert!(!paints_backdrop(Material::Acrylic, BackgroundMode::Desktop));
+        assert!(paints_backdrop(Material::Acrylic, BackgroundMode::Image));
+        assert!(!paints_backdrop(Material::Acrylic, BackgroundMode::None));
+        assert!(paints_backdrop(Material::Mica, BackgroundMode::Desktop));
+        assert!(paints_backdrop(Material::Mica, BackgroundMode::Image));
+        assert!(!paints_backdrop(Material::Solid, BackgroundMode::Image));
+    }
+
+    #[test]
+    fn entering_acrylic_desktop_at_runtime_never_decodes() {
+        // Solid -> Acrylic+Desktop: keep the (absent) texture, build nothing.
+        assert_eq!(
+            backdrop_plan(Material::Acrylic, BackgroundMode::Desktop, false),
+            BackdropPlan::Keep
+        );
+        // The accepted startup prewarm still builds.
+        assert_eq!(
+            backdrop_plan(Material::Acrylic, BackgroundMode::Desktop, true),
+            BackdropPlan::Build
+        );
+        // Leaving Acrylic for a painted pair rebuilds from the path+mtime
+        // cache.
+        assert_eq!(
+            backdrop_plan(Material::Mica, BackgroundMode::Desktop, false),
+            BackdropPlan::Build
+        );
+        assert_eq!(
+            backdrop_plan(Material::Mica, BackgroundMode::Image, false),
+            BackdropPlan::Build
+        );
+        // Solid and None drop without decoding.
+        assert_eq!(
+            backdrop_plan(Material::Solid, BackgroundMode::Desktop, false),
+            BackdropPlan::Drop
+        );
+        assert_eq!(
+            backdrop_plan(Material::Solid, BackgroundMode::Image, true),
+            BackdropPlan::Drop
+        );
+        assert_eq!(
+            backdrop_plan(Material::Acrylic, BackgroundMode::None, true),
+            BackdropPlan::Drop
+        );
+    }
+
+    #[test]
+    fn transient_material_fallback_persists_the_user_request() {
+        // A healthy session persists what is live.
+        assert_eq!(
+            material_to_persist(Material::Acrylic, Material::Acrylic, false),
+            Material::Acrylic
+        );
+        // An intentional Solid was copied into `requested_material`.
+        assert_eq!(
+            material_to_persist(Material::Solid, Material::Solid, false),
+            Material::Solid
+        );
+        // A session-only fallback writes the requested Mica/Acrylic/Image
+        // launch intent instead of Solid.
+        assert_eq!(
+            material_to_persist(Material::Solid, Material::Mica, true),
+            Material::Mica
+        );
+        assert_eq!(
+            material_to_persist(Material::Solid, Material::Acrylic, true),
+            Material::Acrylic
+        );
     }
 
     #[test]
