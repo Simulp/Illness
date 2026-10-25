@@ -59,6 +59,9 @@ pub struct Config {
     pub default_profile: String,
     pub copy_on_select: bool,
     pub profiles: Vec<Profile>,
+    /// Detected profile names the user removed or renamed away. They are
+    /// filtered out when built-in profiles are merged on the next launch.
+    pub hidden_profiles: Vec<String>,
     /// Draw terminal glyphs with the GPU compositor when a wgpu device is
     /// available. `false` always uses the CPU ClearType surface.
     pub gpu_text: bool,
@@ -82,6 +85,7 @@ impl Default for Config {
             default_profile: String::new(),
             copy_on_select: false,
             profiles: Vec::new(),
+            hidden_profiles: Vec::new(),
             gpu_text: true,
         }
         .sanitized()
@@ -100,7 +104,9 @@ impl Config {
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(contents) => match toml::from_str::<Self>(&contents) {
-                Ok(config) => config.sanitized(),
+                // Duplicate names are only collapsed when loading: doing it on
+                // every settings edit would delete a profile mid-rename.
+                Ok(config) => config.sanitized().deduplicated(),
                 Err(error) => {
                     log::warn!(
                         "failed to parse {}: {error}; using defaults",
@@ -163,7 +169,12 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("config.toml"))
     }
 
-    /// Clamp values into supported ranges, resolve the theme, and dedup profiles.
+    /// Clamp values into supported ranges and resolve the theme.
+    ///
+    /// Profile names are deliberately left untouched: this runs on every
+    /// settings frame, and deduplicating here would delete a profile while the
+    /// user is still typing its new name. Uniqueness is enforced by the editor,
+    /// while [`Self::deduplicated`] runs only when loading a file.
     pub fn sanitized(mut self) -> Self {
         if self.font_family.trim().is_empty() {
             self.font_family = "Cascadia Mono".to_string();
@@ -183,20 +194,91 @@ impl Config {
         self.theme = Theme::by_name(self.theme.trim()).name.to_string();
 
         let mut seen: Vec<String> = Vec::new();
-        self.profiles.retain(|profile| {
-            if seen
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(&profile.name))
+        self.hidden_profiles.retain(|name| {
+            let name = name.trim();
+            if name.is_empty()
+                || seen
+                    .iter()
+                    .any(|existing| existing.eq_ignore_ascii_case(name))
             {
                 false
             } else {
-                seen.push(profile.name.clone());
+                seen.push(name.to_string());
                 true
             }
         });
 
         self
     }
+
+    /// Collapse case-insensitive duplicate profile names, keeping the first.
+    ///
+    /// This is a load/merge-time operation, never an edit-time one.
+    pub fn deduplicated(mut self) -> Self {
+        dedupe_profiles(&mut self.profiles);
+        self
+    }
+
+    /// Rewrite `default_profile` when a profile is renamed from `old` to `new`.
+    ///
+    /// Keeping this in sync while the user types means a rename never leaves
+    /// the default pointing at a name that no longer exists.
+    pub fn note_profile_rename(&mut self, old: &str, new: &str) {
+        let new = new.trim();
+        if old.trim().is_empty() || new.is_empty() {
+            return;
+        }
+        if self.default_profile.eq_ignore_ascii_case(old.trim()) {
+            self.default_profile = new.to_string();
+        }
+    }
+
+    /// Remember a detected profile name that should not be merged back in.
+    pub fn hide_profile_name(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty()
+            || self
+                .hidden_profiles
+                .iter()
+                .any(|hidden| hidden.eq_ignore_ascii_case(name))
+        {
+            return;
+        }
+        self.hidden_profiles.push(name.to_string());
+    }
+
+    /// Whether `name` is already used by a profile other than `except`.
+    pub fn profile_name_taken(&self, name: &str, except: Option<usize>) -> bool {
+        let name = name.trim();
+        !name.is_empty()
+            && self.profiles.iter().enumerate().any(|(index, profile)| {
+                Some(index) != except && profile.name.trim().eq_ignore_ascii_case(name)
+            })
+    }
+
+    /// Whether every profile has a non-empty name. Empty names only exist
+    /// transiently while a text field is being edited.
+    pub fn has_empty_profile_name(&self) -> bool {
+        self.profiles
+            .iter()
+            .any(|profile| profile.name.trim().is_empty())
+    }
+}
+
+/// Collapse case-insensitive duplicate profile names, keeping the first.
+pub fn dedupe_profiles(profiles: &mut Vec<Profile>) {
+    let mut seen: Vec<String> = Vec::new();
+    profiles.retain(|profile| {
+        if seen
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(profile.name.trim()))
+        {
+            false
+        } else {
+            seen.push(profile.name.trim().to_string());
+            true
+        }
+    });
 }
 
 fn finite_or(value: f32, fallback: f32) -> f32 {
@@ -249,6 +331,7 @@ mod tests {
         assert!(config.default_profile.is_empty());
         assert!(!config.copy_on_select);
         assert!(config.profiles.is_empty());
+        assert!(config.hidden_profiles.is_empty());
         assert!(config.gpu_text);
     }
 
@@ -358,7 +441,6 @@ mod tests {
             line_height: 0.2,
             scrollback: 0,
             padding: -4.0,
-            profiles: vec![sample_profile("PowerShell"), sample_profile("powershell")],
             ..Config::default()
         }
         .sanitized();
@@ -368,7 +450,6 @@ mod tests {
         assert_eq!(config.line_height, 1.0);
         assert_eq!(config.scrollback, 10_000);
         assert_eq!(config.padding, 0.0);
-        assert_eq!(config.profiles.len(), 1);
 
         let high = Config {
             font_size: 200.0,
@@ -383,6 +464,85 @@ mod tests {
         assert_eq!(high.line_height, 2.0);
         assert_eq!(high.scrollback, 200_000);
         assert_eq!(high.padding, 32.0);
+    }
+
+    #[test]
+    fn sanitize_keeps_duplicate_profiles_until_load_or_merge() {
+        let config = Config {
+            profiles: vec![sample_profile("PowerShell"), sample_profile("powershell")],
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(
+            config.profiles.len(),
+            2,
+            "editing must not delete a profile with a colliding name"
+        );
+
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        config.save_to(&path).expect("save duplicated config");
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].name, "PowerShell");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rename_updates_the_default_profile() {
+        let mut config = Config {
+            profiles: vec![
+                sample_profile("PowerShell"),
+                sample_profile("Command Prompt"),
+            ],
+            default_profile: "PowerShell".to_string(),
+            ..Config::default()
+        };
+
+        config.note_profile_rename("PowerShell", "PS");
+        assert_eq!(config.default_profile, "PS");
+
+        // The caller passes both the previous committed name and the
+        // edit-start name, so consecutive keystrokes keep following the rename.
+        config.note_profile_rename("PS", "PS7");
+        assert_eq!(config.default_profile, "PS7");
+
+        config.note_profile_rename("Command Prompt", "cmd");
+        assert_eq!(config.default_profile, "PS7");
+
+        // Clearing a name mid-edit must not repoint the default.
+        config.note_profile_rename("PS7", "");
+        assert_eq!(config.default_profile, "PS7");
+    }
+
+    #[test]
+    fn hidden_profile_names_are_unique_and_roundtrip() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.hide_profile_name("PowerShell");
+        config.hide_profile_name(" powershell ");
+        config.hide_profile_name("Command Prompt");
+        assert_eq!(config.hidden_profiles, ["PowerShell", "Command Prompt"]);
+
+        config.save_to(&path).expect("save hidden profiles");
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded.hidden_profiles, config.hidden_profiles);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn duplicate_profile_names_are_reported() {
+        let config = Config {
+            profiles: vec![
+                sample_profile("PowerShell"),
+                sample_profile("Command Prompt"),
+            ],
+            ..Config::default()
+        };
+        assert!(config.profile_name_taken("powershell", Some(1)));
+        assert!(!config.profile_name_taken("powershell", Some(0)));
+        assert!(!config.profile_name_taken("", None));
     }
 
     #[test]

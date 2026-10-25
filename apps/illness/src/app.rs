@@ -25,6 +25,34 @@ const DEFAULT_FONT_SIZE: f32 = 18.0;
 const INITIAL_COLS: usize = 120;
 const INITIAL_ROWS: usize = 30;
 const BELL_FLASH_SECS: f64 = 0.18;
+/// Coalesce settings writes; live values still apply immediately.
+const SAVE_DEBOUNCE_MS: u64 = 300;
+
+/// Pending delayed config write. A pointer release flushes immediately so a
+/// click never waits for the timer.
+#[derive(Debug, Default)]
+struct SaveDebounce {
+    due: Option<f64>,
+}
+
+impl SaveDebounce {
+    fn mark(&mut self, now: f64) {
+        self.due = Some(now + SAVE_DEBOUNCE_MS as f64 / 1_000.0);
+    }
+
+    fn clear(&mut self) {
+        self.due = None;
+    }
+
+    fn take_due(&mut self, now: f64, pointer_released: bool) -> bool {
+        if self.due.is_some_and(|due| pointer_released || now >= due) {
+            self.due = None;
+            true
+        } else {
+            false
+        }
+    }
+}
 /// DECSET 1004 focus reports.
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
@@ -35,6 +63,11 @@ struct Tab {
     view: TerminalView,
     title: String,
     profile_name: String,
+    /// Launch values captured at spawn time. Restart uses these when the
+    /// profile was renamed or removed so it never silently starts another
+    /// shell.
+    program: String,
+    args: Vec<String>,
     accent: Rgb,
     exited: bool,
     exit_code: Option<i32>,
@@ -74,12 +107,13 @@ pub struct IllnessApp {
     /// GPU glyph compositor, when a wgpu device and `gpu_text` are available.
     gpu_text: Option<Arc<GpuText>>,
     window_title: String,
-    backdrop: Option<egui::TextureHandle>,
+    backdrop: Option<backdrop::Backdrop>,
 
     window_focused: bool,
     last_search: Option<(String, bool)>,
     bell_flash_until: f64,
     pending_material: bool,
+    save_debounce: SaveDebounce,
     saved: bool,
 }
 
@@ -89,7 +123,11 @@ impl IllnessApp {
         let mut detected = detect_profiles();
         #[cfg(target_os = "windows")]
         detected.extend(platform::wsl_profiles());
-        config.profiles = merge_profiles(std::mem::take(&mut config.profiles), detected);
+        config.profiles = merge_profiles(
+            std::mem::take(&mut config.profiles),
+            detected,
+            &config.hidden_profiles,
+        );
         ensure_default_profile(&mut config);
 
         let theme = Theme::by_name(&config.theme);
@@ -161,6 +199,7 @@ impl IllnessApp {
             last_search: None,
             bell_flash_until: 0.0,
             pending_material: false,
+            save_debounce: SaveDebounce::default(),
             saved: false,
         };
         app.applied_font_size = app.config.font_size;
@@ -222,25 +261,31 @@ impl IllnessApp {
 
     fn build_tab(&self, requested: Option<&str>) -> Result<Tab, String> {
         let profile = self.profile_for(requested);
+        self.build_tab_for(&profile)
+    }
+
+    fn build_tab_for(&self, profile: &Profile) -> Result<Tab, String> {
         let metrics = self.atlas.metrics();
         let cell_px = (cell_pixel(metrics.width_px), cell_pixel(metrics.height_px));
         let ctx = self.ctx.clone();
         let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
 
         let session = Session::spawn(
-            spawn_spec(&profile, &self.config),
+            spawn_spec(profile, &self.config),
             GridSize::new(INITIAL_COLS, INITIAL_ROWS),
             cell_px,
             waker,
         )
         .map_err(|error| format!("Could not start {}: {error}", profile.name))?;
 
-        let (title, exited, exit_code) = restarted_state(&profile);
+        let (title, exited, exit_code) = restarted_state(profile);
         Ok(Tab {
             session,
             view: TerminalView::default(),
             title,
-            profile_name: profile.name,
+            profile_name: profile.name.clone(),
+            program: profile.program.clone(),
+            args: profile.args.clone(),
             accent: profile.accent,
             exited,
             exit_code,
@@ -371,19 +416,27 @@ impl IllnessApp {
 
     /// Reload the backdrop for the current mode and path.
     ///
-    /// Called only when the mode, path, or theme changes; opacity is applied at
-    /// paint time. A missing custom image leaves no backdrop and raises a toast.
+    /// Called only when the mode, path, or a gradient-producing theme changes;
+    /// opacity is applied at paint time. Images are decoded once per
+    /// `(path, mtime)` and rejected when larger than the texture cap.
     fn rebuild_backdrop(&mut self) {
         let mode = self.config.background;
         let path = self.config.background_path.clone();
-        self.backdrop = backdrop::build(&self.ctx, self.theme, mode, &path);
-
-        if self.backdrop.is_none() && mode == BackgroundMode::Image {
-            self.overlays.toast = Some(if path.trim().is_empty() {
-                "Choose a background image".to_string()
-            } else {
-                format!("Could not load background \"{}\"", path)
-            });
+        match backdrop::build(&self.ctx, self.theme, mode, &path) {
+            Ok(backdrop) => {
+                self.backdrop = backdrop;
+                if self.backdrop.is_none() && mode == BackgroundMode::Image {
+                    self.overlays.toast = Some(if path.trim().is_empty() {
+                        "Choose a background image".to_string()
+                    } else {
+                        format!("Could not load background \"{}\"", path)
+                    });
+                }
+            }
+            Err(error) => {
+                self.backdrop = None;
+                self.overlays.toast = Some(error);
+            }
         }
 
         self.applied_background = Some((mode, path));
@@ -393,7 +446,6 @@ impl IllnessApp {
 
     fn reapply_config(&mut self) {
         self.config = self.config.clone().sanitized();
-        ensure_default_profile(&mut self.config);
         if self.config.profiles != self.profiles {
             self.profiles = self.config.profiles.clone();
         }
@@ -406,7 +458,12 @@ impl IllnessApp {
             self.tokens = Tokens::from_theme(theme);
             self.applied_theme = theme.name.to_string();
             self.pending_material = true;
-            background_dirty = true;
+            // A loaded image does not depend on the theme; rebuild only the
+            // gradient fallback so switching themes never re-decodes a file.
+            background_dirty = self
+                .backdrop
+                .as_ref()
+                .is_none_or(|backdrop| !backdrop.from_image);
             self.ctx.request_repaint();
         }
 
@@ -474,10 +531,26 @@ impl IllnessApp {
             self.pending_material = true;
         }
 
-        self.persist();
+        self.schedule_persist();
+    }
+
+    /// Queue a config write so sliders and text edits do not hit the disk on
+    /// every frame. Live values are already applied in memory.
+    fn schedule_persist(&mut self) {
+        let now = self.ctx.input(|input| input.time);
+        self.save_debounce.mark(now);
+        self.ctx
+            .request_repaint_after(Duration::from_millis(SAVE_DEBOUNCE_MS));
     }
 
     fn persist(&mut self) {
+        self.save_debounce.clear();
+        // An empty name only exists while its text field is being edited.
+        // Keep the last valid file rather than persisting an invalid profile.
+        if self.config.has_empty_profile_name() {
+            log::debug!("skipping config save while a profile name is empty");
+            return;
+        }
         if let Err(error) = self.config.save() {
             log::warn!("failed to save config: {error}");
             self.overlays.toast = Some(format!("Could not save config: {error}"));
@@ -496,6 +569,16 @@ impl IllnessApp {
             };
             tab.session.shutdown();
         }
+
+        // If the window closes while a name field is focused and empty, restore
+        // the name it had when editing began so the exit save stays valid.
+        if let Some((index, start)) = self.overlays.profile_name_edit.take()
+            && let Some(profile) = self.config.profiles.get_mut(index)
+            && profile.name.trim().is_empty()
+        {
+            profile.name = start;
+        }
+
         if let Err(error) = self.config.save() {
             log::warn!("failed to save config on exit: {error}");
         }
@@ -557,9 +640,15 @@ impl IllnessApp {
         let Some(TabEntry::Terminal(tab)) = self.tabs.get(index) else {
             return;
         };
-        let profile_name = tab.profile_name.clone();
+        let profile = restart_profile(
+            &tab.profile_name,
+            &tab.program,
+            &tab.args,
+            tab.accent,
+            &self.profiles,
+        );
 
-        match self.build_tab(Some(&profile_name)) {
+        match self.build_tab_for(&profile) {
             Ok(replacement) => {
                 if let Some(slot) = self.tabs.get_mut(index) {
                     *slot = TabEntry::Terminal(Box::new(replacement));
@@ -1066,7 +1155,7 @@ impl eframe::App for IllnessApp {
         {
             let screen = ui.max_rect();
             ui.painter().image(
-                backdrop.id(),
+                backdrop.texture.id(),
                 screen,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
@@ -1105,8 +1194,11 @@ impl eframe::App for IllnessApp {
         );
 
         let overlay_open = !matches!(self.overlays.kind, OverlayKind::None);
+        let settings_active = matches!(self.tabs.get(self.active), Some(TabEntry::Settings));
+        let keyboard_input = ctx.egui_wants_keyboard_input();
+        route_clipboard_to_text_fields(&ctx);
         let mut shortcut_used = false;
-        if !overlay_open {
+        if shortcuts_allowed(overlay_open, settings_active, keyboard_input) {
             shortcut_used = self.handle_shortcuts(&ctx);
             self.handle_zoom_wheel(&ctx);
         }
@@ -1125,8 +1217,6 @@ impl eframe::App for IllnessApp {
         let mut restart_requested = false;
         let mut close_requested = false;
         let mut settings_changed = false;
-
-        let settings_active = matches!(self.tabs.get(self.active), Some(TabEntry::Settings));
 
         if settings_active {
             let tokens = &self.tokens;
@@ -1284,6 +1374,12 @@ impl eframe::App for IllnessApp {
             self.handle_action(action);
         }
 
+        let now = ctx.input(|input| input.time);
+        let pointer_released = ctx.input(|input| input.pointer.any_released());
+        if self.save_debounce.take_due(now, pointer_released) {
+            self.persist();
+        }
+
         if self.pending_material {
             self.pending_material = false;
             self.apply_material_to(frame);
@@ -1319,27 +1415,63 @@ fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
 
 /// Keep profiles saved in `config.toml` and append detected built-ins whose
 /// names are not present yet. Saved values win on case-insensitive name
-/// collisions, and saved profiles stay first in the list.
-fn merge_profiles(saved: Vec<Profile>, detected: Vec<Profile>) -> Vec<Profile> {
+/// collisions, saved profiles stay first, and names the user removed or
+/// renamed away are never re-added.
+fn merge_profiles(saved: Vec<Profile>, detected: Vec<Profile>, hidden: &[String]) -> Vec<Profile> {
     let mut merged = saved;
+    illness_core::config::dedupe_profiles(&mut merged);
     for profile in detected {
-        if !merged
+        let hidden = hidden
             .iter()
-            .any(|existing| existing.name.eq_ignore_ascii_case(&profile.name))
-        {
+            .any(|name| name.trim().eq_ignore_ascii_case(profile.name.trim()));
+        let present = merged.iter().any(|existing| {
+            existing
+                .name
+                .trim()
+                .eq_ignore_ascii_case(profile.name.trim())
+        });
+        if !hidden && !present {
             merged.push(profile);
         }
     }
     merged
 }
 
-/// Point `default_profile` at an existing profile that has a program path.
+/// Resolve which profile a restart should launch.
+///
+/// When the profile still exists, its current program and args win. If it was
+/// renamed or removed, use the values captured when the tab was spawned so
+/// Restart keeps the same shell instead of falling back to the default.
+fn restart_profile(
+    name: &str,
+    program: &str,
+    args: &[String],
+    accent: Rgb,
+    profiles: &[Profile],
+) -> Profile {
+    profiles
+        .iter()
+        .find(|profile| profile.name.eq_ignore_ascii_case(name))
+        .cloned()
+        .unwrap_or_else(|| Profile {
+            name: name.to_string(),
+            program: program.to_string(),
+            args: args.to_vec(),
+            accent,
+        })
+}
+
+/// Point `default_profile` at a profile whose name still exists.
+///
+/// This runs on load only. Running it during edits would silently switch the
+/// default shell when the current profile's Program field is briefly empty.
 fn ensure_default_profile(config: &mut Config) {
     let current = config.default_profile.trim();
     let valid = !current.is_empty()
-        && config.profiles.iter().any(|profile| {
-            profile.name.eq_ignore_ascii_case(current) && !profile.program.trim().is_empty()
-        });
+        && config
+            .profiles
+            .iter()
+            .any(|profile| profile.name.eq_ignore_ascii_case(current));
     if valid {
         return;
     }
@@ -1577,6 +1709,74 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
+/// Global shortcuts stay out of the way while a text field owns the keyboard
+/// or while Settings is open (Ctrl+W must not close Settings, Ctrl+1..9 must
+/// not switch tabs, and Ctrl+Shift+F must not steal the search key).
+fn shortcuts_allowed(overlay_open: bool, settings_active: bool, keyboard_input: bool) -> bool {
+    !overlay_open && !settings_active && !keyboard_input
+}
+
+/// Translate Ctrl+C/X/V into the clipboard events `TextEdit` listens for.
+///
+/// The app runs with `clipboard_shortcuts: false` so the terminal can keep
+/// Ctrl+C as input; that also disables egui-winit's translation. When a text
+/// field has focus, consume the key and synthesize the event instead.
+fn route_clipboard_to_text_fields(ctx: &egui::Context) {
+    if !ctx.text_edit_focused() {
+        return;
+    }
+
+    let (mut copy, mut cut, mut paste) = (false, false, false);
+    ctx.input_mut(|input| {
+        input.events.retain(|event| {
+            let Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } = event
+            else {
+                return true;
+            };
+            if !(modifiers.ctrl || modifiers.command) || modifiers.alt {
+                return true;
+            }
+            match key {
+                Key::C => {
+                    copy = true;
+                    false
+                }
+                Key::X => {
+                    cut = true;
+                    false
+                }
+                Key::V => {
+                    paste = true;
+                    false
+                }
+                _ => true,
+            }
+        });
+    });
+
+    if cut || copy {
+        ctx.input_mut(|input| {
+            input
+                .events
+                .push(if cut { Event::Cut } else { Event::Copy });
+        });
+    }
+    if paste {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) if !text.is_empty() => {
+                ctx.input_mut(|input| input.events.push(Event::Paste(text)));
+            }
+            Ok(_) => {}
+            Err(error) => log::debug!("clipboard paste unavailable: {error}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shortcut {
     NewTab,
@@ -1664,7 +1864,7 @@ mod tests {
     fn merge_keeps_saved_profiles_first() {
         let saved = vec![profile("Mine")];
         let detected = vec![profile("Command Prompt")];
-        let merged = merge_profiles(saved, detected);
+        let merged = merge_profiles(saved, detected, &[]);
         assert_eq!(
             merged
                 .iter()
@@ -1681,7 +1881,7 @@ mod tests {
         let mut detected = profile("powershell");
         detected.program = "detected-pwsh.exe".to_string();
 
-        let merged = merge_profiles(vec![saved], vec![detected]);
+        let merged = merge_profiles(vec![saved], vec![detected], &[]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "PowerShell");
         assert_eq!(merged[0].program, "custom-pwsh.exe");
@@ -1696,7 +1896,7 @@ mod tests {
             profile("Ubuntu"),
         ];
 
-        let merged = merge_profiles(saved, detected);
+        let merged = merge_profiles(saved, detected, &[]);
         assert_eq!(
             merged
                 .iter()
@@ -1708,13 +1908,39 @@ mod tests {
 
     #[test]
     fn merge_uses_detected_without_saved_profiles() {
-        let merged = merge_profiles(Vec::new(), vec![profile("PowerShell")]);
+        let merged = merge_profiles(Vec::new(), vec![profile("PowerShell")], &[]);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].name, "PowerShell");
     }
 
     #[test]
-    fn ensure_default_prefers_a_profile_with_a_program() {
+    fn merge_does_not_readd_hidden_detected_profiles() {
+        let detected = vec![
+            profile("PowerShell"),
+            profile("Windows PowerShell"),
+            profile("Command Prompt"),
+        ];
+        let hidden = vec!["powershell".to_string(), "COMMAND PROMPT".to_string()];
+
+        let merged = merge_profiles(Vec::new(), detected, &hidden);
+        assert_eq!(
+            merged
+                .iter()
+                .map(|profile| profile.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Windows PowerShell"]
+        );
+    }
+
+    #[test]
+    fn merge_deduplicates_saved_profiles() {
+        let saved = vec![profile("Mine"), profile("mine")];
+        let merged = merge_profiles(saved, Vec::new(), &[]);
+        assert_eq!(merged.len(), 1);
+    }
+
+    #[test]
+    fn ensure_default_repairs_missing_names_but_not_empty_programs() {
         let mut config = Config {
             profiles: vec![
                 Profile {
@@ -1727,8 +1953,17 @@ mod tests {
             ..Config::default()
         };
 
+        // The name exists, so an empty Program field must not repoint the shell.
         ensure_default_profile(&mut config);
-        assert_eq!(config.default_profile, "PowerShell");
+        assert_eq!(config.default_profile, "Broken");
+
+        let mut missing = Config {
+            profiles: vec![profile("PowerShell")],
+            default_profile: "missing".to_string(),
+            ..Config::default()
+        };
+        ensure_default_profile(&mut missing);
+        assert_eq!(missing.default_profile, "PowerShell");
 
         let mut empty = Config {
             default_profile: "missing".to_string(),
@@ -1736,6 +1971,47 @@ mod tests {
         };
         ensure_default_profile(&mut empty);
         assert!(empty.default_profile.is_empty());
+    }
+
+    #[test]
+    fn restart_falls_back_to_the_spawned_program_after_a_rename() {
+        let profiles = vec![profile("Renamed")];
+        let args = vec!["-d".to_string(), "Ubuntu".to_string()];
+        let fallback = restart_profile(
+            "PowerShell",
+            "pwsh.exe",
+            &args,
+            Rgb::new(0x7e, 0xe7, 0x87),
+            &profiles,
+        );
+        assert_eq!(fallback.name, "PowerShell");
+        assert_eq!(fallback.program, "pwsh.exe");
+        assert_eq!(fallback.args, args);
+
+        let resolved = restart_profile("Renamed", "old.exe", &[], Rgb::new(0, 0, 0), &profiles);
+        assert_eq!(resolved.program, "pwsh.exe");
+    }
+
+    #[test]
+    fn save_debounce_waits_or_flushes_on_pointer_release() {
+        let mut debounce = SaveDebounce::default();
+        assert!(!debounce.take_due(1.0, false));
+
+        debounce.mark(10.0);
+        assert!(!debounce.take_due(10.1, false));
+        assert!(debounce.take_due(10.31, false));
+        assert!(!debounce.take_due(10.32, false));
+
+        debounce.mark(20.0);
+        assert!(debounce.take_due(20.05, true), "release flushes early");
+    }
+
+    #[test]
+    fn shortcuts_are_off_in_settings_and_text_fields() {
+        assert!(shortcuts_allowed(false, false, false));
+        assert!(!shortcuts_allowed(true, false, false));
+        assert!(!shortcuts_allowed(false, true, false));
+        assert!(!shortcuts_allowed(false, false, true));
     }
 
     #[test]

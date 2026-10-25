@@ -1,3 +1,4 @@
+use std::io;
 use std::time::Duration;
 
 use egui::{
@@ -44,6 +45,8 @@ pub struct OverlayState {
     pub toast: Option<String>,
     /// Absolute egui time at which the current toast expires.
     pub toast_deadline: Option<f64>,
+    /// `(profile index, name at the start of the active name edit)`.
+    pub profile_name_edit: Option<(usize, String)>,
 }
 
 impl Default for OverlayState {
@@ -57,6 +60,7 @@ impl Default for OverlayState {
             search_index: None,
             toast: None,
             toast_deadline: None,
+            profile_name_edit: None,
         }
     }
 }
@@ -648,7 +652,11 @@ pub fn show_settings_panel(
                                 .color(tokens.text),
                         );
                         ui.add_space(2.0);
-                        muted_label(ui, tokens, "Changes are saved automatically.");
+                        muted_label(
+                            ui,
+                            tokens,
+                            "Changes apply instantly and save shortly after you stop editing.",
+                        );
                         ui.add_space(6.0);
                         hairline(ui, tokens);
                         ui.add_space(6.0);
@@ -714,57 +722,75 @@ fn appearance_section(
         }
     });
 
+    let background_enabled = background_controls_enabled(config.material);
     changed |= setting_row(ui, tokens, "Background", |ui| {
-        let mut chosen = config.background;
-        ComboBox::from_id_salt("illness_settings_background")
-            .width(170.0)
-            .selected_text(background_name(config.background))
-            .popup_style(popup_style(tokens))
-            .show_ui(ui, |ui| {
-                for mode in [
-                    BackgroundMode::Desktop,
-                    BackgroundMode::Image,
-                    BackgroundMode::None,
-                ] {
-                    ui.selectable_value(&mut chosen, mode, background_name(mode));
-                }
-            });
-        if chosen != config.background {
-            config.background = chosen;
-            true
-        } else {
+        ui.add_enabled_ui(background_enabled, |ui| {
+            let mut chosen = config.background;
+            ComboBox::from_id_salt("illness_settings_background")
+                .width(170.0)
+                .selected_text(background_name(config.background))
+                .popup_style(popup_style(tokens))
+                .show_ui(ui, |ui| {
+                    for mode in [
+                        BackgroundMode::Desktop,
+                        BackgroundMode::Image,
+                        BackgroundMode::None,
+                    ] {
+                        ui.selectable_value(&mut chosen, mode, background_name(mode));
+                    }
+                });
+            if chosen != config.background {
+                config.background = chosen;
+                return true;
+            }
             false
-        }
+        })
+        .inner
     });
 
     if config.background == BackgroundMode::Image {
-        changed |= background_image_row(ui, tokens, config, state);
+        changed |= ui
+            .add_enabled_ui(background_enabled, |ui| {
+                background_image_row(ui, tokens, config, state)
+            })
+            .inner;
     }
 
     changed |= setting_row(ui, tokens, "Background opacity", |ui| {
-        ui.spacing_mut().slider_width = 150.0;
-        let mut opacity = config.background_opacity;
-        let changed = ui
-            .add(
-                Slider::new(&mut opacity, 0.0..=100.0)
-                    .fixed_decimals(0)
-                    .suffix("%"),
-            )
-            .changed();
-        if changed {
-            config.background_opacity = if opacity.is_finite() {
-                opacity.clamp(0.0, 100.0)
-            } else {
-                100.0
-            };
-        }
-        changed
+        ui.add_enabled_ui(background_enabled, |ui| {
+            ui.spacing_mut().slider_width = 150.0;
+            let mut opacity = config.background_opacity;
+            let changed = ui
+                .add(
+                    Slider::new(&mut opacity, 0.0..=100.0)
+                        .fixed_decimals(0)
+                        .suffix("%"),
+                )
+                .changed();
+            if changed {
+                config.background_opacity = if opacity.is_finite() {
+                    opacity.clamp(0.0, 100.0)
+                } else {
+                    100.0
+                };
+            }
+            changed
+        })
+        .inner
     });
-    muted_label(
-        ui,
-        tokens,
-        "0% paints a solid theme background; 100% keeps the material strength.",
-    );
+    if background_enabled {
+        muted_label(
+            ui,
+            tokens,
+            "0% paints a solid theme background; 100% keeps the material strength.",
+        );
+    } else {
+        muted_label(
+            ui,
+            tokens,
+            "Solid paints an opaque theme background. Choose Mica or Acrylic to use a wallpaper.",
+        );
+    }
 
     changed |= setting_row(ui, tokens, "Font", |ui| {
         let families = fonts::installed_families();
@@ -906,7 +932,9 @@ fn background_image_row(
             if text_button(ui, tokens, "Clear", false, Vec2::new(56.0, 24.0)).clicked()
                 && !current.is_empty()
             {
+                let previous = config.background_path.clone();
                 config.background_path.clear();
+                cleanup_imported_background(&previous, Path::new(""));
                 changed = true;
             }
             if text_button(ui, tokens, "Browse", false, Vec2::new(66.0, 24.0)).clicked()
@@ -916,7 +944,9 @@ fn background_image_row(
             {
                 match import_background(&source) {
                     Ok(path) => {
+                        let previous = config.background_path.clone();
                         config.background_path = path.to_string_lossy().into_owned();
+                        cleanup_imported_background(&previous, &path);
                         changed = true;
                     }
                     Err(error) => state.toast = Some(error),
@@ -928,9 +958,22 @@ fn background_image_row(
     changed
 }
 
+/// Background controls are meaningful only when the material lets the desktop
+/// show through. Solid deliberately paints an opaque theme background.
+pub fn background_controls_enabled(material: Material) -> bool {
+    material != Material::Solid
+}
+
 /// Copy a chosen image into `%APPDATA%\illness\backgrounds` under a safe,
 /// collision-free name and return the stored path. The source is untouched.
 fn import_background(source: &Path) -> Result<PathBuf, String> {
+    let appdata = std::env::var_os("APPDATA")
+        .ok_or_else(|| "Cannot save background: APPDATA is not set".to_string())?;
+    let directory = PathBuf::from(appdata).join("illness").join("backgrounds");
+    import_background_into(source, &directory)
+}
+
+fn import_background_into(source: &Path, directory: &Path) -> Result<PathBuf, String> {
     let extension = source
         .extension()
         .and_then(|extension| extension.to_str())
@@ -938,10 +981,7 @@ fn import_background(source: &Path) -> Result<PathBuf, String> {
         .filter(|extension| matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp"))
         .ok_or_else(|| "Background must be a PNG, JPEG, or BMP image".to_string())?;
 
-    let appdata = std::env::var_os("APPDATA")
-        .ok_or_else(|| "Cannot save background: APPDATA is not set".to_string())?;
-    let directory = PathBuf::from(appdata).join("illness").join("backgrounds");
-    std::fs::create_dir_all(&directory)
+    std::fs::create_dir_all(directory)
         .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
 
     let stem = safe_stem(source.file_stem().unwrap_or_default());
@@ -949,18 +989,62 @@ fn import_background(source: &Path) -> Result<PathBuf, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
+    let mut source_file = std::fs::File::open(source)
+        .map_err(|error| format!("Could not read background: {error}"))?;
 
     for attempt in 0..1_000_u32 {
         let target = directory.join(format!("{stem}-{stamp}-{attempt}.{extension}"));
-        if target.exists() {
-            continue;
+        let copied = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target);
+        match copied {
+            Ok(mut target_file) => {
+                if let Err(error) = io::copy(&mut source_file, &mut target_file)
+                    .and_then(|_| target_file.sync_all())
+                {
+                    drop(target_file);
+                    let _ = std::fs::remove_file(&target);
+                    return Err(format!("Could not copy background: {error}"));
+                }
+                return Ok(target);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Could not copy background: {error}")),
         }
-        std::fs::copy(source, &target)
-            .map_err(|error| format!("Could not copy background: {error}"))?;
-        return Ok(target);
     }
 
     Err("Could not find a free background file name".to_string())
+}
+
+/// Delete a previously imported copy after it is replaced or cleared.
+///
+/// Only files directly inside the app's backgrounds directory are removed, so
+/// choosing a picture from elsewhere never deletes the user's source file.
+fn cleanup_imported_background(previous: &str, replacement: &Path) {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return;
+    };
+    let directory = PathBuf::from(appdata).join("illness").join("backgrounds");
+    remove_imported_background_in(Path::new(previous.trim()), replacement, &directory);
+}
+
+fn remove_imported_background_in(previous: &Path, replacement: &Path, directory: &Path) -> bool {
+    if previous.as_os_str().is_empty() || same_path(previous, replacement) {
+        return false;
+    }
+    let Some(parent) = previous.parent() else {
+        return false;
+    };
+    if !same_path(parent, directory) {
+        return false;
+    }
+    std::fs::remove_file(previous).is_ok()
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
 /// Lowercase ASCII stem with path separators and dots removed, so the copied
@@ -1072,14 +1156,27 @@ fn profiles_section(
     state: &mut OverlayState,
 ) -> bool {
     section_title(ui, tokens, "Profiles");
-    muted_label(ui, tokens, "Changes apply to new tabs.");
+    muted_label(
+        ui,
+        tokens,
+        "Changes apply to new tabs. Names must be unique; renaming updates the default shell.",
+    );
     ui.add_space(4.0);
 
     let mut changed = false;
     let mut remove = None;
+    let mut renames: Vec<(String, String, String)> = Vec::new();
     let count = config.profiles.len();
+    let existing_names: Vec<String> = config
+        .profiles
+        .iter()
+        .map(|profile| profile.name.clone())
+        .collect();
 
     for (index, profile) in config.profiles.iter_mut().enumerate() {
+        let committed_name = profile.name.clone();
+        let mut name = committed_name.clone();
+
         Frame::new()
             .fill(tokens.bg)
             .stroke(Stroke::new(1.0, tokens.border))
@@ -1097,8 +1194,8 @@ fn profiles_section(
                     );
 
                     let name_width = (ui.available_width() - 74.0).max(80.0);
-                    let name = ui.add(
-                        TextEdit::singleline(&mut profile.name)
+                    let name_response = ui.add(
+                        TextEdit::singleline(&mut name)
                             .hint_text("Profile name")
                             .desired_width(name_width)
                             .font(FontId::proportional(12.0))
@@ -1106,8 +1203,43 @@ fn profiles_section(
                             .margin(Margin::symmetric(6, 3))
                             .frame(edit_frame(tokens)),
                     );
-                    if name.changed() {
-                        changed = true;
+                    if name_response.gained_focus() {
+                        state.profile_name_edit = Some((index, committed_name.clone()));
+                    }
+
+                    if name_response.changed() {
+                        let start_name = match &state.profile_name_edit {
+                            Some((edit_index, start)) if *edit_index == index => start.clone(),
+                            _ => committed_name.clone(),
+                        };
+                        let trimmed = name.trim();
+                        let duplicate = !trimmed.is_empty()
+                            && existing_names.iter().enumerate().any(|(other, existing)| {
+                                other != index && existing.trim().eq_ignore_ascii_case(trimmed)
+                            });
+                        if duplicate {
+                            // Reject the keystroke instead of deleting a profile
+                            // from `Config::sanitized` later.
+                            state.toast =
+                                Some(format!("Profile name \"{trimmed}\" is already used"));
+                        } else {
+                            let new_name = name.clone();
+                            profile.name = new_name.clone();
+                            renames.push((committed_name.clone(), start_name, new_name));
+                            changed = true;
+                        }
+                    }
+
+                    if name_response.lost_focus()
+                        && let Some((edit_index, start_name)) = state.profile_name_edit.clone()
+                        && edit_index == index
+                    {
+                        if profile.name.trim().is_empty() {
+                            profile.name = start_name;
+                            state.toast = Some("Profile name cannot be empty".to_string());
+                            changed = true;
+                        }
+                        state.profile_name_edit = None;
                     }
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1181,10 +1313,27 @@ fn profiles_section(
         ui.add_space(6.0);
     }
 
+    for (previous, start, new) in renames {
+        config.note_profile_rename(&previous, &new);
+        config.note_profile_rename(&start, &new);
+        if !start.eq_ignore_ascii_case(&new) {
+            config.hide_profile_name(&start);
+        }
+    }
+
     if let Some(index) = remove
         && config.profiles.len() > 1
     {
-        config.profiles.remove(index);
+        let removed = config.profiles.remove(index);
+        if config.default_profile.eq_ignore_ascii_case(&removed.name) {
+            config.default_profile = config
+                .profiles
+                .first()
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default();
+        }
+        config.hide_profile_name(&removed.name);
+        state.profile_name_edit = None;
         changed = true;
     }
 
@@ -1477,8 +1626,18 @@ fn hairline(ui: &mut Ui, tokens: &Tokens) {
 }
 
 fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: Vec2) -> Response {
-    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
-    let fill = if selected {
+    let enabled = ui.is_enabled();
+    let (rect, response) = ui.allocate_exact_size(
+        size,
+        if enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        },
+    );
+    let fill = if !enabled {
+        tokens.bg
+    } else if selected {
         tokens.accent
     } else if response.hovered() {
         tokens.hover
@@ -1494,12 +1653,19 @@ fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: 
             StrokeKind::Inside,
         );
     }
+    let text_color = if !enabled {
+        tokens.text_dim
+    } else if selected {
+        tokens.bg
+    } else {
+        tokens.text
+    };
     ui.painter().text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::proportional(12.0),
-        if selected { tokens.bg } else { tokens.text },
+        text_color,
     );
     response
 }
@@ -1632,7 +1798,58 @@ fn cursor_name(cursor: CursorKind) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "illness-overlays-test-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn background_controls_require_a_translucent_material() {
+        assert!(background_controls_enabled(Material::Mica));
+        assert!(background_controls_enabled(Material::Acrylic));
+        assert!(!background_controls_enabled(Material::Solid));
+    }
+
+    #[test]
+    fn imported_backgrounds_get_unique_names_and_replacements_are_cleaned_up() {
+        let dir = temp_dir();
+        let source = dir.join("wall.png");
+        std::fs::write(&source, b"not a real png").expect("write source");
+        let backgrounds = dir.join("backgrounds");
+
+        let first = import_background_into(&source, &backgrounds).expect("first import");
+        let second = import_background_into(&source, &backgrounds).expect("second import");
+        assert_ne!(first, second);
+        assert!(first.is_file());
+        assert!(second.is_file());
+        assert!(source.is_file(), "the source image must be untouched");
+
+        assert!(remove_imported_background_in(&first, &second, &backgrounds));
+        assert!(!first.exists(), "replaced import should be removed");
+        assert!(second.exists(), "the replacement must survive");
+
+        let outside = dir.join("outside.png");
+        std::fs::write(&outside, b"x").expect("write outside");
+        assert!(!remove_imported_background_in(
+            &outside,
+            &second,
+            &backgrounds
+        ));
+        assert!(outside.exists(), "files outside the import dir are kept");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn fuzzy_order() {

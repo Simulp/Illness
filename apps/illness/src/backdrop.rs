@@ -10,8 +10,22 @@ use eframe::egui::{Color32, ColorImage, Context, TextureHandle, TextureOptions};
 use illness_core::config::BackgroundMode;
 use illness_core::{Material, Theme};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use crate::platform;
+
+/// Largest accepted wallpaper side, matching common GPU texture limits.
+pub const MAX_BACKDROP_SIDE: u32 = 8192;
+/// Largest accepted wallpaper area (32 megapixels).
+pub const MAX_BACKDROP_PIXELS: u64 = 32_000_000;
+
+/// A loaded backdrop texture and whether it came from an image (as opposed to
+/// the theme colour gradient). Theme changes only rebuild gradients.
+pub struct Backdrop {
+    pub texture: TextureHandle,
+    pub from_image: bool,
+}
 
 /// Tint alpha painted over the backdrop. `opacity` 0 hides the image behind a
 /// solid theme colour; 100 keeps today's material strength.
@@ -32,21 +46,30 @@ pub fn tint_alpha(material: Material, opacity: f32) -> u8 {
 
 /// Load or synthesize the blurred backdrop for `mode`.
 ///
-/// `None` means the caller should paint no backdrop: the mode opts out, a
-/// custom image is missing, or no image could be loaded. Desktop mode always
-/// yields a texture because it falls back to a theme gradient.
+/// `Ok(None)` means the caller should paint no backdrop. `Err` carries a
+/// user-facing reason (missing or oversized image) for a toast. Desktop mode
+/// never fails: it falls back to a theme gradient.
 pub fn build(
     ctx: &Context,
     theme: &Theme,
     mode: BackgroundMode,
     path: &str,
-) -> Option<TextureHandle> {
-    let image = match mode {
-        BackgroundMode::Desktop => Some(desktop_image(theme)),
-        BackgroundMode::Image => custom_image(path),
-        BackgroundMode::None => None,
-    }?;
-    Some(ctx.load_texture("illness_backdrop", image, TextureOptions::LINEAR))
+) -> Result<Option<Backdrop>, String> {
+    let (image, from_image) = match mode {
+        BackgroundMode::Desktop => desktop_image(theme),
+        BackgroundMode::Image => {
+            if path.trim().is_empty() {
+                return Err("Choose a background image".to_string());
+            }
+            let image = custom_image(path)?;
+            (image, true)
+        }
+        BackgroundMode::None => return Ok(None),
+    };
+    Ok(Some(Backdrop {
+        texture: ctx.load_texture("illness_backdrop", image, TextureOptions::LINEAR),
+        from_image,
+    }))
 }
 
 /// Ordered wallpaper sources for Desktop mode: the live wallpaper first, then
@@ -69,7 +92,7 @@ fn desktop_wallpaper_candidates(
     candidates
 }
 
-fn desktop_image(theme: &Theme) -> ColorImage {
+fn desktop_image(theme: &Theme) -> (ColorImage, bool) {
     let transcoded = std::env::var_os("APPDATA").map(|appdata| {
         PathBuf::from(appdata)
             .join("Microsoft")
@@ -79,28 +102,104 @@ fn desktop_image(theme: &Theme) -> ColorImage {
     });
     let candidates = desktop_wallpaper_candidates(platform::current_wallpaper_path(), transcoded);
 
-    candidates
-        .iter()
-        .find_map(|path| load_blurred(path))
-        .unwrap_or_else(|| gradient(theme))
+    for path in &candidates {
+        match load_blurred(path) {
+            Ok(image) => return (image, true),
+            Err(error) => log::debug!("background {} unavailable: {error}", path.display()),
+        }
+    }
+    (gradient(theme), false)
 }
 
-fn custom_image(path: &str) -> Option<ColorImage> {
+fn custom_image(path: &str) -> Result<ColorImage, String> {
     let path = Path::new(path.trim());
     if path.as_os_str().is_empty() {
-        return None;
+        return Err("Choose a background image".to_string());
     }
     load_blurred(path)
 }
 
-fn load_blurred(path: &Path) -> Option<ColorImage> {
-    match image::open(path) {
-        Ok(image) => Some(blurred(image)),
-        Err(error) => {
-            log::debug!("background {} unavailable: {error}", path.display());
-            None
-        }
+/// Decode a wallpaper once per `(path, mtime)` and reuse the blurred result.
+fn load_blurred(path: &Path) -> Result<ColorImage, String> {
+    let modified = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+
+    if let Some(cached) = cached_image(path, modified) {
+        return Ok(cached);
     }
+
+    let image = decode_image(path)?;
+    let blurred = blurred(image);
+    store_cached(path, modified, &blurred);
+    Ok(blurred)
+}
+
+fn decode_image(path: &Path) -> Result<image::DynamicImage, String> {
+    let (width, height) = image_dimensions(path)?;
+    validate_dimensions(width, height)?;
+
+    // `image::open` refuses files without an extension (the Windows
+    // `TranscodedWallpaper` has none), so guess the format from the bytes.
+    image::ImageReader::open(path)
+        .map_err(|error| format!("Could not open \"{}\": {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| format!("Could not read \"{}\": {error}", path.display()))?
+        .decode()
+        .map_err(|error| format!("Could not decode \"{}\": {error}", path.display()))
+}
+
+fn image_dimensions(path: &Path) -> Result<(u32, u32), String> {
+    image::ImageReader::open(path)
+        .map_err(|error| format!("Could not open \"{}\": {error}", path.display()))?
+        .with_guessed_format()
+        .map_err(|error| format!("Could not read \"{}\": {error}", path.display()))?
+        .into_dimensions()
+        .map_err(|error| format!("Could not read \"{}\": {error}", path.display()))
+}
+
+/// Reject wallpapers that would allocate an unreasonable amount of memory.
+pub fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
+    let pixels = u64::from(width) * u64::from(height);
+    if width > MAX_BACKDROP_SIDE || height > MAX_BACKDROP_SIDE || pixels > MAX_BACKDROP_PIXELS {
+        return Err(format!(
+            "Background is {width}×{height}; the limit is \
+             {MAX_BACKDROP_SIDE} px per side and {} MP",
+            MAX_BACKDROP_PIXELS / 1_000_000
+        ));
+    }
+    Ok(())
+}
+
+struct CacheEntry {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+    image: ColorImage,
+}
+
+static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+
+fn cache() -> &'static Mutex<Option<CacheEntry>> {
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cached_image(path: &Path, modified: Option<SystemTime>) -> Option<ColorImage> {
+    let cache = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let entry = cache.as_ref()?;
+    (entry.path == path && entry.modified == modified).then(|| entry.image.clone())
+}
+
+fn store_cached(path: &Path, modified: Option<SystemTime>, image: &ColorImage) {
+    let mut cache = cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *cache = Some(CacheEntry {
+        path: path.to_path_buf(),
+        modified,
+        image: image.clone(),
+    });
 }
 
 fn blurred(image: image::DynamicImage) -> ColorImage {
@@ -139,7 +238,21 @@ fn gradient(theme: &Theme) -> ColorImage {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use super::*;
+
+    static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "illness-backdrop-test-{}-{}",
+            std::process::id(),
+            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn opacity_zero_is_solid_and_full_keeps_material_strength() {
@@ -158,6 +271,57 @@ mod tests {
         assert_eq!(tint_alpha(Material::Mica, -20.0), 255);
         assert_eq!(tint_alpha(Material::Mica, 400.0), 90);
         assert_eq!(tint_alpha(Material::Mica, f32::NAN), 90);
+    }
+
+    #[test]
+    fn dimensions_are_capped_by_side_and_area() {
+        assert!(validate_dimensions(1920, 1080).is_ok());
+        assert!(validate_dimensions(MAX_BACKDROP_SIDE, 100).is_ok());
+        assert!(validate_dimensions(MAX_BACKDROP_SIDE + 1, 1).is_err());
+        assert!(validate_dimensions(1, MAX_BACKDROP_SIDE + 1).is_err());
+        assert!(validate_dimensions(8192, 4000).is_err(), "33 MP");
+        assert!(
+            validate_dimensions(8000, 4000).is_ok(),
+            "exactly 32 MP is allowed"
+        );
+    }
+
+    #[test]
+    fn extensionless_wallpaper_decodes_with_a_guessed_format() {
+        let dir = temp_dir();
+        let path = dir.join("TranscodedWallpaper");
+        let image = image::RgbaImage::from_pixel(8, 8, image::Rgba([20, 40, 60, 255]));
+        image
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("write extensionless png");
+
+        let loaded = load_blurred(&path).expect("extensionless image should decode");
+        assert_eq!(loaded.size, [640, 360]);
+
+        let modified = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        assert!(
+            cached_image(&path, modified).is_some(),
+            "decoded image should be cached by path and mtime"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn oversized_wallpaper_is_rejected_before_decoding() {
+        let dir = temp_dir();
+        let path = dir.join("huge.png");
+        let image =
+            image::RgbaImage::from_pixel(MAX_BACKDROP_SIDE + 1, 1, image::Rgba([0, 0, 0, 255]));
+        image
+            .save_with_format(&path, image::ImageFormat::Png)
+            .expect("write wide png");
+
+        let error = load_blurred(&path).expect_err("oversized image must be rejected");
+        assert!(error.contains("limit"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

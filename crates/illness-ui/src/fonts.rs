@@ -85,9 +85,21 @@ pub fn installed_families() -> Vec<String> {
     FAMILIES.get_or_init(load_installed_families).clone()
 }
 
+/// One system font database shared by enumeration and face loading.
+///
+/// Loading system fonts costs ~250 ms, so it must happen at most once per
+/// process even when Settings enumerates families and then loads a face.
+fn database() -> &'static fontdb::Database {
+    static DATABASE: OnceLock<fontdb::Database> = OnceLock::new();
+    DATABASE.get_or_init(|| {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        db
+    })
+}
+
 fn load_installed_families() -> Vec<String> {
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = database();
 
     // Some families appear on several faces; treat a family as monospace when
     // any of its faces is, so grouping and the settings list agree.
@@ -129,8 +141,7 @@ pub fn load_terminal_font(family: &str) -> Option<(Vec<u8>, u32)> {
         return None;
     }
 
-    let mut db = fontdb::Database::new();
-    db.load_system_fonts();
+    let db = database();
 
     // `fontdb` matches names exactly, so resolve the requested spelling first.
     let resolved = db
@@ -163,6 +174,14 @@ mod tests {
         assert!(!INTER.is_empty());
         assert!(!INTER_ITALIC.is_empty());
         assert!(!CASCADIA_MONO.is_empty());
+    }
+
+    #[test]
+    fn system_font_database_is_shared() {
+        assert!(std::ptr::eq(database(), database()));
+        let first = installed_families();
+        let second = installed_families();
+        assert_eq!(first, second);
     }
 
     #[test]
