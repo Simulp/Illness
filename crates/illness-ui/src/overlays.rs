@@ -2,10 +2,12 @@ use std::time::Duration;
 
 use egui::{
     Align, Align2, Area, Color32, ComboBox, Context, DragValue, FontId, Frame, Id, Key, Layout,
-    Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Stroke,
+    Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Slider, Stroke,
     StrokeKind, TextEdit, Ui, Vec2,
 };
+use illness_core::config::BackgroundMode;
 use illness_core::{Config, CursorKind, Material, Profile, Rgb, Theme};
+use std::path::{Path, PathBuf};
 
 use crate::chrome::{Action, TabInfo};
 use crate::design::{self, Tokens};
@@ -656,7 +658,7 @@ pub fn show_settings_panel(
                             .max_height(ui.available_height())
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                changed |= appearance_section(ui, tokens, config);
+                                changed |= appearance_section(ui, tokens, config, state);
                                 changed |= terminal_section(ui, tokens, config);
                                 changed |= profiles_section(ui, tokens, config, state);
                                 about_section(ui, tokens, theme, state);
@@ -669,7 +671,12 @@ pub fn show_settings_panel(
     changed
 }
 
-fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
+fn appearance_section(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    config: &mut Config,
+    state: &mut OverlayState,
+) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Appearance");
 
@@ -706,6 +713,58 @@ fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool
             false
         }
     });
+
+    changed |= setting_row(ui, tokens, "Background", |ui| {
+        let mut chosen = config.background;
+        ComboBox::from_id_salt("illness_settings_background")
+            .width(170.0)
+            .selected_text(background_name(config.background))
+            .popup_style(popup_style(tokens))
+            .show_ui(ui, |ui| {
+                for mode in [
+                    BackgroundMode::Desktop,
+                    BackgroundMode::Image,
+                    BackgroundMode::None,
+                ] {
+                    ui.selectable_value(&mut chosen, mode, background_name(mode));
+                }
+            });
+        if chosen != config.background {
+            config.background = chosen;
+            true
+        } else {
+            false
+        }
+    });
+
+    if config.background == BackgroundMode::Image {
+        changed |= background_image_row(ui, tokens, config, state);
+    }
+
+    changed |= setting_row(ui, tokens, "Background opacity", |ui| {
+        ui.spacing_mut().slider_width = 150.0;
+        let mut opacity = config.background_opacity;
+        let changed = ui
+            .add(
+                Slider::new(&mut opacity, 0.0..=100.0)
+                    .fixed_decimals(0)
+                    .suffix("%"),
+            )
+            .changed();
+        if changed {
+            config.background_opacity = if opacity.is_finite() {
+                opacity.clamp(0.0, 100.0)
+            } else {
+                100.0
+            };
+        }
+        changed
+    });
+    muted_label(
+        ui,
+        tokens,
+        "0% paints a solid theme background; 100% keeps the material strength.",
+    );
 
     changed |= setting_row(ui, tokens, "Font", |ui| {
         let families = fonts::installed_families();
@@ -822,6 +881,108 @@ fn appearance_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool
         toggle(ui, tokens, &mut config.cursor_blink)
     });
     changed
+}
+
+fn background_image_row(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    config: &mut Config,
+    state: &mut OverlayState,
+) -> bool {
+    let mut changed = false;
+    let current = config.background_path.trim().to_string();
+    let summary = if current.is_empty() {
+        "No image selected".to_string()
+    } else {
+        elide_path(&current, 54)
+    };
+
+    ui.horizontal(|ui| {
+        let path_label = ui.label(RichText::new(summary).size(11.0).color(tokens.text_dim));
+        if !current.is_empty() {
+            path_label.on_hover_text(&current);
+        }
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if text_button(ui, tokens, "Clear", false, Vec2::new(56.0, 24.0)).clicked()
+                && !current.is_empty()
+            {
+                config.background_path.clear();
+                changed = true;
+            }
+            if text_button(ui, tokens, "Browse", false, Vec2::new(66.0, 24.0)).clicked()
+                && let Some(source) = rfd::FileDialog::new()
+                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                    .pick_file()
+            {
+                match import_background(&source) {
+                    Ok(path) => {
+                        config.background_path = path.to_string_lossy().into_owned();
+                        changed = true;
+                    }
+                    Err(error) => state.toast = Some(error),
+                }
+            }
+        });
+    });
+
+    changed
+}
+
+/// Copy a chosen image into `%APPDATA%\illness\backgrounds` under a safe,
+/// collision-free name and return the stored path. The source is untouched.
+fn import_background(source: &Path) -> Result<PathBuf, String> {
+    let extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .filter(|extension| matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "bmp"))
+        .ok_or_else(|| "Background must be a PNG, JPEG, or BMP image".to_string())?;
+
+    let appdata = std::env::var_os("APPDATA")
+        .ok_or_else(|| "Cannot save background: APPDATA is not set".to_string())?;
+    let directory = PathBuf::from(appdata).join("illness").join("backgrounds");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create {}: {error}", directory.display()))?;
+
+    let stem = safe_stem(source.file_stem().unwrap_or_default());
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+
+    for attempt in 0..1_000_u32 {
+        let target = directory.join(format!("{stem}-{stamp}-{attempt}.{extension}"));
+        if target.exists() {
+            continue;
+        }
+        std::fs::copy(source, &target)
+            .map_err(|error| format!("Could not copy background: {error}"))?;
+        return Ok(target);
+    }
+
+    Err("Could not find a free background file name".to_string())
+}
+
+/// Lowercase ASCII stem with path separators and dots removed, so the copied
+/// file cannot escape the backgrounds directory or collide on case.
+fn safe_stem(stem: &std::ffi::OsStr) -> String {
+    let mut cleaned = String::new();
+    for character in stem.to_string_lossy().chars() {
+        if cleaned.len() >= 40 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() {
+            cleaned.push(character.to_ascii_lowercase());
+        } else if !cleaned.ends_with('-') {
+            cleaned.push('-');
+        }
+    }
+    let cleaned = cleaned.trim_matches('-').to_string();
+    if cleaned.is_empty() {
+        "background".to_string()
+    } else {
+        cleaned
+    }
 }
 
 fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
@@ -1450,6 +1611,14 @@ fn material_name(material: Material) -> &'static str {
         Material::Mica => "Mica",
         Material::Acrylic => "Acrylic",
         Material::Solid => "Solid",
+    }
+}
+
+fn background_name(mode: BackgroundMode) -> &'static str {
+    match mode {
+        BackgroundMode::Desktop => "Desktop",
+        BackgroundMode::Image => "Image",
+        BackgroundMode::None => "None",
     }
 }
 

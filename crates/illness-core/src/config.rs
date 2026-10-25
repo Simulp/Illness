@@ -28,6 +28,19 @@ pub enum CursorKind {
     Underline,
 }
 
+/// What is painted behind the terminal when the window material is translucent.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackgroundMode {
+    /// Follow the wallpaper Windows currently reports.
+    #[default]
+    Desktop,
+    /// Use a user-chosen image.
+    Image,
+    /// Paint no backdrop; the theme background is solid.
+    None,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -36,6 +49,9 @@ pub struct Config {
     pub font_size: f32,
     pub line_height: f32,
     pub material: Material,
+    pub background: BackgroundMode,
+    pub background_path: String,
+    pub background_opacity: f32,
     pub cursor: CursorKind,
     pub cursor_blink: bool,
     pub scrollback: usize,
@@ -53,6 +69,9 @@ impl Default for Config {
             font_size: 18.0,
             line_height: 1.2,
             material: Material::Mica,
+            background: BackgroundMode::Desktop,
+            background_path: String::new(),
+            background_opacity: 100.0,
             cursor: CursorKind::Block,
             cursor_blink: true,
             scrollback: 10_000,
@@ -150,6 +169,8 @@ impl Config {
         self.font_size = finite_or(self.font_size, 18.0).clamp(8.0, 40.0);
         self.line_height = finite_or(self.line_height, 1.2).clamp(1.0, 2.0);
         self.padding = finite_or(self.padding, 8.0).clamp(0.0, 32.0);
+        self.background_path = self.background_path.trim().to_string();
+        self.background_opacity = finite_or(self.background_opacity, 100.0).clamp(0.0, 100.0);
         self.scrollback = if self.scrollback == 0 {
             10_000
         } else {
@@ -214,6 +235,9 @@ mod tests {
         assert_eq!(config.font_size, 18.0);
         assert_eq!(config.line_height, 1.2);
         assert_eq!(config.material, Material::Mica);
+        assert_eq!(config.background, BackgroundMode::Desktop);
+        assert!(config.background_path.is_empty());
+        assert_eq!(config.background_opacity, 100.0);
         assert_eq!(config.cursor, CursorKind::Block);
         assert!(config.cursor_blink);
         assert_eq!(config.scrollback, 10_000);
@@ -232,6 +256,10 @@ mod tests {
             font_size: 15.5,
             line_height: 1.35,
             material: Material::Acrylic,
+            background: BackgroundMode::Image,
+            background_path: r"C:\Users\me\AppData\Roaming\illness\backgrounds\wall 1.png"
+                .to_string(),
+            background_opacity: 42.5,
             default_profile: "PowerShell".to_string(),
             profiles: vec![sample_profile("PowerShell")],
             ..Config::default()
@@ -269,6 +297,46 @@ mod tests {
         let loaded = Config::load_from(&path);
         assert_eq!(loaded, Config::default());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn background_mode_serializes_lowercase() {
+        let config = Config {
+            background: BackgroundMode::Image,
+            ..Config::default()
+        };
+        let text = toml::to_string_pretty(&config).expect("serialize config");
+        assert!(text.contains("background = \"image\""), "{text}");
+
+        let parsed: Config = toml::from_str(&text).expect("parse config");
+        assert_eq!(parsed.background, BackgroundMode::Image);
+        assert_eq!(parsed, config);
+    }
+
+    #[test]
+    fn sanitize_clamps_background_opacity_and_path() {
+        let low = Config {
+            background_opacity: -12.0,
+            background_path: "  C:\\wallpapers\\one.png  ".to_string(),
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(low.background_opacity, 0.0);
+        assert_eq!(low.background_path, "C:\\wallpapers\\one.png");
+
+        let high = Config {
+            background_opacity: 250.0,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(high.background_opacity, 100.0);
+
+        let nan = Config {
+            background_opacity: f32::NAN,
+            ..Config::default()
+        }
+        .sanitized();
+        assert_eq!(nan.background_opacity, 100.0);
     }
 
     #[test]

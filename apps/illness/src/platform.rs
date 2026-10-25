@@ -8,6 +8,7 @@
 use anyhow::Result;
 use illness_core::Material;
 use raw_window_handle::HasWindowHandle;
+use std::path::PathBuf;
 
 #[cfg(target_os = "windows")]
 use raw_window_handle::RawWindowHandle;
@@ -142,6 +143,51 @@ pub fn wsl_profiles() -> Vec<illness_core::Profile> {
     // Safety: key was opened successfully above and is not used afterwards.
     unsafe { RegCloseKey(key) };
     profiles
+}
+
+/// Path of the wallpaper Windows currently has registered, if any.
+///
+/// Reads `SPI_GETDESKWALLPAPER` rather than guessing a file name, so a stock
+/// Windows wallpaper is only used when the OS actually reports it. Returns
+/// `None` for a solid-colour desktop or when the query fails.
+#[cfg(target_os = "windows")]
+pub fn current_wallpaper_path() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SPI_GETDESKWALLPAPER, SystemParametersInfoW,
+    };
+
+    // The documented path limit is MAX_PATH, but Windows 11 can report longer
+    // user paths; 32K WCHARs is the widest value the API accepts and costs only
+    // 64 KiB of heap.
+    let mut buffer = vec![0u16; 32_768];
+    let size = u32::try_from(buffer.len()).ok()?;
+
+    // Safety: buffer is a live, writable Vec<u16> with `size` WCHARs of
+    // capacity, which is the length passed to the API. SystemParametersInfoW
+    // writes at most that many and NUL-terminates its result. The pointer does
+    // not outlive the call.
+    let ok =
+        unsafe { SystemParametersInfoW(SPI_GETDESKWALLPAPER, size, buffer.as_mut_ptr().cast(), 0) };
+    if ok == 0 {
+        return None;
+    }
+
+    let len = buffer
+        .iter()
+        .position(|&character| character == 0)
+        .unwrap_or(buffer.len());
+    if len == 0 {
+        return None;
+    }
+
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buffer[..len])))
+}
+
+/// Path of the wallpaper Windows currently has registered, if any.
+#[cfg(not(target_os = "windows"))]
+pub fn current_wallpaper_path() -> Option<PathBuf> {
+    None
 }
 
 /// Apply the requested backdrop to `window`.

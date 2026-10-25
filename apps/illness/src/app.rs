@@ -5,6 +5,7 @@ use eframe::egui::{
     self, Align2, Color32, Event, FontId, Id, Key, Modifiers, Order, Rect, RichText, Sense, Stroke,
     StrokeKind, Vec2, ViewportCommand, pos2, vec2,
 };
+use illness_core::config::BackgroundMode;
 use illness_core::{Config, Material, Profile, Rgb, Theme, detect_profiles};
 use illness_term::{
     GridSize, SelectionType, Session, SessionEvent, Side, SpawnSpec, encode_paste,
@@ -63,10 +64,13 @@ pub struct IllnessApp {
     applied_ppp: f32,
     applied_line_height: f32,
     applied_material: Material,
+    /// `(mode, path)` that produced the current backdrop texture.
+    applied_background: Option<(BackgroundMode, String)>,
+    applied_background_opacity: f32,
     /// Family whose load failed, so the toast is not repeated every change.
     font_failure: Option<String>,
     window_title: String,
-    backdrop: egui::TextureHandle,
+    backdrop: Option<egui::TextureHandle>,
 
     window_focused: bool,
     last_search: Option<(String, bool)>,
@@ -112,7 +116,7 @@ impl IllnessApp {
             }
         }
         let line_height = config.line_height;
-        let backdrop = backdrop::build(&ctx, theme);
+        let background_opacity = config.background_opacity;
 
         let mut app = Self {
             ctx,
@@ -131,9 +135,11 @@ impl IllnessApp {
             applied_ppp: 0.0,
             applied_line_height: line_height,
             applied_material: Material::Mica,
+            applied_background: None,
+            applied_background_opacity: background_opacity,
             font_failure: None,
             window_title: "Illness".to_string(),
-            backdrop,
+            backdrop: None,
             window_focused: false,
             last_search: None,
             bell_flash_until: 0.0,
@@ -143,6 +149,7 @@ impl IllnessApp {
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
         app.apply_material_to(cc);
+        app.rebuild_backdrop();
         app.open_tab(None);
         app
     }
@@ -345,6 +352,28 @@ impl IllnessApp {
         self.applied_material = self.config.material;
     }
 
+    /// Reload the backdrop for the current mode and path.
+    ///
+    /// Called only when the mode, path, or theme changes; opacity is applied at
+    /// paint time. A missing custom image leaves no backdrop and raises a toast.
+    fn rebuild_backdrop(&mut self) {
+        let mode = self.config.background;
+        let path = self.config.background_path.clone();
+        self.backdrop = backdrop::build(&self.ctx, self.theme, mode, &path);
+
+        if self.backdrop.is_none() && mode == BackgroundMode::Image {
+            self.overlays.toast = Some(if path.trim().is_empty() {
+                "Choose a background image".to_string()
+            } else {
+                format!("Could not load background \"{}\"", path)
+            });
+        }
+
+        self.applied_background = Some((mode, path));
+        self.applied_background_opacity = self.config.background_opacity;
+        self.ctx.request_repaint();
+    }
+
     fn reapply_config(&mut self) {
         self.config = self.config.clone().sanitized();
         ensure_default_profile(&mut self.config);
@@ -353,13 +382,14 @@ impl IllnessApp {
         }
 
         let theme = Theme::by_name(&self.config.theme);
+        let mut background_dirty = false;
         if theme.name != self.applied_theme.as_str() {
             design::install(&self.ctx, theme, &self.config);
             self.theme = theme;
             self.tokens = Tokens::from_theme(theme);
-            self.backdrop = backdrop::build(&self.ctx, theme);
             self.applied_theme = theme.name.to_string();
             self.pending_material = true;
+            background_dirty = true;
             self.ctx.request_repaint();
         }
 
@@ -404,6 +434,16 @@ impl IllnessApp {
         if (self.config.line_height - self.applied_line_height).abs() > f32::EPSILON {
             self.atlas.set_line_height(self.config.line_height);
             self.applied_line_height = self.config.line_height;
+        }
+
+        let background = (self.config.background, self.config.background_path.clone());
+        if background_dirty || self.applied_background.as_ref() != Some(&background) {
+            self.rebuild_backdrop();
+        } else if (self.config.background_opacity - self.applied_background_opacity).abs()
+            > f32::EPSILON
+        {
+            self.applied_background_opacity = self.config.background_opacity;
+            self.ctx.request_repaint();
         }
 
         if self.config.material != self.applied_material {
@@ -987,19 +1027,18 @@ impl eframe::App for IllnessApp {
 
         ui.spacing_mut().item_spacing = Vec2::ZERO;
 
-        if self.config.material != Material::Solid {
+        if self.config.material != Material::Solid
+            && self.config.background != BackgroundMode::None
+            && let Some(backdrop) = &self.backdrop
+        {
             let screen = ui.max_rect();
             ui.painter().image(
-                self.backdrop.id(),
+                backdrop.id(),
                 screen,
                 Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
                 Color32::WHITE,
             );
-            let tint = match self.config.material {
-                Material::Mica => 90,
-                Material::Acrylic => 50,
-                Material::Solid => 255,
-            };
+            let tint = backdrop::tint_alpha(self.config.material, self.config.background_opacity);
             ui.painter().rect_filled(
                 screen,
                 0.0,
