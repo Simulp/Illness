@@ -8,6 +8,10 @@ mod platform;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+
+/// A startup folder probe must not freeze the process on an offline UNC path.
+const STARTUP_PATH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Initialise stderr logging in debug builds and a file log in release builds,
 /// where no console exists. Logging failures must never block startup.
@@ -176,7 +180,7 @@ fn directory_argument(argument: &OsStr) -> Option<PathBuf> {
     {
         path = PathBuf::from(format!("{text}\\"));
     }
-    path.is_dir().then_some(path)
+    platform::path_is_dir_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT).then_some(path)
 }
 
 /// A bare drive prefix such as `C:` with no root separator.
@@ -189,7 +193,7 @@ fn is_bare_drive(text: &str) -> bool {
 #[cfg(not(target_os = "windows"))]
 fn directory_argument(argument: &OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(argument);
-    path.is_dir().then_some(path)
+    platform::path_is_dir_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT).then_some(path)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -198,7 +202,7 @@ fn main() -> anyhow::Result<()> {
 
     match parse_command_line(std::env::args_os().skip(1)) {
         Startup::RegisterContextMenu => {
-            if let Err(error) = platform::register_context_menu() {
+            if let Err(error) = platform::register_context_menu(true) {
                 log::error!("context-menu registration failed: {error:#}");
                 eprintln!("Illness context-menu registration failed: {error:#}");
                 std::process::exit(1);
@@ -217,9 +221,11 @@ fn main() -> anyhow::Result<()> {
         }
         Startup::Run { folder } => {
             // Explorer verbs are per-user and best-effort: a locked registry
-            // must not prevent the terminal from starting. The explicit
-            // `--register-context-menu` path above is the authoritative one.
-            if let Err(error) = platform::register_context_menu() {
+            // must not prevent the terminal from starting. Automatic updates
+            // only happen from a stable installed location; transient/dev
+            // copies must not repoint an installed menu. The explicit
+            // `--register-context-menu` path above is authoritative.
+            if let Err(error) = platform::register_context_menu(false) {
                 log::warn!("could not register the folder context menu: {error:#}");
             }
             run(folder)

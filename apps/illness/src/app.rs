@@ -55,6 +55,13 @@ const WARM_RECOVERY_CAP: u32 = 5;
 /// this floor so alt-tab spam cannot exhaust the warm retry cap.
 const BACKDROP_REVALIDATE_INTERVAL: Duration = Duration::from_secs(45);
 const FOCUS_REVALIDATE_FLOOR: Duration = Duration::from_secs(8);
+/// A shell that exits within this window (or before the user has interacted
+/// with it) is treated as a failed profile: the tab is kept with a recovery
+/// card instead of closing the window. Normal `exit` after use still closes.
+const FAST_EXIT_WINDOW: Duration = Duration::from_secs(2);
+/// Deadline for checking a stored/startup folder before spawning. A dead UNC
+/// share can otherwise block the UI for the SMB timeout.
+const SPAWN_PATH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Pending delayed config write. A pointer release flushes immediately so a
 /// click never waits for the timer.
@@ -236,12 +243,27 @@ struct Tab {
     accent: Rgb,
     /// Whether the PTY currently believes this tab has focus (DECSET 1004).
     focus_reported: bool,
+    /// Spawn time and whether the user has interacted with this tab. A shell
+    /// that exits before use is a failed profile, not a normal exit.
+    spawned_at: Instant,
+    user_acted: bool,
+    /// Set when an immediate/spontaneous exit is kept for recovery instead of
+    /// being removed by [`IllnessApp::remove_exited_tabs`].
+    recovery: bool,
 }
 
 /// A slot in the tab strip. Settings is a real tab but has no PTY session.
 enum TabEntry {
     Terminal(Box<Tab>),
     Settings,
+}
+
+/// Choice offered by the failed-shell recovery card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryAction {
+    Restart,
+    Settings,
+    Close,
 }
 
 /// Result of a detached [`backdrop::warm_cache`] request.
@@ -520,7 +542,10 @@ impl IllnessApp {
             .and_then(|id| self.tab_index_by_id(id))
             .and_then(|index| match self.tabs.get_mut(index) {
                 Some(TabEntry::Terminal(tab)) => {
-                    let live = tab_live_cwd(tab).filter(|path| path.is_dir());
+                    // Trust the PEB path from a live shell. It was already
+                    // validated when the shell was spawned, and probing every
+                    // read would reintroduce the UNC stall this path removed.
+                    let live = tab_live_cwd(tab);
                     if let Some(cwd) = &live {
                         tab.cwd = Some(cwd.clone());
                     }
@@ -620,6 +645,9 @@ impl IllnessApp {
             cwd,
             accent: profile.accent,
             focus_reported: false,
+            spawned_at: Instant::now(),
+            user_acted: false,
+            recovery: false,
         })
     }
 
@@ -1876,19 +1904,75 @@ impl IllnessApp {
 
     /// Drop every terminal whose shell has exited, including several that
     /// exited between two frames.
+    ///
+    /// A profile that fails immediately is the exception: removing it used to
+    /// leave no tab at all, so the window closed before Settings could be
+    /// reached. Keep that tab, mark it for recovery, and let the card offer
+    /// Restart/Settings/Close. A shell that exits after use is removed normally.
     fn remove_exited_tabs(&mut self) {
-        let exited: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                TabEntry::Terminal(tab) if tab.session.is_exited() => Some(index),
-                _ => None,
-            })
-            .collect();
+        let now = Instant::now();
+        let mut exited = Vec::new();
+        for (index, entry) in self.tabs.iter_mut().enumerate() {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
+            if !tab.session.is_exited() || tab.recovery {
+                continue;
+            }
+            let elapsed = now.saturating_duration_since(tab.spawned_at);
+            if needs_recovery(elapsed, tab.user_acted) {
+                tab.recovery = true;
+                log::warn!(
+                    "keeping exited {} tab for recovery (spawned {:?} ago, user acted: {})",
+                    tab.profile_name,
+                    elapsed,
+                    tab.user_acted
+                );
+            } else {
+                exited.push(index);
+            }
+        }
         for index in exited.into_iter().rev() {
             log::debug!("removing exited tab {index}");
             self.remove_tab(index);
+        }
+    }
+
+    /// Restart a failed tab in place, preserving its profile and last cwd.
+    fn restart_tab(&mut self, index: usize) {
+        let Some(TabEntry::Terminal(tab)) = self.tabs.get(index) else {
+            return;
+        };
+        let profile_name = tab.profile_name.clone();
+        let cwd = tab.cwd.clone();
+        let profile = self.profile_for(Some(&profile_name));
+        match self.build_tab_for(&profile, cwd) {
+            Ok(tab) => {
+                let id = tab.id;
+                self.tabs[index] = TabEntry::Terminal(Box::new(tab));
+                self.active = index;
+                self.last_terminal_id = Some(id);
+            }
+            Err(error) => self.overlays.set_toast(error),
+        }
+    }
+
+    /// Mark the active terminal as used when the user presses a key or clicks.
+    /// A shell that exits before this is a profile failure, not a normal exit.
+    fn note_user_activity(&mut self, ctx: &egui::Context) {
+        let acted = ctx.input(|input| {
+            input.events.iter().any(|event| {
+                matches!(
+                    event,
+                    Event::Key { pressed: true, .. }
+                        | Event::PointerButton { pressed: true, .. }
+                        | Event::MouseWheel { .. }
+                        | Event::Text(_)
+                )
+            })
+        });
+        if acted && let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) {
+            tab.user_acted = true;
         }
     }
 
@@ -2383,6 +2467,7 @@ impl IllnessApp {
 impl IllnessApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        self.note_user_activity(&ctx);
         // Apply a requested material change before building any shape. The
         // platform call, design tokens, backdrop drop/upload and clear colour
         // then describe one material for the whole pass.
@@ -2488,6 +2573,7 @@ impl IllnessApp {
         let mut terminal_actions = Vec::new();
         let mut terminal_rect = None;
         let mut context_menu_pos = None;
+        let mut recovery_action = None;
         let mut settings_outcome = overlays::SettingsOutcome::default();
 
         if settings_active {
@@ -2538,6 +2624,11 @@ impl IllnessApp {
                 );
                 terminal_rect = Some(response.response.rect);
                 terminal_actions = response.actions;
+                if tab.recovery {
+                    recovery_action =
+                        show_recovery_card(ui.ctx(), tokens, tab.id, &tab.profile_name, &tab.title)
+                            .map(|action| (tab.id, action));
+                }
                 if response.response.secondary_clicked()
                     && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
                 {
@@ -2575,6 +2666,18 @@ impl IllnessApp {
 
         for action in terminal_actions {
             self.handle_terminal_action(action);
+        }
+
+        if let Some((id, action)) = recovery_action {
+            let index = self
+                .tab_index_by_id(id)
+                .or_else(|| self.active_terminal_index());
+            match (action, index) {
+                (RecoveryAction::Restart, Some(index)) => self.restart_tab(index),
+                (RecoveryAction::Settings, _) => self.open_settings(),
+                (RecoveryAction::Close, Some(index)) => self.close_tab(index),
+                (RecoveryAction::Restart | RecoveryAction::Close, None) => {}
+            }
         }
 
         if let Some(pos) = context_menu_pos
@@ -2702,24 +2805,35 @@ fn backdrop_plan(material: Material, mode: BackgroundMode) -> BackdropPlan {
 
 /// PowerShell's `Set-Location`/`cd` changes its provider location without
 /// updating the Win32 current directory, so a PEB read would keep reporting
-/// the startup folder. Sync the two at every prompt. The original prompt is
-/// preserved and still produces the visible text.
+/// the startup folder. PowerShell 7 exposes `LocationChangedAction`, which
+/// syncs the two without touching `prompt` and therefore without changing the
+/// `$?` a custom prompt reports. Windows PowerShell 5.1 has no such hook; there
+/// only the built-in/default prompt is wrapped, and a custom prompt is left
+/// untouched (its cwd is not synced). The original prompt still produces the
+/// visible text.
 const POWERSHELL_CWD_HOOK: &str = concat!(
+    "$global:__illness_sync = { try { [Environment]::CurrentDirectory = ",
+    "$ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath } catch {} }; ",
+    "$global:__illness_invoke = $ExecutionContext.SessionState.InvokeCommand; ",
+    "if ($global:__illness_invoke.PSObject.Properties['LocationChangedAction']) { ",
+    "$global:__illness_invoke.LocationChangedAction = $global:__illness_sync ",
+    "} elseif ($function:prompt -and ($function:prompt.ToString() -like ",
+    "'*PS $($executionContext.SessionState.Path.CurrentLocation)*$nestedPromptLevel*')) { ",
     "$global:__illness_prompt = $function:prompt; ",
-    "function global:prompt { ",
-    "try { [Environment]::CurrentDirectory = ",
-    "$ExecutionContext.SessionState.Path.CurrentLocation.ProviderPath } catch {}; ",
-    "if ($global:__illness_prompt) { & $global:__illness_prompt } ",
-    "else { 'PS ' + (Get-Location) + '> ' } ",
+    "function global:prompt { & $global:__illness_sync; & $global:__illness_prompt } ",
     "}"
 );
 
+/// Recognize `pwsh`/`powershell` with or without the `.exe` suffix.
 fn is_power_shell(program: &str) -> bool {
     Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            name.eq_ignore_ascii_case("pwsh.exe") || name.eq_ignore_ascii_case("powershell.exe")
+            name.eq_ignore_ascii_case("pwsh")
+                || name.eq_ignore_ascii_case("pwsh.exe")
+                || name.eq_ignore_ascii_case("powershell")
+                || name.eq_ignore_ascii_case("powershell.exe")
         })
 }
 
@@ -2780,10 +2894,17 @@ fn select_spawn_cwd(
     startup: Option<PathBuf>,
     process: Option<PathBuf>,
 ) -> Option<PathBuf> {
-    live.filter(|path| path.is_dir())
-        .or_else(|| stored.filter(|path| path.is_dir()))
-        .or_else(|| startup.filter(|path| path.is_dir()))
+    // A live shell's PEB path is trusted: checking it here duplicated the
+    // caller's check and could stall on a UNC working directory. Stored and
+    // launch folders are probed off-thread with a short deadline so an offline
+    // share falls through instead of freezing New Tab/startup.
+    live.or_else(|| stored.and_then(probe_spawn_dir))
+        .or_else(|| startup.and_then(probe_spawn_dir))
         .or(process)
+}
+
+fn probe_spawn_dir(path: PathBuf) -> Option<PathBuf> {
+    platform::path_is_dir_with_deadline(&path, SPAWN_PATH_PROBE_TIMEOUT).then_some(path)
 }
 
 /// Respect the Settings opt-out: disabled inheritance ignores the active
@@ -3047,6 +3168,67 @@ fn color_response(index: usize, theme: &Theme) -> String {
 
 fn removal_closes_window(remaining: usize) -> bool {
     remaining == 0
+}
+
+/// Centered recovery card for a shell that failed before it could be used.
+/// Returns the clicked action; the tab stays open until Close is chosen.
+fn show_recovery_card(
+    ctx: &egui::Context,
+    tokens: &Tokens,
+    tab_id: u64,
+    profile: &str,
+    title: &str,
+) -> Option<RecoveryAction> {
+    let mut action = None;
+    egui::Window::new("Shell ended")
+        .id(Id::unique(("illness-recovery", tab_id)))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.set_max_width(380.0);
+            ui.label(
+                egui::RichText::new(format!("{profile} exited immediately."))
+                    .size(tokens.font_body)
+                    .color(tokens.text),
+            );
+            if !title.trim().is_empty() && !title.eq_ignore_ascii_case(profile) {
+                ui.label(
+                    egui::RichText::new(title)
+                        .size(tokens.font_small)
+                        .color(tokens.text_dim),
+                );
+            }
+            ui.add_space(tokens.gap_sm);
+            ui.label(
+                egui::RichText::new(
+                    "The saved profile may point at a missing or uninstalled program.",
+                )
+                .size(tokens.font_small)
+                .color(tokens.text_dim),
+            );
+            ui.add_space(tokens.gap_md);
+            ui.horizontal(|ui| {
+                if ui.button("Restart").clicked() {
+                    action = Some(RecoveryAction::Restart);
+                }
+                if ui.button("Settings").clicked() {
+                    action = Some(RecoveryAction::Settings);
+                }
+                if ui.button("Close").clicked() {
+                    action = Some(RecoveryAction::Close);
+                }
+            });
+        });
+    action
+}
+
+/// Whether an exited shell should be kept with a recovery card instead of
+/// being removed. A spontaneous exit (no user interaction) is always treated
+/// as a failed profile; an exit in the first couple of seconds is also kept so
+/// a shell that fails on the first frame cannot close the window.
+fn needs_recovery(elapsed: Duration, user_acted: bool) -> bool {
+    !user_acted || elapsed < FAST_EXIT_WINDOW
 }
 
 /// New active strip index after removing `closing` from `remaining` entries.
@@ -4217,17 +4399,27 @@ mod tests {
     }
 
     #[test]
-    fn missing_live_and_stored_dirs_fall_back_to_startup_then_process() {
+    fn live_shell_path_is_trusted_and_missing_stored_dirs_fall_back() {
         let missing = std::env::temp_dir().join("illness-cwd-missing");
         let startup = test_dir("startup-fallback");
         let process = test_dir("process-fallback");
 
+        // The PEB path comes from a live shell and is not probed again.
         assert_eq!(
             select_spawn_cwd(
                 Some(missing.clone()),
                 Some(missing.clone()),
                 Some(startup.clone()),
                 Some(process.clone()),
+            ),
+            Some(missing.clone())
+        );
+        assert_eq!(
+            select_spawn_cwd(
+                None,
+                Some(missing.clone()),
+                Some(startup.clone()),
+                Some(process.clone())
             ),
             Some(startup.clone())
         );
@@ -4316,5 +4508,132 @@ mod tests {
         profile.args = vec!["/k".into(), "echo hello".into()];
 
         assert_eq!(shell_args(&profile, true), profile.args);
+    }
+
+    #[test]
+    fn fast_failed_shell_is_kept_but_normal_exit_closes() {
+        // A profile that fails immediately (even before a frame) must not
+        // become "no tabs" and close the window.
+        assert!(needs_recovery(Duration::ZERO, false));
+        assert!(needs_recovery(Duration::from_millis(100), false));
+        assert!(needs_recovery(Duration::from_secs(10), false));
+        // A quick exit is also kept, even if the user already typed.
+        assert!(needs_recovery(
+            FAST_EXIT_WINDOW - Duration::from_millis(1),
+            true
+        ));
+        // Normal `exit` after use still removes the tab immediately.
+        assert!(!needs_recovery(FAST_EXIT_WINDOW, true));
+        assert!(!needs_recovery(Duration::from_secs(30), true));
+    }
+
+    #[test]
+    fn powershell_is_recognized_without_the_exe_suffix() {
+        assert!(is_power_shell("pwsh"));
+        assert!(is_power_shell("pwsh.exe"));
+        assert!(is_power_shell("powershell"));
+        assert!(is_power_shell(r"C:\Program Files\PowerShell\7\pwsh.exe"));
+        assert!(!is_power_shell("cmd.exe"));
+        assert!(!is_power_shell("my-pwsh-wrapper.exe"));
+    }
+
+    #[test]
+    fn pwsh_without_exe_gets_the_cwd_hook() {
+        let mut profile = profile("PowerShell");
+        profile.program = "pwsh".to_string();
+
+        let args = shell_args(&profile, true);
+
+        assert_eq!(&args[..2], ["-NoExit", "-Command"]);
+        assert_eq!(args[2], POWERSHELL_CWD_HOOK);
+    }
+
+    #[test]
+    fn prompt_hook_targets_location_changes_and_default_prompts_only() {
+        assert!(POWERSHELL_CWD_HOOK.contains("LocationChangedAction"));
+        assert!(POWERSHELL_CWD_HOOK.contains("$nestedPromptLevel"));
+        // The custom prompt assignment is inside the 5.1-only `elseif` guard.
+        let guard = POWERSHELL_CWD_HOOK
+            .find("elseif")
+            .expect("the prompt fallback is guarded");
+        let wrap = POWERSHELL_CWD_HOOK
+            .find("$global:__illness_prompt = $function:prompt")
+            .expect("the default prompt fallback exists");
+        assert!(guard < wrap);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn test_powershells() -> Vec<std::path::PathBuf> {
+        use std::process::Command;
+
+        let mut shells = Vec::new();
+        if Command::new("pwsh")
+            .args(["-NoLogo", "-NoProfile", "-Command", "exit 0"])
+            .status()
+            .is_ok_and(|status| status.success())
+        {
+            shells.push(std::path::PathBuf::from("pwsh"));
+        }
+        if let Some(powershell) = std::env::var_os("SystemRoot").map(|root| {
+            std::path::PathBuf::from(root)
+                .join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        }) && powershell.is_file()
+        {
+            shells.push(powershell);
+        }
+        shells
+    }
+
+    #[cfg(target_os = "windows")]
+    fn run_powershell(shell: &std::path::Path, script: &str) -> String {
+        use std::process::Command;
+
+        let output = Command::new(shell)
+            .args(["-NoLogo", "-NoProfile", "-Command", script])
+            .output()
+            .expect("run PowerShell");
+        assert!(
+            output.status.success(),
+            "PowerShell failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prompt_hook_preserves_a_custom_prompts_success_status() {
+        for shell in test_powershells() {
+            let script = format!(
+                "function global:prompt {{ \"CUSTOM ok=$? \" }}; {POWERSHELL_CWD_HOOK}; \
+                 try {{ throw 'illness-test' }} catch {{}}; prompt"
+            );
+            let output = run_powershell(&shell, &script);
+            assert!(
+                output.contains("CUSTOM ok=False"),
+                "a custom prompt must still see the failed command in {}, got {output:?}",
+                shell.display()
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prompt_hook_syncs_cwd_for_the_default_prompt() {
+        for shell in test_powershells() {
+            let script = format!(
+                "{POWERSHELL_CWD_HOOK}; Set-Location $env:TEMP; prompt | Out-Null; \
+                 if ([Environment]::CurrentDirectory -ieq [IO.Path]::GetFullPath($env:TEMP)) {{ 'MATCH' }} else {{ [Environment]::CurrentDirectory }}"
+            );
+            let output = run_powershell(&shell, &script);
+            assert!(
+                output.contains("MATCH"),
+                "the cwd hook must update the process directory in {}, got {output:?}",
+                shell.display()
+            );
+        }
     }
 }

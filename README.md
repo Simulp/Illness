@@ -43,7 +43,9 @@ antialiasing (no ClearType color fringing).
   underline/strikethrough, OSC 8 hyperlinks and all cursor shapes.
 - Full xterm key and mouse encoding, bracketed paste, IME commit, focus reporting and DECSCUSR.
 - 10,000 lines of scrollback, smooth wheel scrolling, word/line selection and a jump-to-bottom pill.
-- A session that ends stays readable; Restart is one click away.
+- A shell that exits normally after use closes its tab (and the window when it was the last tab).
+  A profile that fails immediately keeps its tab and shows a Restart / Settings / Close recovery
+  card, so a missing shell can be fixed without relaunching.
 - Pixel-snapped, hinted glyphs on a nearest-sampled physical-pixel atlas. Glyphs are drawn on
   the GPU from a grayscale mask atlas (plus color emoji), while backgrounds, selection, search
   hits and the cursor stay pixel-exact; the CPU grayscale compositor remains as a fallback.
@@ -65,6 +67,38 @@ cargo build --release -p illness
 The binary is `target\release\illness.exe`. Release builds use the Windows GUI subsystem, so
 double-clicking it opens Illness directly instead of hosting a console in Windows Terminal.
 
+### Opening a folder
+
+```pwsh
+illness.exe "E:\Files"
+illness.exe C:\CLI
+```
+
+The positional folder is the launch folder. With **New tabs inherit current folder** enabled
+(the default, `inherit_cwd = true` in `%APPDATA%\illness\config.toml`), a new tab starts in the
+active shell's current directory; otherwise it uses the launch folder. The setting is captured
+when a tab is spawned: enabling it later does not retrofit already-open tabs.
+
+PowerShell 7 syncs its cwd through `LocationChangedAction` without touching `prompt`. Windows
+PowerShell 5.1 has no equivalent hook, so Illness only wraps the built-in/default prompt there.
+A custom 5.1 prompt is left untouched, which preserves its `$?` but means its folder may not be
+inherited; the tab keeps the last known folder instead. Stored and launch-folder checks run on a
+detached thread with a short deadline, so an offline UNC share falls back instead of freezing the
+UI.
+
+### Explorer context menu
+
+Illness adds per-user **Open with Illness** verbs for folder backgrounds, selected folders and
+drive roots (no file association). A normal launch only updates them when running from a stable
+installed location (`%ProgramFiles%`, `%ProgramFiles(x86)%`, or `%LOCALAPPDATA%\Programs`);
+running a `target\debug`, temporary or USB copy will not repoint an installed menu. Explicitly
+register or remove the current copy with:
+
+```pwsh
+illness.exe --register-context-menu
+illness.exe --unregister-context-menu
+```
+
 ### Windows installer
 
 Build a machine-wide NSIS installer with [cargo-packager](https://github.com/crabnebula-dev/cargo-packager) 0.11.8:
@@ -77,7 +111,9 @@ cargo install cargo-packager --version 0.11.8 --locked   # once
 The result is `dist\illness_0.1.0_x64-setup.exe`. It installs to `%ProgramFiles%\Illness` for all
 users (UAC prompt), creates an All Users Start Menu shortcut, and registers an uninstaller in
 Programs and Features. Settings remain per-user in `%APPDATA%\illness`; the uninstaller offers to
-remove them but keeps them by default.
+remove them but keeps them by default. Before deleting the install directory, the uninstaller
+removes the per-user Explorer verbs from HKCU and every loaded `HKEY_USERS` hive, so it does not
+depend on the app being launched again.
 
 ## Prescription
 

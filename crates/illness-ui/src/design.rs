@@ -115,7 +115,7 @@ impl Tokens {
 
             titlebar_h: 40.0,
             tabbar_h: 34.0,
-            caption_w: 46.0,
+            caption_w: 48.0,
 
             font_small: 12.0,
             font_body: 13.5,
@@ -146,7 +146,7 @@ impl Tokens {
             success: Color32::from_rgb(0x6C, 0xCB, 0x5F),
             titlebar_height: 40.0,
             tab_height: 34.0,
-            caption_width: 46.0,
+            caption_width: 48.0,
             caption_height: 40.0,
         }
     }
@@ -319,7 +319,7 @@ mod tests {
         assert_eq!(tokens.gap_xs, 4.0);
         assert_eq!(tokens.titlebar_h, 40.0);
         assert_eq!(tokens.tabbar_h, 34.0);
-        assert_eq!(tokens.caption_w, 46.0);
+        assert_eq!(tokens.caption_w, 48.0);
     }
 
     #[test]

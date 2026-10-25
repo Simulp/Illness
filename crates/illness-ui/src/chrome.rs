@@ -17,10 +17,22 @@ const TAB_GAP: f32 = 2.0;
 const TAB_SCROLL_STEP: f32 = 72.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DOUBLE_CLICK_SECS: f64 = 0.4;
-const PLUS_WIDTH: f32 = 30.0;
-const CHEVRON_WIDTH: f32 = 22.0;
-const NEW_TAB_HEIGHT: f32 = 28.0;
-const CLOSE_SIZE: f32 = 16.0;
+const PLUS_WIDTH: f32 = 36.0;
+const CHEVRON_WIDTH: f32 = 32.0;
+const NEW_TAB_HEIGHT: f32 = 30.0;
+const TAB_CLOSE_SIZE: f32 = 20.0;
+const TAB_CLOSE_GLYPH: f32 = 10.0;
+const PLUS_GLYPH: f32 = 22.0;
+const CHEVRON_GLYPH: f32 = 22.0;
+/// Gap between the tab strip/plus and the chevron/caption cluster.
+const CONTROL_GAP: f32 = 4.0;
+/// Caps between the chevron and the first caption button.
+const CAPTION_GAP: f32 = 2.0;
+/// Windows-standard caption button metrics (logical points, scaled by egui's
+/// pixels-per-point so hit rects and glyphs follow display DPI).
+const CAPTION_WIDTH_FALLBACK: f32 = 48.0;
+const CAPTION_ICON_SIZE: f32 = 12.0;
+const CAPTION_ICON_STROKE: f32 = 1.0;
 const MENU_WIDTH: f32 = 228.0;
 const EMPTY_BAR: usize = usize::MAX;
 const WINDOW_CLOSE_HOVER: Color32 = Color32::from_rgb(0xc4, 0x2b, 0x1c);
@@ -114,32 +126,16 @@ pub fn show(
         tokens.border,
     );
 
-    let caption_width = if tokens.caption_w > 0.0 {
-        tokens.caption_w
-    } else {
-        46.0
-    };
-    let captions = caption_rects(bar.right(), bar.top(), caption_width, bar_height);
-    let captions_left = captions[0].left();
-    let tabs_left = bar.left() + TAB_START_X;
-    // Lay the tabs out against the whole strip first, then park the new-tab
-    // button immediately after the content (or at the strip's right edge when
-    // the tabs overflow).
-    let strip_right = (captions_left - PLUS_WIDTH - CHEVRON_WIDTH - 6.0).max(tabs_left);
-    let slots = layout_tabs(strip_right - tabs_left, tabs.len());
-    let content_width = tabs_content_width(&slots);
-    let plus_left = plus_position(tabs_left, content_width, strip_right);
-    let tabs_right = (plus_left - 4.0).max(tabs_left);
-    let tab_viewport = Rect::from_min_max(
-        Pos2::new(tabs_left, bar.top()),
-        Pos2::new(tabs_right, bar.bottom()),
-    );
-    let tab_height = if tokens.tabbar_h > 0.0 && tokens.tabbar_h <= bar_height {
-        tokens.tabbar_h
-    } else {
-        bar_height
-    };
-    let tab_y = bar.bottom() - tab_height;
+    let ppp = ctx.pixels_per_point();
+    let layout = chrome_layout(bar, tokens, tabs.len());
+    let captions = layout.captions;
+    let captions_left = layout.captions_left;
+    let tabs_left = layout.tab_viewport.left();
+    let tab_viewport = layout.tab_viewport;
+    let tab_height = layout.tab_height;
+    let tab_y = layout.tab_y;
+    let slots = &layout.slots;
+    let content_width = tabs_content_width(slots);
 
     let max_scroll = (content_width - tab_viewport.width()).max(0.0);
     let pointer = ctx.input(|i| i.pointer.hover_pos());
@@ -253,8 +249,8 @@ pub fn show(
         );
 
         let close_rect = Rect::from_center_size(
-            Pos2::new(rect.right() - 18.0, rect.center().y),
-            Vec2::splat(CLOSE_SIZE),
+            Pos2::new(rect.right() - 22.0, rect.center().y),
+            Vec2::splat(TAB_CLOSE_SIZE),
         );
         let close_hovered = pointer.is_some_and(|pos| close_rect.contains(pos));
         if close_hovered {
@@ -283,15 +279,15 @@ pub fn show(
             if close_hovered {
                 tabs_painter.rect_filled(close_rect, 4.0, tokens.bg_sunken);
             }
-            icons::paint_icon(
+            paint_tab_close(
                 &tabs_painter,
-                Rect::from_center_size(close_rect.center(), Vec2::splat(8.0)),
-                Icon::Close,
+                close_rect.center(),
                 if close_hovered {
                     tokens.text
                 } else {
                     tokens.text_dim
                 },
+                ppp,
             );
         }
 
@@ -387,14 +383,8 @@ pub fn show(
         }
     }
 
-    let plus_rect = Rect::from_min_size(
-        Pos2::new(plus_left, bar.top() + (bar_height - NEW_TAB_HEIGHT) / 2.0),
-        Vec2::new(PLUS_WIDTH, NEW_TAB_HEIGHT),
-    );
-    let chevron_rect = Rect::from_min_size(
-        Pos2::new(plus_rect.right(), plus_rect.top()),
-        Vec2::new(CHEVRON_WIDTH, NEW_TAB_HEIGHT),
-    );
+    let plus_rect = layout.plus;
+    let chevron_rect = layout.chevron;
 
     let plus = ui.interact(plus_rect, Id::unique("illness_new_tab"), Sense::click());
     if plus.hovered() {
@@ -402,7 +392,7 @@ pub fn show(
     }
     icons::paint_icon(
         &painter,
-        Rect::from_center_size(plus_rect.center(), Vec2::splat(12.0)),
+        Rect::from_center_size(plus_rect.center(), Vec2::splat(PLUS_GLYPH)),
         Icon::Plus,
         tokens.text,
     );
@@ -421,7 +411,7 @@ pub fn show(
     }
     icons::paint_icon(
         &painter,
-        Rect::from_center_size(chevron_rect.center(), Vec2::splat(10.0)),
+        Rect::from_center_size(chevron_rect.center(), Vec2::splat(CHEVRON_GLYPH)),
         Icon::ChevronDown,
         tokens.text_dim,
     );
@@ -448,23 +438,12 @@ pub fn show(
                 },
             );
         }
-        let icon = match index {
-            0 => Icon::Minimize,
-            1 if maximized => Icon::Restore,
-            1 => Icon::Maximize,
-            _ => Icon::Close,
-        };
         let icon_color = if close && response.hovered() {
             Color32::WHITE
         } else {
             tokens.text
         };
-        icons::paint_icon(
-            &painter,
-            Rect::from_center_size(rect.center(), Vec2::splat(10.0)),
-            icon,
-            icon_color,
-        );
+        paint_caption_glyph(&painter, rect.center(), index, maximized, icon_color, ppp);
         if response.clicked() {
             actions.push(match index {
                 0 => Action::Minimize,
@@ -491,15 +470,15 @@ pub fn show(
     if tab_y > bar.top() {
         empty_regions.push(Rect::from_min_max(
             Pos2::new(tabs_left, bar.top()),
-            Pos2::new(captions_left, tab_y),
+            Pos2::new(captions_left, tab_y.min(plus_rect.top())),
         ));
     }
     // Gap between the last visible tab and the new-tab button. This also
     // covers the clipped edge when the tab strip overflows.
-    if plus_left > tabs_left {
+    if plus_rect.left() > tabs_left {
         empty_regions.push(Rect::from_min_max(
             Pos2::new(tab_viewport.right(), tab_y),
-            Pos2::new(plus_left, bar.bottom()),
+            Pos2::new(plus_rect.left(), bar.bottom()),
         ));
     }
     // Strip below the tabs, new-tab button and chevron.
@@ -509,11 +488,18 @@ pub fn show(
             Pos2::new(captions_left, bar.bottom()),
         ));
     }
-    // Everything right of the chevron still drags the window.
+    // Empty titlebar between the new-tab button and the right-aligned chevron.
+    if plus_rect.right() < chevron_rect.left() {
+        empty_regions.push(Rect::from_min_max(
+            Pos2::new(plus_rect.right(), plus_rect.top()),
+            Pos2::new(chevron_rect.left(), plus_rect.bottom()),
+        ));
+    }
+    // Narrow gap between the chevron and the caption cluster.
     if chevron_rect.right() < captions_left {
         empty_regions.push(Rect::from_min_max(
-            Pos2::new(chevron_rect.right(), plus_rect.top()),
-            Pos2::new(captions_left, plus_rect.bottom()),
+            Pos2::new(chevron_rect.right(), chevron_rect.top()),
+            Pos2::new(captions_left, chevron_rect.bottom()),
         ));
     }
 
@@ -629,6 +615,157 @@ pub fn show(
     actions
 }
 
+/// Positions shared by painting and hit-testing.
+///
+/// Everything here is in egui logical points; egui scales those to physical
+/// pixels using the window's pixels-per-point, so the same 48-point caption
+/// hit target follows display DPI. Order is always tabs → plus → gap →
+/// chevron → captions.
+#[derive(Debug, Clone)]
+struct ChromeLayout {
+    captions: [Rect; 3],
+    captions_left: f32,
+    chevron: Rect,
+    plus: Rect,
+    tab_viewport: Rect,
+    tab_y: f32,
+    tab_height: f32,
+    slots: Vec<(f32, f32)>,
+}
+
+fn chrome_layout(bar: Rect, tokens: &Tokens, tab_count: usize) -> ChromeLayout {
+    let bar_height = bar.height();
+    let caption_width = if tokens.caption_w > 0.0 {
+        tokens.caption_w
+    } else {
+        CAPTION_WIDTH_FALLBACK
+    };
+    let captions = caption_rects(bar.right(), bar.top(), caption_width, bar_height);
+    let captions_left = captions[0].left();
+
+    let control_height = NEW_TAB_HEIGHT.min(bar_height.max(0.0));
+    let control_top = bar.top() + (bar_height - control_height) / 2.0;
+    let chevron_left = (captions_left - CAPTION_GAP - CHEVRON_WIDTH).max(bar.left());
+    let chevron = Rect::from_min_size(
+        Pos2::new(chevron_left, control_top),
+        Vec2::new(CHEVRON_WIDTH, control_height),
+    );
+
+    let tabs_left = bar.left() + TAB_START_X;
+    let plus_limit = (chevron.left() - CONTROL_GAP - PLUS_WIDTH).max(tabs_left);
+    let tabs_available = (plus_limit - CONTROL_GAP - tabs_left).max(0.0);
+    let slots = layout_tabs(tabs_available, tab_count);
+    let content_width = tabs_content_width(&slots);
+    let plus_left = plus_position(tabs_left, content_width, plus_limit);
+    let plus = Rect::from_min_size(
+        Pos2::new(plus_left, control_top),
+        Vec2::new(PLUS_WIDTH, control_height),
+    );
+    let tabs_right = (plus.left() - CONTROL_GAP).max(tabs_left);
+
+    let tab_height = if tokens.tabbar_h > 0.0 && tokens.tabbar_h <= bar_height {
+        tokens.tabbar_h
+    } else {
+        bar_height
+    };
+    let tab_y = bar.bottom() - tab_height;
+    let tab_viewport = Rect::from_min_max(
+        Pos2::new(tabs_left, bar.top()),
+        Pos2::new(tabs_right, bar.bottom()),
+    );
+
+    ChromeLayout {
+        captions,
+        captions_left,
+        chevron,
+        plus,
+        tab_viewport,
+        tab_y,
+        tab_height,
+        slots,
+    }
+}
+
+/// Convert a logical stroke width to a whole number of physical pixels so
+/// hairlines stay crisp at 125/150/200% scaling, with a one-pixel floor.
+fn physical_stroke(ppp: f32, logical: f32) -> f32 {
+    let ppp = if ppp.is_finite() && ppp > 0.0 {
+        ppp
+    } else {
+        1.0
+    };
+    ((logical * ppp).round().max(1.0)) / ppp
+}
+
+/// Windows-style caption glyphs: a 12-point X, a 12-point minimize rule and a
+/// 9-point maximize/restore box. Drawn directly so the stroke can be snapped
+/// to physical pixels instead of inheriting the small 16-unit icon grid.
+fn paint_caption_glyph(
+    painter: &egui::Painter,
+    center: Pos2,
+    index: usize,
+    maximized: bool,
+    color: Color32,
+    ppp: f32,
+) {
+    let stroke = Stroke::new(physical_stroke(ppp, CAPTION_ICON_STROKE), color);
+    let extent = CAPTION_ICON_SIZE / 2.0;
+    match index {
+        0 => {
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - extent, center.y),
+                    Pos2::new(center.x + extent, center.y),
+                ],
+                stroke,
+            );
+        }
+        1 if maximized => {
+            let front = Rect::from_center_size(center + Vec2::new(1.0, 1.0), Vec2::splat(8.0));
+            let back = Rect::from_center_size(center - Vec2::new(1.0, 1.0), Vec2::splat(8.0));
+            painter.rect_stroke(back, 0.0, stroke, StrokeKind::Inside);
+            painter.rect_stroke(front, 0.0, stroke, StrokeKind::Inside);
+        }
+        1 => {
+            let box_rect = Rect::from_center_size(center, Vec2::splat(CAPTION_ICON_SIZE - 3.0));
+            painter.rect_stroke(box_rect, 0.0, stroke, StrokeKind::Inside);
+        }
+        _ => {
+            painter.line_segment(
+                [
+                    center - Vec2::splat(extent - 0.5),
+                    center + Vec2::splat(extent - 0.5),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    Pos2::new(center.x - extent + 0.5, center.y + extent - 0.5),
+                    Pos2::new(center.x + extent - 0.5, center.y - extent + 0.5),
+                ],
+                stroke,
+            );
+        }
+    }
+}
+
+/// Tab close X, deliberately larger than the 16-unit icon grid would make it.
+fn paint_tab_close(painter: &egui::Painter, center: Pos2, color: Color32, ppp: f32) {
+    let half = TAB_CLOSE_GLYPH / 2.0;
+    let stroke = Stroke::new(physical_stroke(ppp, 1.0), color);
+    painter.line_segment(
+        [center - Vec2::splat(half), center + Vec2::splat(half)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            Pos2::new(center.x - half, center.y + half),
+            Pos2::new(center.x + half, center.y - half),
+        ],
+        stroke,
+    );
+}
+
 fn top_tab_radius(tokens: &Tokens) -> CornerRadius {
     let radius = tokens.radius_md.clamp(0.0, 16.0).round() as u8;
     CornerRadius {
@@ -662,11 +799,12 @@ fn active_tab_fill(tokens: &Tokens, material: Material) -> Color32 {
     }
 }
 
-/// Left edge of the new-tab button. `strip_right` is the space reserved before
-/// the chevron and caption buttons, so overflowing tabs keep their clip edge.
-fn plus_position(tabs_left: f32, content_width: f32, strip_right: f32) -> f32 {
-    (tabs_left + content_width + 4.0)
-        .min(strip_right)
+/// Left edge of the new-tab button. `plus_limit` is the farthest-left position
+/// that still clears the right-aligned chevron; overflowing tabs pin the plus
+/// there.
+fn plus_position(tabs_left: f32, content_width: f32, plus_limit: f32) -> f32 {
+    (tabs_left + content_width + CONTROL_GAP)
+        .min(plus_limit)
         .max(tabs_left)
 }
 
@@ -679,6 +817,8 @@ fn menu_left(chevron: Rect, bar: Rect) -> f32 {
 }
 
 /// Tab slots as `(x_offset, width)`, relative to the tab strip origin.
+/// Gaps are reserved before widths are divided so a set of tabs that fits ends
+/// exactly at the strip edge, and the plus button can follow immediately.
 /// Widths clamp to 120..=220 and the strip is allowed to overflow.
 fn layout_tabs(width: f32, count: usize) -> Vec<(f32, f32)> {
     if count == 0 {
@@ -689,7 +829,8 @@ fn layout_tabs(width: f32, count: usize) -> Vec<(f32, f32)> {
     } else {
         0.0
     };
-    let tab_width = (width / count as f32).clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
+    let gaps = TAB_GAP * count.saturating_sub(1) as f32;
+    let tab_width = ((width - gaps).max(0.0) / count as f32).clamp(MIN_TAB_WIDTH, MAX_TAB_WIDTH);
     (0..count)
         .map(|index| (index as f32 * (tab_width + TAB_GAP), tab_width))
         .collect()
@@ -887,13 +1028,61 @@ mod tests {
 
     #[test]
     fn captions_end_at_window_edge() {
-        let rects = caption_rects(1180.0, 0.0, 46.0, 40.0);
+        let rects = caption_rects(1180.0, 0.0, 48.0, 40.0);
         assert_eq!(rects[2].right(), 1180.0);
-        assert_eq!(rects[2].width(), 46.0);
+        assert_eq!(rects[2].width(), 48.0);
         assert_eq!(rects[2].height(), 40.0);
-        assert_eq!(rects[0].left(), 1180.0 - 3.0 * 46.0);
+        assert_eq!(rects[0].left(), 1180.0 - 3.0 * 48.0);
         assert_eq!(rects[0].right(), rects[1].left());
         assert_eq!(rects[1].right(), rects[2].left());
+    }
+
+    #[test]
+    fn caption_hit_targets_and_glyphs_are_windows_standard() {
+        let tokens = Tokens::default();
+        let rects = caption_rects(1180.0, 0.0, tokens.caption_w, tokens.titlebar_h);
+        assert!((46.0..=50.0).contains(&tokens.caption_w));
+        for rect in rects {
+            assert_eq!(rect.width(), tokens.caption_w);
+            assert_eq!(
+                rect.height(),
+                tokens.titlebar_h,
+                "captions span the titlebar"
+            );
+        }
+        assert!((12.0..=14.0).contains(&CAPTION_ICON_SIZE));
+        for ppp in [1.0, 1.25, 1.5, 2.0] {
+            let physical = physical_stroke(ppp, CAPTION_ICON_STROKE) * ppp;
+            assert!(
+                (physical - physical.round()).abs() < 0.001 && physical >= 1.0,
+                "caption stroke must be whole physical pixels at {ppp}x, got {physical}"
+            );
+        }
+    }
+
+    #[test]
+    fn controls_have_larger_hit_rects() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 2);
+        assert!(layout.plus.width() >= 36.0);
+        assert!(layout.chevron.width() >= 32.0);
+        assert!(layout.plus.height() >= 28.0);
+        assert!(layout.chevron.height() >= 28.0);
+    }
+
+    #[test]
+    fn all_themes_share_the_caption_and_control_geometry() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
+        for theme in illness_core::Theme::all() {
+            let tokens = Tokens::from_theme(theme);
+            let layout = chrome_layout(bar, &tokens, 4);
+            assert_eq!(layout.captions[2].width(), tokens.caption_w);
+            assert_eq!(layout.captions[2].height(), tokens.titlebar_h);
+            assert_eq!(layout.chevron.width(), CHEVRON_WIDTH);
+            assert_eq!(layout.plus.width(), PLUS_WIDTH);
+            assert!(layout.captions_left >= layout.chevron.right());
+            assert!(layout.chevron.left() >= layout.plus.right());
+        }
     }
 
     #[test]
@@ -973,38 +1162,73 @@ mod tests {
 
     #[test]
     fn plus_sits_after_tab_content() {
-        let tabs = layout_tabs(600.0, 2);
-        let content = tabs_content_width(&tabs);
-        let strip_right = 800.0;
-        let plus = plus_position(8.0, content, strip_right);
-        assert!((plus - (8.0 + content + 4.0)).abs() < f32::EPSILON);
-        assert!(plus < strip_right);
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 2);
+        let content = tabs_content_width(&layout.slots);
+        let expected = 0.0 + TAB_START_X + content + CONTROL_GAP;
+        assert!((layout.plus.left() - expected).abs() < f32::EPSILON);
+        assert!(layout.plus.right() + CONTROL_GAP <= layout.chevron.left());
     }
 
     #[test]
-    fn plus_pins_to_strip_right_when_tabs_overflow() {
+    fn chevron_is_right_aligned_before_the_captions() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 3);
+        assert!((layout.chevron.right() + CAPTION_GAP - layout.captions[0].left()).abs() < 0.001);
+        assert!(layout.chevron.left() > layout.plus.right());
+        assert!(layout.tab_viewport.right() < layout.plus.left());
+    }
+
+    #[test]
+    fn minimum_width_keeps_tabs_plus_chevron_and_captions_apart() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 12);
+        assert!(tabs_content_width(&layout.slots) > layout.tab_viewport.width());
+        assert!(layout.plus.left() >= layout.tab_viewport.right() + CONTROL_GAP);
+        assert!(layout.plus.right() + CONTROL_GAP <= layout.chevron.left());
+        assert!(layout.chevron.right() + CAPTION_GAP <= layout.captions[0].left());
+        assert!(layout.captions[2].right() <= bar.right());
+        assert!(layout.tab_viewport.left() >= bar.left());
+    }
+
+    #[test]
+    fn plus_pins_before_chevron_when_tabs_overflow() {
         let tabs = layout_tabs(600.0, 8);
         let content = tabs_content_width(&tabs);
         assert!(content > 600.0);
         let plus = plus_position(8.0, content, 608.0);
-        assert!((plus - 608.0).abs() < f32::EPSILON);
-        // The chevron follows the plus and still clears the caption buttons.
-        assert!(plus + PLUS_WIDTH + CHEVRON_WIDTH <= 660.0);
+        assert!(
+            (plus - 608.0).abs() < f32::EPSILON,
+            "plus pins at the limit"
+        );
+        assert!(
+            plus < 8.0 + content + CONTROL_GAP,
+            "content overflows past it"
+        );
     }
 
     #[test]
     fn menu_right_edge_anchors_to_chevron() {
         let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
-        let chevron = Rect::from_min_size(Pos2::new(900.0, 6.0), Vec2::new(22.0, 28.0));
+        let chevron = Rect::from_min_size(
+            Pos2::new(900.0, 5.0),
+            Vec2::new(CHEVRON_WIDTH, NEW_TAB_HEIGHT),
+        );
         let left = menu_left(chevron, bar);
         assert!((left + MENU_WIDTH - chevron.right()).abs() < f32::EPSILON);
         assert!(left >= bar.left());
 
-        let left_chevron = Rect::from_min_size(Pos2::new(18.0, 6.0), Vec2::new(22.0, 28.0));
+        let left_chevron = Rect::from_min_size(
+            Pos2::new(18.0, 5.0),
+            Vec2::new(CHEVRON_WIDTH, NEW_TAB_HEIGHT),
+        );
         assert!((menu_left(left_chevron, bar) - (bar.left() + 4.0)).abs() < f32::EPSILON);
 
         let narrow = Rect::from_min_size(Pos2::ZERO, Vec2::new(240.0, 40.0));
-        let right_chevron = Rect::from_min_size(Pos2::new(216.0, 6.0), Vec2::new(22.0, 28.0));
+        let right_chevron = Rect::from_min_size(
+            Pos2::new(204.0, 5.0),
+            Vec2::new(CHEVRON_WIDTH, NEW_TAB_HEIGHT),
+        );
         let left = menu_left(right_chevron, narrow);
         assert!(left + MENU_WIDTH <= narrow.right());
     }

@@ -1240,7 +1240,7 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     muted_label(
         ui,
         tokens,
-        "New tabs start in the active tab's shell folder; otherwise the launch folder.",
+        "New tabs start in the active tab's shell folder; otherwise the launch folder. Applies at spawn, so changing it does not move open tabs. PowerShell 7 follows cwd changes; Windows PowerShell 5.1 needs its default prompt, so a custom prompt keeps its own $? but may not sync the folder.",
     );
 
     changed |= setting_row(ui, tokens, "Copy on select", |ui| {

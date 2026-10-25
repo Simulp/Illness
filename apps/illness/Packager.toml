@@ -33,6 +33,11 @@ before-packaging-command = "cargo build --release -p illness"
 # Note: cargo-packager 0.11.8 does not accept `install-mode`; the canonical
 # config key is `installMode` (alias: `installer-mode`).
 installMode = "perMachine"
+# Project copy of cargo-packager's NSIS template. It adds an uninstall hook
+# that removes the per-user Explorer verbs from HKCU and every loaded user
+# hive before $INSTDIR is deleted. Keep it in sync with the cargo-packager
+# version pinned by build-installer.ps1.
+template = "installer.nsi"
 installer-icon = "../../assets/illness.ico"
 compression = "lzma"
 languages = ["English"]

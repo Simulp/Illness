@@ -2,12 +2,15 @@
 # Build the Windows NSIS installer for Illness into dist/.
 # The installer is per-machine: running it prompts for UAC elevation.
 #
-# Explorer integration is per-user and registered by the application on every
-# normal launch, using its own executable path. A first launch from
-# $INSTDIR therefore points the verbs at the installed illness.exe. The NSIS
-# uninstaller does not execute the app, so run
+# Explorer integration is per-user. A normal launch registers it only from a
+# stable installed location (Program Files or %LOCALAPPDATA%\Programs); a
+# debug/temporary/USB copy will not repoint an installed menu. Use
+#   "$INSTDIR\illness.exe" --register-context-menu
+# to register deliberately from another location, and
 #   "$INSTDIR\illness.exe" --unregister-context-menu
-# before uninstalling if the "Open with Illness" verbs should be removed too.
+# to remove it for the current user. The per-machine uninstaller also removes
+# the verbs from HKCU and every loaded HKEY_USERS hive before deleting
+# $INSTDIR, so no next launch is required.
 $ErrorActionPreference = 'Stop'
 
 if (-not (Get-Command cargo-packager -ErrorAction SilentlyContinue)) {
