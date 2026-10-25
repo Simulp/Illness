@@ -40,6 +40,10 @@ const MAX_CONCURRENT_DECODES: usize = 2;
 /// stale rather than a user-visible image failure.
 pub const WARM_CANCELLED: &str = "background warm cancelled";
 
+/// Error published when a joined flight's leader unwinds without a result.
+/// Without it, a wait on the flight would last until the app's 30 s timeout.
+const WARM_FAILED: &str = "Background warm failed unexpectedly";
+
 /// A loaded backdrop texture and whether it came from an image (as opposed to
 /// the theme colour gradient). Theme changes only rebuild gradients.
 pub struct Backdrop {
@@ -450,6 +454,9 @@ fn acquire_decode_slot(token: &WarmToken) -> Result<DecodeSlot, String> {
 /// requests for other paths decode at most [`MAX_CONCURRENT_DECODES`] at a
 /// time. The flight never holds the registry lock across open/decode/blur.
 fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
+    // A request that takes over from a superseded leader may upload work the
+    // app has never painted. Its cache hit is a real change for that caller.
+    let mut takeover = false;
     loop {
         if token.is_cancelled() {
             return Err(WARM_CANCELLED.to_string());
@@ -461,7 +468,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
         }
         if let Some(cached) = cached_key(&key) {
             let _ = cached;
-            return Ok(LoadedImage { changed: false });
+            return Ok(LoadedImage { changed: takeover });
         }
 
         let warm_key = WarmKey::Image(path.to_path_buf());
@@ -471,7 +478,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                 Ok(outcome) => {
                     // Never hand a joiner an image cached for another mtime:
                     // the leader's result is only reusable when the current
-                    // `(path, mtime)` key still matches the cache.
+                    // `(path, mtime, len)` key still matches the cache.
                     let (key, exists) = image_key_state(path);
                     if !exists {
                         evict_image_path(path);
@@ -480,19 +487,28 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                     if let Some(cached) = cached_key(&key) {
                         let _ = cached;
                         return Ok(LoadedImage {
-                            changed: outcome.changed,
+                            changed: outcome.changed || takeover,
                         });
                     }
                     continue;
                 }
                 // The leader was superseded. If this request is still live,
-                // take over instead of surfacing a stale cancellation.
-                Err(error) if error == WARM_CANCELLED && !token.is_cancelled() => continue,
+                // take over instead of surfacing a stale cancellation. Remove
+                // the finished flight first so the takeover can register a new
+                // leader instead of re-joining the same cancelled result.
+                Err(error) if error == WARM_CANCELLED && !token.is_cancelled() => {
+                    remove_flight(&warm_key, &flight);
+                    takeover = true;
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }
 
-        let _registration = FlightRegistration { key: warm_key };
+        let _registration = FlightRegistration {
+            key: warm_key,
+            flight: Arc::clone(&flight),
+        };
         // Re-check after becoming leader: another flight may have completed
         // between the lookup above and registration.
         let outcome = if token.is_cancelled() {
@@ -504,7 +520,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                 Err(format!("Could not load \"{}\"", path.display()))
             } else if let Some(cached) = cached_key(&key) {
                 let _ = cached;
-                Ok(LoadedImage { changed: false })
+                Ok(LoadedImage { changed: takeover })
             } else {
                 match acquire_decode_slot(token) {
                     Err(error) => Err(error),
@@ -520,7 +536,7 @@ fn load_blurred(path: &Path, token: &WarmToken) -> Result<LoadedImage, String> {
                             Err(format!("Could not load \"{}\"", path.display()))
                         } else if let Some(cached) = cached_key(&key) {
                             let _ = cached;
-                            Ok(LoadedImage { changed: false })
+                            Ok(LoadedImage { changed: takeover })
                         } else {
                             #[cfg(test)]
                             DECODE_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -605,15 +621,17 @@ pub fn validate_dimensions(width: u32, height: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Cache identity: `(image path, mtime)` for decoded wallpapers, or the theme
-/// name for a synthesized gradient. Blurred/downscaled images are ~0.9 MB, so a
-/// small LRU keeps a Desktop wallpaper alive across an Image load without
-/// retaining full-size decodes. The mtime is resolved on the warm thread only.
-#[derive(Clone, PartialEq, Eq)]
+/// Cache identity: `(image path, mtime, length)` for decoded wallpapers, or the
+/// theme name for a synthesized gradient. Blurred/downscaled images are ~0.9 MB,
+/// so a small LRU keeps a Desktop wallpaper alive across an Image load without
+/// retaining full-size decodes. The mtime and length are resolved on the warm
+/// thread only; the UI path lookup stays path-only.
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CacheKey {
     Image {
         path: PathBuf,
         modified: Option<SystemTime>,
+        len: Option<u64>,
     },
     Gradient {
         theme: &'static str,
@@ -689,17 +707,18 @@ struct Flight {
 }
 
 /// Removes a flight from the registry when the leader finishes, even on an
-/// early error return.
+/// early error return. A leader that unwinds (a decoder panic) publishes an
+/// error first, so a joiner already waiting on the flight wakes immediately
+/// instead of spinning until the app-level timeout.
 struct FlightRegistration {
     key: WarmKey,
+    flight: Arc<Flight>,
 }
 
 impl Drop for FlightRegistration {
     fn drop(&mut self) {
-        let mut flights = warms()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        flights.remove(&self.key);
+        publish_flight_if_empty(&self.flight, Err(WARM_FAILED.to_string()));
+        remove_flight(&self.key, &self.flight);
     }
 }
 
@@ -723,6 +742,34 @@ fn publish_flight(flight: &Flight, result: Result<WarmOutcome, String>) {
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *slot = Some(result);
     flight.ready.notify_all();
+}
+
+/// Publish a fallback result only when the leader left without one, waking
+/// joiners that would otherwise wait for a flight that can never complete.
+fn publish_flight_if_empty(flight: &Flight, result: Result<WarmOutcome, String>) {
+    let mut slot = flight
+        .result
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot.is_none() {
+        *slot = Some(result);
+        flight.ready.notify_all();
+    }
+}
+
+/// Remove the registry entry only when it still points at `flight`. A live
+/// joiner may drop a finished cancelled flight and register a new leader; the
+/// old leader's late registration drop must not remove that new flight.
+fn remove_flight(key: &WarmKey, flight: &Arc<Flight>) {
+    let mut flights = warms()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if flights
+        .get(key)
+        .is_some_and(|current| Arc::ptr_eq(current, flight))
+    {
+        flights.remove(key);
+    }
 }
 
 fn wait_for_flight(flight: &Flight, token: &WarmToken) -> Result<WarmOutcome, String> {
@@ -834,11 +881,15 @@ fn image_key_state(path: &Path) -> (CacheKey, bool) {
     METADATA_COUNT.fetch_add(1, Ordering::Relaxed);
     let metadata = std::fs::metadata(path);
     let exists = metadata.is_ok();
-    let modified = metadata.ok().and_then(|metadata| metadata.modified().ok());
+    let (modified, len) = metadata
+        .ok()
+        .map(|metadata| (metadata.modified().ok(), Some(metadata.len())))
+        .unwrap_or((None, None));
     (
         CacheKey::Image {
             path: path.to_path_buf(),
             modified,
+            len,
         },
         exists,
     )
@@ -1138,9 +1189,11 @@ mod tests {
         publish_flight(&flight_b, Ok(WarmOutcome::UNCHANGED));
         drop(FlightRegistration {
             key: WarmKey::Image(PathBuf::from("independent-a.png")),
+            flight: Arc::clone(&flight_a),
         });
         drop(FlightRegistration {
             key: WarmKey::Image(PathBuf::from("independent-b.png")),
+            flight: Arc::clone(&flight_b),
         });
     }
 
@@ -1157,12 +1210,19 @@ mod tests {
         let joiner = std::thread::spawn(move || load_blurred(&joined_path, &WarmToken::new()));
         std::thread::sleep(Duration::from_millis(25));
         publish_flight(&flight, Err(WARM_CANCELLED.to_string()));
-        drop(FlightRegistration { key });
+        drop(FlightRegistration {
+            key,
+            flight: Arc::clone(&flight),
+        });
 
-        joiner
+        let loaded = joiner
             .join()
             .expect("joiner thread")
             .expect("a live joiner must take over instead of surfacing cancellation");
+        assert!(
+            loaded.changed,
+            "a takeover decode must upload instead of reporting an unchanged cache"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1173,6 +1233,7 @@ mod tests {
             let key = CacheKey::Image {
                 path: PathBuf::from(format!("lru-{index}.png")),
                 modified: None,
+                len: None,
             };
             cache_put(
                 key,
@@ -1182,11 +1243,13 @@ mod tests {
         let first = CacheKey::Image {
             path: PathBuf::from("lru-0.png"),
             modified: None,
+            len: None,
         };
         assert!(cached_key(&first).is_none(), "oldest entry is evicted");
         let last = CacheKey::Image {
             path: PathBuf::from(format!("lru-{CACHE_CAPACITY}.png")),
             modified: None,
+            len: None,
         };
         assert!(cached_key(&last).is_some());
     }
@@ -1548,6 +1611,189 @@ mod tests {
     }
 
     #[test]
+    fn superseded_warm_still_uploads_its_finished_decode() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_solid(&dir, "superseded.png", [10, 200, 30, 255]);
+        let text = path.to_string_lossy().into_owned();
+        let theme = Theme::by_name("Illness Dark");
+        let token = WarmToken::new();
+        *CANCEL_AFTER_DECODE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token.clone());
+
+        let error = load_blurred(&path, &token).expect_err("superseded warm must cancel");
+        assert_eq!(error, WARM_CANCELLED);
+        assert!(
+            cached_image_path(&path).is_some(),
+            "the superseded warm still completed its decode"
+        );
+
+        // The app's post-cancel rebuild is path-only. It must upload the
+        // finished decode instead of losing it behind a cache hit.
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+        let metadata = METADATA_COUNT.load(Ordering::Relaxed);
+        let ctx = Context::default();
+        match build(&ctx, theme, BackgroundMode::Image, &text) {
+            BackdropBuild::Ready(Some(backdrop)) => assert!(backdrop.from_image),
+            BackdropBuild::Ready(None) => panic!("the cached decode must paint"),
+            BackdropBuild::Warming => panic!("the cached decode must not warm again"),
+            BackdropBuild::Failed(error) => panic!("the cached decode failed: {error}"),
+        }
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed),
+            decodes,
+            "uploading the superseded decode must not decode again"
+        );
+        assert_eq!(
+            METADATA_COUNT.load(Ordering::Relaxed),
+            metadata,
+            "the UI upload path must stay path-only"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_live_takeover_uploads_the_cancelled_leaders_decode() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_image(&dir, "takeover-changed.png", 320, 200);
+        let leader_path = path.clone();
+        let leader_token = WarmToken::new();
+        *CANCEL_AFTER_DECODE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(leader_token.clone());
+        DECODE_DELAY_MS.store(200, Ordering::SeqCst);
+        let decodes = DECODE_COUNT.load(Ordering::Relaxed);
+
+        let leader = std::thread::spawn(move || load_blurred(&leader_path, &leader_token));
+        // Join while the leader is still inside the delayed decode, so this
+        // request waits on the leader rather than starting its own decode.
+        std::thread::sleep(Duration::from_millis(20));
+        let joiner_path = path.clone();
+        let joiner = std::thread::spawn(move || load_blurred(&joiner_path, &WarmToken::new()));
+
+        let leader_result = leader.join().expect("leader thread");
+        let joiner_result = joiner.join().expect("joiner thread");
+        DECODE_DELAY_MS.store(0, Ordering::SeqCst);
+
+        assert_eq!(
+            leader_result.expect_err("leader must cancel"),
+            WARM_CANCELLED
+        );
+        let loaded = joiner_result.expect("a live takeover must upload the cached decode");
+        assert!(
+            loaded.changed,
+            "the takeover cache hit must report a change so the app uploads it"
+        );
+        assert_eq!(
+            DECODE_COUNT.load(Ordering::Relaxed) - decodes,
+            1,
+            "the takeover must reuse the leader's completed decode"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cache_identity_includes_the_file_length() {
+        let _test = test_cache_lock();
+        let dir = temp_dir();
+        let path = write_solid(&dir, "identity.png", [1, 2, 3, 255]);
+        let before = image_key(&path);
+        let modified = std::fs::metadata(&path)
+            .expect("metadata")
+            .modified()
+            .expect("mtime");
+
+        // Replace the file with different bytes while restoring its mtime.
+        // An mtime-only key would miss this; the length keeps it distinct.
+        std::fs::write(&path, b"a replacement with a different length").expect("replace");
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open replacement");
+        file.set_times(std::fs::FileTimes::new().set_modified(modified))
+            .expect("restore mtime");
+        drop(file);
+
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("metadata")
+                .modified()
+                .expect("mtime"),
+            modified,
+            "the test must preserve the timestamp"
+        );
+        let after = image_key(&path);
+        assert!(
+            before != after,
+            "a timestamp-preserving replacement must change the cache key"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_panicking_leader_wakes_joiners() {
+        let _test = test_cache_lock();
+        let key = WarmKey::Image(PathBuf::from("panics.png"));
+        let (flight, leader) = begin_flight(key.clone());
+        assert!(leader);
+
+        let joiner_flight = Arc::clone(&flight);
+        let joiner = std::thread::spawn(move || wait_for_flight(&joiner_flight, &WarmToken::new()));
+        std::thread::sleep(Duration::from_millis(25));
+        let leader_thread = std::thread::spawn(move || {
+            let _registration = FlightRegistration { key, flight };
+            panic!("simulated decoder panic");
+        });
+        assert!(leader_thread.join().is_err(), "the leader must unwind");
+
+        let error = joiner
+            .join()
+            .expect("joiner thread")
+            .expect_err("a panicking leader must publish an error");
+        assert_eq!(error, WARM_FAILED);
+
+        // The registry entry must be gone, so a later request starts fresh.
+        let fresh_key = WarmKey::Image(PathBuf::from("panics.png"));
+        let (fresh, fresh_leader) = begin_flight(fresh_key.clone());
+        assert!(fresh_leader, "the panicked flight must not stay registered");
+        drop(FlightRegistration {
+            key: fresh_key,
+            flight: fresh,
+        });
+    }
+
+    #[test]
+    fn a_stale_registration_drop_keeps_the_replacement_flight() {
+        let _test = test_cache_lock();
+        let key = WarmKey::Image(PathBuf::from("replacement.png"));
+        let (old, leader) = begin_flight(key.clone());
+        assert!(leader);
+
+        // A live joiner removes the finished cancelled flight and a new leader
+        // registers before the old leader's registration drop runs.
+        remove_flight(&key, &old);
+        let (new, new_leader) = begin_flight(key.clone());
+        assert!(new_leader);
+        drop(FlightRegistration {
+            key: key.clone(),
+            flight: old,
+        });
+
+        let (still, still_leader) = begin_flight(key.clone());
+        assert!(
+            !still_leader,
+            "the stale drop must not remove the replacement flight"
+        );
+        assert!(Arc::ptr_eq(&still, &new));
+        drop(FlightRegistration { key, flight: new });
+    }
+
+    #[test]
     fn joiner_rejects_a_cache_entry_for_another_mtime() {
         let _test = test_cache_lock();
         let dir = temp_dir();
@@ -1575,7 +1821,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(25));
         let decodes = DECODE_COUNT.load(Ordering::Relaxed);
         publish_flight(&flight, Ok(WarmOutcome::UNCHANGED));
-        drop(FlightRegistration { key });
+        drop(FlightRegistration {
+            key,
+            flight: Arc::clone(&flight),
+        });
 
         let loaded = joiner
             .join()
