@@ -1,22 +1,30 @@
-//! GPU glyph compositor for the terminal grid.
+//! GPU glyph and fill compositor for the terminal grid.
 //!
-//! The CPU [`crate::soft`] pass still owns backgrounds, selection, search
-//! highlights, cursor fills, and underline/strike decorations. Glyph quads are
-//! drawn afterwards by an [`egui_wgpu`] paint callback, sampling a dedicated
-//! atlas of subpixel (RGB coverage) and color (premultiplied RGBA) glyphs.
+//! The CPU [`crate::soft`] pass keeps base/cell backgrounds and
+//! underline/strike decorations. Selection, search, and cursor fills are solid
+//! quads drawn here, before glyph quads, so they never invalidate the CPU
+//! surface. Glyph quads sample a dedicated atlas of subpixel (RGB coverage) and
+//! color (premultiplied RGBA) glyphs.
 //!
-//! Mask glyphs use `One`/`OneMinusSrcColor`, which blends each RGB channel
-//! independently and preserves ClearType fringes. Color glyphs (emoji) use
-//! premultiplied `One`/`OneMinusSrcAlpha`. Both use nearest sampling and
-//! physical-pixel quad positions, so atlas texels map 1:1 to screen pixels.
+//! Mask glyphs use dual-source blending: the fragment shader emits the
+//! foreground color as the first source and per-channel coverage as the
+//! second, and the pipeline blends with `Src1`/`OneMinusSrc1`. That keeps true
+//! per-channel ClearType fringes on light and selected backgrounds. Color
+//! glyphs (emoji) use premultiplied `One`/`OneMinusSrcAlpha`. Both use nearest
+//! sampling and physical-pixel quad positions, so atlas texels map 1:1 to
+//! screen pixels.
 //!
-//! wgpu resources are created lazily in `prepare` on the render thread. If the
-//! device is missing or the shared state is poisoned, [`GpuText::build_frame`]
-//! returns `None` and the caller keeps its CPU surface.
+//! Vertex data is cached by a content fingerprint and uploaded into a
+//! three-slot grow-only buffer ring; unchanged frames rebuild and upload
+//! nothing. wgpu resources are created lazily in `prepare` on the render
+//! thread. If the device lacks dual-source blending, the atlas overflows, or
+//! shared state is poisoned, [`GpuText::build_frame`] returns `None` and the
+//! caller keeps CPU text for the whole frame.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use egui::{Color32, Rect};
 use egui_wgpu::wgpu;
@@ -28,7 +36,7 @@ use illness_term::snapshot::CellFlags;
 use crate::design;
 use crate::glyph::{CellMetrics, GlyphAtlas, GlyphStyle};
 use crate::soft::{self, SurfaceSpec};
-use crate::terminal::{cell_colors, dim, glyph_style};
+use crate::terminal::{cell_colors, dim, find_matches, glyph_style, row_text, selection_ranges};
 
 /// Side length of the GPU atlas in texels.
 const ATLAS_SIZE: u32 = 2048;
@@ -36,8 +44,22 @@ const ATLAS_SIZE: u32 = 2048;
 const VERTEX_SIZE: usize = 8 * 4;
 /// Smallest vertex buffer allocation, so short frames do not churn buffers.
 const MIN_VERTEX_BYTES: u64 = 4096;
+/// Number of vertex buffers; one is uploaded while earlier ones may still be
+/// read by submitted frames.
+const SLOT_COUNT: usize = 3;
+/// Solid quads (selection, search, block cursor) are drawn before glyphs.
+const LAYER_FILLS: usize = 0;
+/// Subpixel mask glyphs.
+const LAYER_MASK: usize = 1;
+/// Color glyphs (emoji).
+const LAYER_COLOR: usize = 2;
+/// Beam and underline cursor fills are drawn over glyphs.
+const LAYER_CURSOR: usize = 3;
+const LAYER_COUNT: usize = 4;
 
 const SHADER: &str = r#"
+enable dual_source_blending;
+
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -48,6 +70,11 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
+};
+
+struct MaskOutput {
+    @location(0) @blend_src(0) color: vec4<f32>,
+    @location(0) @blend_src(1) coverage: vec4<f32>,
 };
 
 @group(0) @binding(0) var atlas: texture_2d<f32>;
@@ -63,15 +90,26 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_mask(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_mask(in: VertexOutput) -> MaskOutput {
     let coverage = textureSample(atlas, atlas_sampler, in.uv).rgb;
-    let alpha = max(coverage.r, max(coverage.g, coverage.b));
-    return vec4<f32>(in.color.rgb * coverage * in.color.a, alpha * in.color.a);
+    var out: MaskOutput;
+    // The material alpha is baked into the vertex alpha. The first source is
+    // the foreground; the second is per-channel coverage consumed by
+    // Src1/OneMinusSrc1.
+    out.color = vec4<f32>(in.color.rgb * in.color.a, in.color.a);
+    out.coverage = vec4<f32>(coverage, 1.0);
+    return out;
 }
 
 @fragment
 fn fs_color(in: VertexOutput) -> @location(0) vec4<f32> {
     return textureSample(atlas, atlas_sampler, in.uv) * in.color.a;
+}
+
+@fragment
+fn fs_solid(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Vertex colors are premultiplied by material and fill alpha.
+    return in.color;
 }
 "#;
 
@@ -156,6 +194,8 @@ struct GlyphCache {
     metrics: Option<MetricsKey>,
     /// Bumped whenever existing UVs stop being valid.
     generation: u64,
+    /// Sticky until the font metrics change; a partially packed frame must
+    /// fall back to CPU text instead of silently dropping glyphs.
     overflowed: bool,
 }
 
@@ -180,11 +220,12 @@ impl GlyphCache {
         self.generation = self.generation.wrapping_add(1);
     }
 
-    /// Drops cached glyphs when the rasterization geometry changes, and starts
-    /// over after an overflow so a later frame can repack everything.
+    /// Drops cached glyphs only when the rasterization geometry changes.
+    /// Overflow is sticky until then so a broken frame does not rebuild the
+    /// whole atlas on every repaint.
     fn begin_frame(&mut self, metrics: CellMetrics, ppp: f32) {
         let key = MetricsKey::new(metrics, ppp);
-        if self.metrics != Some(key) || self.overflowed {
+        if self.metrics != Some(key) {
             self.reset();
             self.metrics = Some(key);
         }
@@ -206,7 +247,7 @@ impl GlyphCache {
         }
         let Some((x, y)) = self.shelf.allocate(glyph.width, glyph.height) else {
             self.overflowed = true;
-            log::warn!("GPU glyph atlas is full; dropping new glyphs until the next font change");
+            log::warn!("GPU glyph atlas is full; using CPU text until the font or metrics change");
             return None;
         };
 
@@ -244,23 +285,91 @@ impl GlyphCache {
     }
 }
 
-/// Builds the vertex stream for one terminal frame.
+/// Reusable vertex scratch layers plus the assembled stream for one frame.
+///
+/// `layers` keeps its capacity across rebuilds and the assembled `vertices`
+/// grows to the high-water mark, so a changed frame does not allocate a new
+/// buffer.
+struct VertexStream {
+    fingerprint: Option<u64>,
+    generation: u64,
+    layers: [Vec<u8>; LAYER_COUNT],
+    vertices: Vec<u8>,
+    counts: [u32; LAYER_COUNT],
+    slot: usize,
+}
+
+impl Default for VertexStream {
+    fn default() -> Self {
+        Self {
+            fingerprint: None,
+            generation: 0,
+            layers: std::array::from_fn(|_| Vec::new()),
+            vertices: Vec::new(),
+            counts: [0; LAYER_COUNT],
+            slot: 0,
+        }
+    }
+}
+
+impl VertexStream {
+    /// Rebuilds only when the content fingerprint or atlas generation changed.
+    /// Returns `true` when new vertices must be uploaded.
+    fn update(
+        &mut self,
+        fingerprint: u64,
+        generation: u64,
+        surface_size: [u32; 2],
+        material_alpha: u8,
+        build: impl FnOnce(&mut VertexBuilder),
+    ) -> bool {
+        if self.fingerprint == Some(fingerprint) && self.generation == generation {
+            return false;
+        }
+
+        let layers = std::array::from_fn(|index| std::mem::take(&mut self.layers[index]));
+        let mut builder = VertexBuilder::new(surface_size, material_alpha, layers);
+        build(&mut builder);
+        let (counts, layers) = builder.finish();
+
+        self.vertices.clear();
+        for layer in &layers {
+            self.vertices.extend_from_slice(layer);
+        }
+        self.layers = layers;
+        self.counts = counts;
+        self.fingerprint = Some(fingerprint);
+        self.generation = generation;
+        self.slot = (self.slot + 1) % SLOT_COUNT;
+        true
+    }
+
+    /// Forgets the cached stream without releasing its capacity.
+    fn invalidate(&mut self) {
+        self.fingerprint = None;
+        self.vertices.clear();
+        self.counts = [0; LAYER_COUNT];
+    }
+}
+
+/// Builds the layered vertex stream for one terminal frame.
 struct VertexBuilder {
     surface_size: [u32; 2],
     /// Material alpha, baked into every vertex so translucent windows keep
     /// the same weight as the CPU surface.
     alpha: f32,
-    mask: Vec<u8>,
-    color: Vec<u8>,
+    layers: [Vec<u8>; LAYER_COUNT],
 }
 
 impl VertexBuilder {
-    fn new(surface_size: [u32; 2], material_alpha: u8) -> Self {
+    fn new(surface_size: [u32; 2], material_alpha: u8, mut layers: [Vec<u8>; LAYER_COUNT]) -> Self {
+        for layer in &mut layers {
+            layer.clear();
+        }
         Self {
             surface_size,
             alpha: f32::from(material_alpha) / 255.0,
-            mask: Vec::new(),
-            color: Vec::new(),
+            layers,
         }
     }
 
@@ -297,11 +406,8 @@ impl VertexBuilder {
                 self.alpha,
             ]
         };
-        let target = if slot.color {
-            &mut self.color
-        } else {
-            &mut self.mask
-        };
+        let layer = if slot.color { LAYER_COLOR } else { LAYER_MASK };
+        let target = &mut self.layers[layer];
         let corners = [
             ([ndc_x0, ndc_y0], [u0, v0]),
             ([ndc_x1, ndc_y0], [u1, v0]),
@@ -315,12 +421,47 @@ impl VertexBuilder {
         }
     }
 
-    fn finish(self) -> (Vec<u8>, u32, u32) {
-        let mask_vertices = (self.mask.len() / VERTEX_SIZE) as u32;
-        let color_vertices = (self.color.len() / VERTEX_SIZE) as u32;
-        let mut vertices = self.mask;
-        vertices.extend_from_slice(&self.color);
-        (vertices, mask_vertices, color_vertices)
+    /// Emits an axis-aligned solid rectangle in physical pixels.
+    fn push_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color32, layer: usize) {
+        let width = self.surface_size[0] as i32;
+        let height = self.surface_size[1] as i32;
+        let x0 = x0.clamp(0, width);
+        let x1 = x1.clamp(0, width);
+        let y0 = y0.clamp(0, height);
+        let y1 = y1.clamp(0, height);
+        if width <= 0 || height <= 0 || x1 <= x0 || y1 <= y0 {
+            return;
+        }
+
+        let ndc_x0 = x0 as f32 / width as f32 * 2.0 - 1.0;
+        let ndc_x1 = x1 as f32 / width as f32 * 2.0 - 1.0;
+        let ndc_y0 = 1.0 - y0 as f32 / height as f32 * 2.0;
+        let ndc_y1 = 1.0 - y1 as f32 / height as f32 * 2.0;
+
+        let fill_alpha = f32::from(color.a()) / 255.0;
+        let color = [
+            f32::from(color.r()) / 255.0 * self.alpha * fill_alpha,
+            f32::from(color.g()) / 255.0 * self.alpha * fill_alpha,
+            f32::from(color.b()) / 255.0 * self.alpha * fill_alpha,
+            fill_alpha,
+        ];
+        let target = &mut self.layers[layer];
+        let corners = [
+            ([ndc_x0, ndc_y0], [0.0, 0.0]),
+            ([ndc_x1, ndc_y0], [0.0, 0.0]),
+            ([ndc_x1, ndc_y1], [0.0, 0.0]),
+            ([ndc_x0, ndc_y0], [0.0, 0.0]),
+            ([ndc_x1, ndc_y1], [0.0, 0.0]),
+            ([ndc_x0, ndc_y1], [0.0, 0.0]),
+        ];
+        for (position, uv) in corners {
+            push_vertex(target, position, uv, color);
+        }
+    }
+
+    fn finish(self) -> ([u32; LAYER_COUNT], [Vec<u8>; LAYER_COUNT]) {
+        let counts = std::array::from_fn(|index| (self.layers[index].len() / VERTEX_SIZE) as u32);
+        (counts, self.layers)
     }
 }
 
@@ -346,6 +487,94 @@ fn push_glyph(
         return;
     };
     builder.push_quad(slot, cell_x + slot.left, cell_y + baseline - slot.top, fg);
+}
+
+/// Draws selection, search, and cursor fills as solid quads.
+fn build_fills(
+    builder: &mut VertexBuilder,
+    snapshot: &Snapshot,
+    spec: &SurfaceSpec<'_>,
+    metrics: CellMetrics,
+) {
+    let cell_width = metrics.width_px as i32;
+    let cell_height = metrics.height_px as i32;
+    if cell_width <= 0 || cell_height <= 0 || spec.cols == 0 || spec.rows == 0 {
+        return;
+    }
+    let origin = (spec.padding.max(0.0) * spec.ppp).round() as i32;
+
+    for (row, start, end) in selection_ranges(snapshot, spec.cols, spec.rows) {
+        if start >= end {
+            continue;
+        }
+        builder.push_rect(
+            origin + start as i32 * cell_width,
+            origin + row as i32 * cell_height,
+            origin + end as i32 * cell_width,
+            origin + (row as i32 + 1) * cell_height,
+            spec.tokens.selection,
+            LAYER_FILLS,
+        );
+    }
+
+    if let Some(search) = spec.search
+        && !search.query.is_empty()
+    {
+        let highlight = Color32::from_rgba_unmultiplied(
+            spec.tokens.accent.r(),
+            spec.tokens.accent.g(),
+            spec.tokens.accent.b(),
+            96,
+        );
+        for row in 0..spec.rows {
+            let text = row_text(snapshot, row, spec.cols);
+            for (start, end) in find_matches(&text, &search.query, search.case_sensitive) {
+                if start >= end {
+                    continue;
+                }
+                builder.push_rect(
+                    origin + start as i32 * cell_width,
+                    origin + row as i32 * cell_height,
+                    origin + end as i32 * cell_width,
+                    origin + (row as i32 + 1) * cell_height,
+                    highlight,
+                    LAYER_FILLS,
+                );
+            }
+        }
+    }
+
+    if !spec.show_cursor || spec.cols == 0 || spec.rows == 0 {
+        return;
+    }
+    let mut col = snapshot.cursor.col.min(spec.cols - 1);
+    let row = snapshot.cursor.row.min(spec.rows - 1);
+    if col > 0
+        && snapshot
+            .cell(col, row)
+            .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR_SPACER))
+    {
+        col -= 1;
+    }
+    let wide = snapshot
+        .cell(col, row)
+        .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR));
+    let x0 = origin + col as i32 * cell_width;
+    let y0 = origin + row as i32 * cell_height;
+    let x1 = x0 + if wide { cell_width * 2 } else { cell_width };
+    let y1 = y0 + cell_height;
+    let color = design::color(spec.theme.cursor);
+    match snapshot.cursor.kind {
+        CursorKind::Block => {
+            builder.push_rect(x0, y0, x1, y1, color, LAYER_FILLS);
+        }
+        CursorKind::Beam => {
+            builder.push_rect(x0, y0, x0 + 2, y1, color, LAYER_CURSOR);
+        }
+        CursorKind::Underline => {
+            builder.push_rect(x0, y1 - 2, x1, y1, color, LAYER_CURSOR);
+        }
+    }
 }
 
 /// Builds every glyph quad for the visible grid.
@@ -405,7 +634,7 @@ fn build_vertices(
         }
     }
 
-    // A block cursor inverts its glyph; the CPU pass draws the fill.
+    // A block cursor inverts its glyph; the CPU/GPU fill pass draws the block.
     if spec.show_cursor
         && snapshot.cursor.kind == CursorKind::Block
         && spec.cols > 0
@@ -453,19 +682,36 @@ pub struct GpuText {
 
 struct State {
     cache: GlyphCache,
+    stream: VertexStream,
+    buffers: Vec<Option<VertexBuffer>>,
+    /// Slot, fingerprint, and generation currently present in that slot's
+    /// buffer. Frames that egui never rendered must not look uploaded.
+    uploaded: Option<(usize, u64, u64)>,
     resources: Option<Resources>,
 }
 
 impl GpuText {
     /// Wraps the device that eframe created for the window.
     pub fn new(render_state: &egui_wgpu::RenderState) -> Self {
+        let dual_source = render_state
+            .device
+            .features()
+            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        if !dual_source {
+            log::warn!(
+                "GPU text disabled: the device does not support dual-source blending; using CPU text"
+            );
+        }
         Self {
             target_format: render_state.target_format,
             state: Mutex::new(State {
                 cache: GlyphCache::new(),
+                stream: VertexStream::default(),
+                buffers: Vec::new(),
+                uploaded: None,
                 resources: None,
             }),
-            failed: AtomicBool::new(false),
+            failed: AtomicBool::new(!dual_source),
         }
     }
 
@@ -473,6 +719,8 @@ impl GpuText {
     pub fn reset(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.cache.reset();
+            state.stream.invalidate();
+            state.uploaded = None;
         }
     }
 
@@ -502,50 +750,61 @@ impl GpuText {
         };
 
         state.cache.begin_frame(metrics, spec.ppp);
-        let mut builder = VertexBuilder::new(surface_size, design::material_alpha(spec.material));
-        build_vertices(&mut builder, &mut state.cache, atlas, snapshot, spec);
-        let (vertices, mask_vertices, color_vertices) = builder.finish();
+        // Debug-only fault injection used by the launch checks to prove the
+        // whole-frame CPU fallback and one-time overflow log.
+        #[cfg(debug_assertions)]
+        if std::env::var_os("ILLNESS_FORCE_GPU_ATLAS_OVERFLOW").is_some() {
+            state.cache.shelf.y = ATLAS_SIZE;
+        }
+        if state.cache.overflowed {
+            return None;
+        }
+
+        let mut gpu_spec = *spec;
+        gpu_spec.text = false;
+        gpu_spec.fills = true;
+        let fingerprint = soft::fingerprint(snapshot, &gpu_spec);
+        let generation = state.cache.generation;
+        let material_alpha = design::material_alpha(spec.material);
+
+        let started = Instant::now();
+        let rebuilt = {
+            let State { cache, stream, .. } = &mut *state;
+            stream.update(
+                fingerprint,
+                generation,
+                surface_size,
+                material_alpha,
+                |builder| {
+                    build_fills(builder, snapshot, spec, metrics);
+                    build_vertices(builder, cache, atlas, snapshot, spec);
+                },
+            )
+        };
+        if rebuilt && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "gpu frame rebuild {} vertices, {} bytes in {:?}",
+                state.stream.vertices.len() / VERTEX_SIZE,
+                state.stream.vertices.len(),
+                started.elapsed()
+            );
+        }
+
+        // The atlas filled up while packing. Discard the partial stream and
+        // let the caller draw this whole frame with CPU glyphs.
+        if state.cache.overflowed {
+            state.stream.invalidate();
+            return None;
+        }
 
         Some(GpuFrame {
             shared: Arc::clone(self),
-            vertices,
-            mask_vertices,
-            color_vertices,
-            generation: state.cache.generation,
-            buffer: Mutex::new(None),
+            slot: state.stream.slot,
+            fingerprint,
+            generation,
+            counts: state.stream.counts,
+            bytes: state.stream.vertices.len() as u64,
         })
-    }
-
-    fn upload_vertices(
-        &self,
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        frame: &GpuFrame,
-    ) -> bool {
-        let Ok(mut buffer) = frame.buffer.lock() else {
-            return false;
-        };
-        let needed = frame.vertices.len() as u64;
-        let needs_buffer = buffer.as_ref().is_none_or(|slot| slot.size < needed);
-        if needs_buffer {
-            let size = needed.max(MIN_VERTEX_BYTES).next_power_of_two();
-            *buffer = Some(VertexBuffer {
-                buffer: device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("illness-gpu-text-vertices"),
-                    size,
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                }),
-                size,
-            });
-        }
-        let Some(slot) = buffer.as_ref() else {
-            return false;
-        };
-        if !frame.vertices.is_empty() {
-            queue.write_buffer(&slot.buffer, 0, &frame.vertices);
-        }
-        true
     }
 }
 
@@ -554,21 +813,21 @@ struct VertexBuffer {
     size: u64,
 }
 
-/// One frame's glyph quads. The paint callback owns it until egui renders.
+/// One frame's quads. The paint callback owns it until egui renders.
 pub struct GpuFrame {
     shared: Arc<GpuText>,
-    vertices: Vec<u8>,
-    mask_vertices: u32,
-    color_vertices: u32,
+    slot: usize,
+    fingerprint: u64,
     generation: u64,
-    buffer: Mutex<Option<VertexBuffer>>,
+    counts: [u32; LAYER_COUNT],
+    bytes: u64,
 }
 
 impl GpuFrame {
     /// True when there is nothing to draw (blank grid, or every glyph failed
-    /// to pack). The caller still keeps CPU glyphs off because there are none.
+    /// to pack).
     pub fn is_empty(&self) -> bool {
-        self.mask_vertices == 0 && self.color_vertices == 0
+        self.counts.iter().all(|&count| count == 0)
     }
 
     /// Converts the frame into an egui paint callback over `rect`.
@@ -615,7 +874,23 @@ impl CallbackTrait for GpuFrame {
             }
         }
 
-        self.shared.upload_vertices(device, queue, self);
+        let key = (self.slot, self.fingerprint, self.generation);
+        if state.uploaded != Some(key) {
+            let matches = {
+                let State {
+                    stream, buffers, ..
+                } = &mut *state;
+                let matches = stream.fingerprint == Some(self.fingerprint)
+                    && stream.vertices.len() as u64 == self.bytes;
+                if matches {
+                    upload_vertices(device, queue, buffers, self.slot, &stream.vertices);
+                }
+                matches
+            };
+            if matches {
+                state.uploaded = Some(key);
+            }
+        }
         Vec::new()
     }
 
@@ -637,10 +912,7 @@ impl CallbackTrait for GpuFrame {
         if state.cache.generation != self.generation || resources.generation != self.generation {
             return;
         }
-        let Ok(buffer) = self.buffer.lock() else {
-            return;
-        };
-        let Some(slot) = buffer.as_ref() else {
+        let Some(slot) = state.buffers.get(self.slot).and_then(Option::as_ref) else {
             return;
         };
 
@@ -658,17 +930,78 @@ impl CallbackTrait for GpuFrame {
         render_pass.set_scissor_rect(left, top, right - left, bottom - top);
         render_pass.set_bind_group(0, &resources.bind_group, &[]);
         render_pass.set_vertex_buffer(0, slot.buffer.slice(..));
-        if self.mask_vertices > 0 {
+
+        let mut first = 0;
+        let [fills, mask, color, cursor] = self.counts;
+        if fills > 0 {
+            render_pass.set_pipeline(&resources.solid_pipeline);
+            render_pass.draw(first..first + fills, 0..1);
+            first += fills;
+        }
+        if mask > 0 {
             render_pass.set_pipeline(&resources.mask_pipeline);
-            render_pass.draw(0..self.mask_vertices, 0..1);
+            render_pass.draw(first..first + mask, 0..1);
+            first += mask;
         }
-        if self.color_vertices > 0 {
+        if color > 0 {
             render_pass.set_pipeline(&resources.color_pipeline);
-            render_pass.draw(
-                self.mask_vertices..self.mask_vertices + self.color_vertices,
-                0..1,
-            );
+            render_pass.draw(first..first + color, 0..1);
+            first += color;
         }
+        if cursor > 0 {
+            render_pass.set_pipeline(&resources.solid_pipeline);
+            render_pass.draw(first..first + cursor, 0..1);
+        }
+    }
+}
+
+/// Creates or grows one ring slot and uploads `data` into it.
+fn upload_vertices(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffers: &mut Vec<Option<VertexBuffer>>,
+    slot: usize,
+    data: &[u8],
+) {
+    if buffers.len() <= slot {
+        buffers.resize_with(slot + 1, || None);
+    }
+    let needed = data.len() as u64;
+    let needs_buffer = buffers[slot]
+        .as_ref()
+        .is_none_or(|buffer| buffer.size < needed);
+    if needs_buffer {
+        let size = needed.max(MIN_VERTEX_BYTES).next_power_of_two();
+        buffers[slot] = Some(VertexBuffer {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("illness-gpu-text-vertices"),
+                size,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            size,
+        });
+    }
+    if let Some(Some(buffer)) = buffers.get(slot)
+        && !data.is_empty()
+    {
+        queue.write_buffer(&buffer.buffer, 0, data);
+    }
+}
+
+/// Dual-source mask blending: foreground color times per-channel coverage.
+fn mask_blend_state() -> wgpu::BlendState {
+    wgpu::BlendState {
+        color: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::Src1,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+            operation: wgpu::BlendOperation::Add,
+        },
+        alpha: wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+            operation: wgpu::BlendOperation::Add,
+        },
     }
 }
 
@@ -676,6 +1009,7 @@ struct Resources {
     bind_group: wgpu::BindGroup,
     bind_group_layout: wgpu::BindGroupLayout,
     mask_pipeline: wgpu::RenderPipeline,
+    solid_pipeline: wgpu::RenderPipeline,
     color_pipeline: wgpu::RenderPipeline,
     texture: wgpu::Texture,
     generation: u64,
@@ -742,18 +1076,7 @@ impl Resources {
             &shader,
             &vertex_buffers,
             "fs_mask",
-            wgpu::BlendState {
-                color: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrc,
-                    operation: wgpu::BlendOperation::Add,
-                },
-                alpha: wgpu::BlendComponent {
-                    src_factor: wgpu::BlendFactor::One,
-                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                    operation: wgpu::BlendOperation::Add,
-                },
-            },
+            mask_blend_state(),
             "illness-gpu-text-mask-pipeline",
         );
         let color_pipeline = create_pipeline(
@@ -766,24 +1089,26 @@ impl Resources {
             wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
             "illness-gpu-text-color-pipeline",
         );
+        let solid_pipeline = create_pipeline(
+            device,
+            format,
+            &pipeline_layout,
+            &shader,
+            &vertex_buffers,
+            "fs_solid",
+            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
+            "illness-gpu-text-solid-pipeline",
+        );
 
         let texture = create_atlas_texture(device);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("illness-gpu-text-sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let sampler = create_sampler(device);
         let bind_group = create_bind_group(device, &bind_group_layout, &texture, &sampler);
 
         Self {
             bind_group,
             bind_group_layout,
             mask_pipeline,
+            solid_pipeline,
             color_pipeline,
             texture,
             generation,
@@ -793,16 +1118,7 @@ impl Resources {
     /// Replaces the atlas with a zeroed texture after the cache was reset.
     fn rebuild_atlas(&mut self, device: &wgpu::Device, generation: u64) {
         let texture = create_atlas_texture(device);
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("illness-gpu-text-sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
+        let sampler = create_sampler(device);
         self.bind_group = create_bind_group(device, &self.bind_group_layout, &texture, &sampler);
         self.texture = texture;
         self.generation = generation;
@@ -852,6 +1168,19 @@ fn create_atlas_texture(device: &wgpu::Device) -> wgpu::Texture {
         format: wgpu::TextureFormat::Rgba8Unorm,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
+    })
+}
+
+fn create_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+    device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("illness-gpu-text-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+        ..Default::default()
     })
 }
 
@@ -932,13 +1261,33 @@ pub(crate) fn test_vertices(
     snapshot: &Snapshot,
     spec: &SurfaceSpec<'_>,
 ) -> (Vec<u8>, u32, u32) {
+    let (vertices, counts) = test_layers(atlas, snapshot, spec, false);
+    (vertices, counts[LAYER_MASK], counts[LAYER_COLOR])
+}
+
+#[cfg(test)]
+fn test_layers(
+    atlas: &mut GlyphAtlas,
+    snapshot: &Snapshot,
+    spec: &SurfaceSpec<'_>,
+    fills: bool,
+) -> (Vec<u8>, [u32; LAYER_COUNT]) {
     let surface_size = soft::surface_size(spec.rect, spec.ppp).expect("surface size");
     let surface_size = [surface_size[0] as u32, surface_size[1] as u32];
     let mut cache = GlyphCache::new();
     cache.begin_frame(atlas.metrics(), spec.ppp);
-    let mut builder = VertexBuilder::new(surface_size, 255);
+    let metrics = atlas.metrics();
+    let mut builder = VertexBuilder::new(surface_size, 255, std::array::from_fn(|_| Vec::new()));
+    if fills {
+        build_fills(&mut builder, snapshot, spec, metrics);
+    }
     build_vertices(&mut builder, &mut cache, atlas, snapshot, spec);
-    builder.finish()
+    let (counts, layers) = builder.finish();
+    let mut vertices = Vec::new();
+    for layer in &layers {
+        vertices.extend_from_slice(layer);
+    }
+    (vertices, counts)
 }
 
 #[cfg(test)]
@@ -961,7 +1310,8 @@ mod tests {
             material: illness_core::Material::Solid,
             show_cursor: false,
             search: None,
-            text: false,
+            text: true,
+            fills: true,
             theme,
             tokens,
             font_size: 14.0,
@@ -981,6 +1331,77 @@ mod tests {
                 ]
             })
             .collect()
+    }
+
+    #[test]
+    fn mask_pipeline_uses_dual_source_channel_coverage() {
+        let blend = mask_blend_state();
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::Src1);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrc1);
+        assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+        assert!(SHADER.contains("enable dual_source_blending"));
+        assert!(SHADER.contains("@blend_src(0)"));
+        assert!(SHADER.contains("@blend_src(1)"));
+        assert!(!SHADER.contains("OneMinusSrcColor"));
+    }
+
+    #[test]
+    fn vertex_stream_reuses_unchanged_frames() {
+        let mut stream = VertexStream::default();
+        let mut builds = 0;
+        let rebuilt = stream.update(7, 1, [64, 64], 255, |builder| {
+            builds += 1;
+            builder.push_rect(0, 0, 8, 8, Color32::WHITE, LAYER_FILLS);
+        });
+        assert!(rebuilt);
+        assert_eq!(builds, 1);
+        let first_len = stream.vertices.len();
+        let first_slot = stream.slot;
+
+        let rebuilt = stream.update(7, 1, [64, 64], 255, |_| builds += 1);
+        assert!(!rebuilt, "same fingerprint must reuse the vertex stream");
+        assert_eq!(builds, 1);
+        assert_eq!(stream.vertices.len(), first_len);
+        assert_eq!(stream.slot, first_slot);
+
+        let rebuilt = stream.update(8, 1, [64, 64], 255, |_| builds += 1);
+        assert!(rebuilt);
+        assert_eq!(builds, 2);
+        assert_ne!(stream.slot, first_slot, "rebuilds rotate the buffer ring");
+
+        // An atlas generation change invalidates the stream even when the
+        // snapshot is identical.
+        assert!(stream.update(8, 2, [64, 64], 255, |_| builds += 1));
+        assert_eq!(builds, 3);
+    }
+
+    #[test]
+    fn atlas_overflow_falls_back_until_metrics_change() {
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 14.0, 1.0);
+        let mut cache = GlyphCache::new();
+        cache.begin_frame(atlas.metrics(), 1.0);
+        cache.shelf.y = ATLAS_SIZE;
+
+        assert!(cache.slot(&mut atlas, 'A', GlyphStyle::Regular).is_none());
+        assert!(cache.overflowed);
+        assert!(
+            cache.slot(&mut atlas, 'B', GlyphStyle::Regular).is_none(),
+            "an overflowed cache must not pretend later glyphs fit"
+        );
+
+        // Same metrics: stay overflowed instead of resetting/logging per frame.
+        cache.begin_frame(atlas.metrics(), 1.0);
+        assert!(cache.overflowed);
+        assert!(cache.slot(&mut atlas, 'C', GlyphStyle::Regular).is_none());
+
+        // New metrics clear the overflow and repack from scratch.
+        let mut metrics = atlas.metrics();
+        metrics.height_px += 1;
+        cache.begin_frame(metrics, 1.0);
+        assert!(!cache.overflowed);
+        assert!(cache.slot(&mut atlas, 'A', GlyphStyle::Regular).is_some());
     }
 
     #[test]
@@ -1060,6 +1481,51 @@ mod tests {
         assert!(vertices.is_empty());
         assert_eq!(mask, 0);
         assert_eq!(color, 0);
+    }
+
+    #[test]
+    fn selection_search_and_cursor_are_gpu_fills() {
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 14.0, 1.0);
+        let theme = Theme::by_name("Illness Dark");
+        let tokens = Tokens::from_theme(theme);
+        let metrics = atlas.metrics();
+        let rect = Rect::from_min_size(
+            pos2(0.0, 0.0),
+            vec2(
+                (metrics.width_px * 4) as f32,
+                (metrics.height_px * 2) as f32,
+            ),
+        );
+        let mut spec = spec(rect, theme, &tokens);
+        spec.show_cursor = true;
+        let search = crate::terminal::SearchState {
+            query: "AA".to_string(),
+            case_sensitive: true,
+        };
+        spec.search = Some(&search);
+
+        let mut snapshot = Snapshot::empty(4, 2);
+        snapshot.cells[0].ch = 'A';
+        snapshot.cells[1].ch = 'A';
+        snapshot.cursor.visible = true;
+        snapshot.cursor.kind = CursorKind::Block;
+        snapshot.selection = vec![illness_term::SelectionSpan {
+            start: (0, 0),
+            end: (0, 1),
+        }];
+
+        let (vertices, counts) = test_layers(&mut atlas, &snapshot, &spec, true);
+        assert_eq!(
+            counts[LAYER_FILLS], 18,
+            "selection, search, and block cursor fills should be solid quads"
+        );
+        assert_eq!(counts[LAYER_MASK], 18);
+        assert_eq!(counts[LAYER_CURSOR], 0);
+        assert_eq!(
+            vertices.len(),
+            counts.iter().sum::<u32>() as usize * VERTEX_SIZE
+        );
     }
 
     #[test]

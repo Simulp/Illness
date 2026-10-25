@@ -198,8 +198,11 @@ impl ShelfAllocator {
 }
 
 /// A `swash`-backed glyph atlas uploaded as one egui texture.
+///
+/// The 2048² egui texture is created lazily on the first CPU glyph. A
+/// GPU-only terminal never allocates it; the GPU pass has its own small atlas.
 pub struct GlyphAtlas {
-    texture: TextureHandle,
+    texture: Option<TextureHandle>,
     options: TextureOptions,
     ctx: egui::Context,
     metrics: CellMetrics,
@@ -241,14 +244,9 @@ impl GlyphAtlas {
             physical_size,
             ppp,
         );
-        let texture = ctx.load_texture(
-            ATLAS_NAME,
-            ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
-            TextureOptions::NEAREST,
-        );
 
         Self {
-            texture,
+            texture: None,
             options: TextureOptions::NEAREST,
             ctx: ctx.clone(),
             metrics,
@@ -420,10 +418,12 @@ impl GlyphAtlas {
         };
 
         let (tile, _coverage) = build_tile(&image, tile_width, tile_height);
-        self.texture.set_partial(
+        let options = self.options;
+        let texture = self.ensure_texture();
+        texture.set_partial(
             [origin.0, origin.1],
             ColorImage::new([tile_width, tile_height], tile),
-            self.options,
+            options,
         );
 
         let atlas_size = ATLAS_SIZE as f32;
@@ -517,9 +517,21 @@ impl GlyphAtlas {
         Some(glyph)
     }
 
-    /// The atlas texture to sample from in custom meshes.
-    pub fn texture(&self) -> TextureId {
-        self.texture.id()
+    /// The atlas texture to sample from in custom meshes, once CPU glyphs
+    /// have been requested. GPU-only text never creates it.
+    pub fn texture(&self) -> Option<TextureId> {
+        self.texture.as_ref().map(TextureHandle::id)
+    }
+
+    /// Creates the egui atlas on first CPU glyph use.
+    fn ensure_texture(&mut self) -> &mut TextureHandle {
+        self.texture.get_or_insert_with(|| {
+            self.ctx.load_texture(
+                ATLAS_NAME,
+                ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
+                self.options,
+            )
+        })
     }
 
     /// Sampling options used for the atlas (always nearest for crisp text).
@@ -538,6 +550,9 @@ impl GlyphAtlas {
         if glyph.size.x <= 0.0 || glyph.size.y <= 0.0 {
             return;
         }
+        let Some(texture_id) = self.texture.as_ref().map(TextureHandle::id) else {
+            return;
+        };
 
         let ppp = painter.ctx().pixels_per_point().max(f32::EPSILON);
         let snap = |value: f32| (value * ppp).round() / ppp;
@@ -561,7 +576,7 @@ impl GlyphAtlas {
         let uv = glyph.uv;
         let vertex_color = if glyph.color { Color32::WHITE } else { color };
 
-        let mut mesh = Mesh::with_texture(self.texture.id());
+        let mut mesh = Mesh::with_texture(texture_id);
         mesh.vertices.push(Vertex {
             pos: rect.left_top(),
             uv: uv.left_top(),
@@ -592,10 +607,12 @@ impl GlyphAtlas {
         self.cache.clear();
         self.soft_cache.clear();
         self.allocator.reset();
-        self.texture.set(
-            ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
-            self.options,
-        );
+        if let Some(texture) = self.texture.as_mut() {
+            texture.set(
+                ColorImage::filled([ATLAS_SIZE, ATLAS_SIZE], Color32::TRANSPARENT),
+                self.options,
+            );
+        }
         #[cfg(test)]
         {
             self.last_coverage = (0, 0);
@@ -1170,6 +1187,26 @@ mod tests {
     fn test_nearest() {
         let (_ctx, atlas) = atlas(14.0, 1.0);
         assert_eq!(atlas.texture_options(), TextureOptions::NEAREST);
+    }
+
+    /// GPU-only text must not allocate the 16 MB egui atlas.
+    #[test]
+    fn egui_atlas_is_lazy() {
+        let (_ctx, mut atlas) = atlas(14.0, 1.0);
+        assert!(atlas.texture().is_none());
+
+        let glyph = atlas
+            .soft_glyph('H', GlyphStyle::Regular)
+            .expect("soft glyph");
+        assert!(glyph.width > 0);
+        assert!(
+            atlas.texture().is_none(),
+            "the software glyph cache alone must not create the egui atlas"
+        );
+
+        let glyph = atlas.glyph('H', GlyphStyle::Regular).expect("mesh glyph");
+        assert!(glyph.size.x > 0.0);
+        assert!(atlas.texture().is_some(), "mesh glyphs need the egui atlas");
     }
 
     #[test]

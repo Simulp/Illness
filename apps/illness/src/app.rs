@@ -166,8 +166,12 @@ impl IllnessApp {
         } else {
             None
         };
-        if gpu_text.is_some() {
-            log::info!("GPU text compositor enabled");
+        if let Some(gpu) = &gpu_text {
+            if gpu.failed() {
+                log::warn!("GPU text unavailable on this device; using the CPU compositor");
+            } else {
+                log::info!("GPU text compositor enabled");
+            }
         } else {
             log::info!("GPU text unavailable or disabled; using the CPU compositor");
         }

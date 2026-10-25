@@ -5,6 +5,9 @@ mod backdrop;
 mod platform;
 
 use eframe::egui;
+use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
+use eframe::wgpu;
+use std::sync::Arc;
 
 /// Initialise stderr logging in debug builds and a file log in release builds,
 /// where no console exists. Logging failures must never block startup.
@@ -30,7 +33,7 @@ fn install_file_logger() {
 
     impl log::Log for FileLogger {
         fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-            metadata.level() <= log::Level::Info
+            metadata.level() <= log::max_level()
         }
 
         fn log(&self, record: &log::Record<'_>) {
@@ -76,7 +79,13 @@ fn install_file_logger() {
     }))
     .is_ok()
     {
-        log::set_max_level(log::LevelFilter::Info);
+        // Default to info. `ILLNESS_LOG=trace` enables presentation-rate and
+        // surface-cost measurements in release builds.
+        let level = std::env::var("ILLNESS_LOG")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(log::LevelFilter::Info);
+        log::set_max_level(level);
     }
 }
 
@@ -125,9 +134,30 @@ fn run() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
+    // Terminal mask glyphs need dual-source blending for true per-channel
+    // ClearType coverage. Request it when the adapter offers it; the GPU text
+    // compositor checks the resulting device feature and falls back to CPU
+    // text otherwise.
+    let mut wgpu_options = WgpuConfiguration::default()
+        .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
+    if let WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
+        let base = Arc::clone(&setup.device_descriptor);
+        setup.device_descriptor = Arc::new(move |adapter| {
+            let mut descriptor = base(adapter);
+            if adapter
+                .features()
+                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+            {
+                descriptor.required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
+            }
+            descriptor
+        });
+    }
+
     let options = eframe::NativeOptions {
         viewport,
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options,
         // Keep Ctrl+C/V/X as terminal input. The app handles Ctrl+Shift+C/V
         // itself; letting egui-winit intercept them would swallow Ctrl+C
         // (0x03) and Ctrl+V (0x16) before the session sees them.

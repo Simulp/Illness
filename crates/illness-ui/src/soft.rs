@@ -15,8 +15,8 @@ use std::hash::{Hash, Hasher};
 
 use egui::{Color32, ColorImage, Rect};
 use illness_core::{CursorKind, Material, Theme};
+use illness_term::Snapshot;
 use illness_term::snapshot::CellFlags;
-use illness_term::{Color, Snapshot};
 
 use crate::design::{self, Tokens};
 use crate::glyph::{GlyphAtlas, SoftGlyph};
@@ -32,6 +32,7 @@ const MAX_SURFACE_PIXELS: usize = 36_000_000;
 const SEARCH_ALPHA: u8 = 96;
 
 /// Everything needed to render or fingerprint one terminal surface.
+#[derive(Clone, Copy)]
 pub struct SurfaceSpec<'a> {
     pub cols: usize,
     pub rows: usize,
@@ -45,6 +46,9 @@ pub struct SurfaceSpec<'a> {
     /// Paint glyph pixels. `false` keeps backgrounds, decorations, and the
     /// cursor fill so a GPU pass can draw the glyph quads on top.
     pub text: bool,
+    /// Paint selection, search, and cursor fills. `false` leaves them to the
+    /// GPU quad pass, so changes there do not invalidate this surface.
+    pub fills: bool,
     pub theme: &'a Theme,
     pub tokens: &'a Tokens,
     pub font_size: f32,
@@ -120,24 +124,26 @@ pub fn render_surface(
         cell_width,
         cell_height,
     );
-    paint_selection(
-        &mut surface,
-        snapshot,
-        spec,
-        origin_x,
-        origin_y,
-        cell_width,
-        cell_height,
-    );
-    paint_search(
-        &mut surface,
-        snapshot,
-        spec,
-        origin_x,
-        origin_y,
-        cell_width,
-        cell_height,
-    );
+    if spec.fills {
+        paint_selection(
+            &mut surface,
+            snapshot,
+            spec,
+            origin_x,
+            origin_y,
+            cell_width,
+            cell_height,
+        );
+        paint_search(
+            &mut surface,
+            snapshot,
+            spec,
+            origin_x,
+            origin_y,
+            cell_width,
+            cell_height,
+        );
+    }
     paint_text(
         &mut surface,
         atlas,
@@ -149,7 +155,7 @@ pub fn render_surface(
         cell_width,
         cell_height,
     );
-    if spec.show_cursor {
+    if spec.fills && spec.show_cursor {
         paint_cursor(
             &mut surface,
             atlas,
@@ -170,6 +176,11 @@ pub fn render_surface(
 /// Covers every input that changes pixels: cell contents/colors/flags,
 /// selection, search, cursor and blink state, theme/tokens, font geometry,
 /// material, DPI, and the physical buffer size.
+///
+/// When `fills` is `false`, selection/search/cursor pixels are drawn by the
+/// GPU quad pass and therefore excluded. When `text` is also `false`, glyph
+/// characters cannot change this surface, so typing does not force a
+/// re-composite of the background layer.
 pub fn fingerprint(snapshot: &Snapshot, spec: &SurfaceSpec<'_>) -> u64 {
     let mut hasher = DefaultHasher::new();
 
@@ -181,16 +192,19 @@ pub fn fingerprint(snapshot: &Snapshot, spec: &SurfaceSpec<'_>) -> u64 {
     spec.font_size.to_bits().hash(&mut hasher);
     spec.line_height.to_bits().hash(&mut hasher);
     material_tag(spec.material).hash(&mut hasher);
-    spec.show_cursor.hash(&mut hasher);
     spec.text.hash(&mut hasher);
+    spec.fills.hash(&mut hasher);
 
-    match spec.search {
-        Some(search) => {
-            true.hash(&mut hasher);
-            search.query.hash(&mut hasher);
-            search.case_sensitive.hash(&mut hasher);
+    if spec.fills {
+        spec.show_cursor.hash(&mut hasher);
+        match spec.search {
+            Some(search) => {
+                true.hash(&mut hasher);
+                search.query.hash(&mut hasher);
+                search.case_sensitive.hash(&mut hasher);
+            }
+            None => false.hash(&mut hasher),
         }
-        None => false.hash(&mut hasher),
     }
 
     for color in [
@@ -207,31 +221,90 @@ pub fn fingerprint(snapshot: &Snapshot, spec: &SurfaceSpec<'_>) -> u64 {
     hash_color32(&mut hasher, spec.tokens.selection);
     hash_color32(&mut hasher, spec.tokens.accent);
 
+    // Glyph characters only affect this surface through painted text and
+    // search matches. Backgrounds and decorations depend on resolved colors
+    // and a small flag subset, so plain output scrolling does not re-composite
+    // the layer.
+    let hashes_glyphs = spec.text || spec.fills;
+    let mut soft_flags =
+        CellFlags::ALL_UNDERLINES | CellFlags::STRIKEOUT | CellFlags::HIDDEN | CellFlags::WIDE_CHAR;
+    if hashes_glyphs {
+        soft_flags = soft_flags | CellFlags::BOLD | CellFlags::ITALIC;
+    }
     snapshot.cells.len().hash(&mut hasher);
     for cell in &snapshot.cells {
-        cell.ch.hash(&mut hasher);
-        cell.combining_len.hash(&mut hasher);
-        for ch in snapshot.zero_width(cell) {
-            ch.hash(&mut hasher);
+        if hashes_glyphs {
+            cell.ch.hash(&mut hasher);
+            cell.combining_len.hash(&mut hasher);
+            for ch in snapshot.zero_width(cell) {
+                ch.hash(&mut hasher);
+            }
         }
-        hash_term_color(&mut hasher, cell.fg);
-        hash_term_color(&mut hasher, cell.bg);
-        cell.flags.bits().hash(&mut hasher);
+        // Hash resolved colors, not the enum representation: a default-bg
+        // space and an explicitly painted background color produce identical
+        // pixels and must not invalidate the surface.
+        let (fg, bg) = cell_colors(cell, spec.theme);
+        hash_color32(&mut hasher, bg);
+        let flags = CellFlags::from_bits_truncate(cell.flags.bits() & soft_flags.bits());
+        flags.bits().hash(&mut hasher);
+        let decorated = flags.intersects(CellFlags::ALL_UNDERLINES | CellFlags::STRIKEOUT)
+            && !flags.contains(CellFlags::HIDDEN);
+        if hashes_glyphs || decorated {
+            let fg = if cell.flags.contains(CellFlags::DIM) {
+                dim(fg)
+            } else {
+                fg
+            };
+            hash_color32(&mut hasher, fg);
+        }
     }
 
-    snapshot.selection.len().hash(&mut hasher);
-    for span in &snapshot.selection {
-        span.start.hash(&mut hasher);
-        span.end.hash(&mut hasher);
-    }
+    if spec.fills {
+        snapshot.selection.len().hash(&mut hasher);
+        for span in &snapshot.selection {
+            span.start.hash(&mut hasher);
+            span.end.hash(&mut hasher);
+        }
 
-    snapshot.cursor.col.hash(&mut hasher);
-    snapshot.cursor.row.hash(&mut hasher);
-    cursor_tag(snapshot.cursor.kind).hash(&mut hasher);
-    snapshot.cursor.blinking.hash(&mut hasher);
-    snapshot.cursor.visible.hash(&mut hasher);
+        snapshot.cursor.col.hash(&mut hasher);
+        snapshot.cursor.row.hash(&mut hasher);
+        cursor_tag(snapshot.cursor.kind).hash(&mut hasher);
+        snapshot.cursor.blinking.hash(&mut hasher);
+        snapshot.cursor.visible.hash(&mut hasher);
+    }
 
     hasher.finish()
+}
+
+/// Row bands whose pixels differ between two surfaces of the same size.
+///
+/// Consecutive dirty rows are merged so one partial texture update covers a
+/// block of changed lines instead of one upload per row. A size change always
+/// requires a full upload.
+pub fn dirty_bands(previous: &ColorImage, next: &ColorImage) -> Vec<(usize, usize)> {
+    if previous.size != next.size {
+        return vec![(0, next.size[1])];
+    }
+    let width = next.size[0];
+    let mut bands = Vec::new();
+    let mut band_start = None;
+    for row in 0..next.size[1] {
+        let start = row * width;
+        let end = start + width;
+        let dirty = previous.pixels[start..end] != next.pixels[start..end];
+        match (dirty, band_start) {
+            (true, None) => band_start = Some(row),
+            (false, Some(start)) => {
+                bands.push((start, row - start));
+                band_start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(start) = band_start {
+        bands.push((start, next.size[1] - start));
+    }
+    bands
 }
 
 fn material_tag(material: Material) -> u8 {
@@ -258,25 +331,6 @@ fn hash_rgb<H: Hasher>(hasher: &mut H, color: illness_core::Rgb) {
 
 fn hash_color32<H: Hasher>(hasher: &mut H, color: Color32) {
     color.to_array().hash(hasher);
-}
-
-fn hash_term_color<H: Hasher>(hasher: &mut H, color: Color) {
-    match color {
-        Color::Spec(rgb) => {
-            0u8.hash(hasher);
-            rgb.r.hash(hasher);
-            rgb.g.hash(hasher);
-            rgb.b.hash(hasher);
-        }
-        Color::Indexed(index) => {
-            1u8.hash(hasher);
-            index.hash(hasher);
-        }
-        Color::Named(named) => {
-            2u8.hash(hasher);
-            (named as u16).hash(hasher);
-        }
-    }
 }
 
 fn rgb(color: Color32) -> [u8; 3] {
@@ -703,6 +757,7 @@ mod tests {
             show_cursor: false,
             search: None,
             text: true,
+            fills: true,
             theme,
             tokens,
             font_size: 14.0,
@@ -779,6 +834,73 @@ mod tests {
         let marked = fingerprint(&snapshot, &spec);
         assert_ne!(before, marked);
         assert_eq!(marked, fingerprint(&snapshot, &spec));
+    }
+
+    /// With GPU text and GPU fills, typing and selection changes must not
+    /// invalidate the background surface.
+    #[test]
+    fn gpu_layer_fingerprint_ignores_glyphs_and_fills() {
+        let theme = Theme::by_name("Illness Dark");
+        let tokens = Tokens::from_theme(theme);
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(36.0, 36.0));
+        let mut spec = themed_spec(rect, theme, &tokens);
+        spec.text = false;
+        spec.fills = false;
+        let mut snapshot = Snapshot::empty(4, 2);
+
+        let before = fingerprint(&snapshot, &spec);
+
+        snapshot.cells[0].ch = 'A';
+        assert_eq!(
+            before,
+            fingerprint(&snapshot, &spec),
+            "glyph text alone must not re-composite backgrounds"
+        );
+        snapshot.combining.push('\u{301}');
+        snapshot.cells[0].combining_start = 0;
+        snapshot.cells[0].combining_len = 1;
+        assert_eq!(before, fingerprint(&snapshot, &spec));
+
+        snapshot.selection = vec![illness_term::SelectionSpan {
+            start: (0, 0),
+            end: (0, 3),
+        }];
+        assert_eq!(before, fingerprint(&snapshot, &spec));
+
+        snapshot.cursor.visible = true;
+        snapshot.cursor.col = 2;
+        snapshot.cursor.kind = CursorKind::Beam;
+        assert_eq!(before, fingerprint(&snapshot, &spec));
+
+        let search = SearchState {
+            query: "A".to_string(),
+            case_sensitive: false,
+        };
+        spec.search = Some(&search);
+        assert_eq!(before, fingerprint(&snapshot, &spec));
+
+        // A cell background edit still invalidates the surface.
+        snapshot.cells[1].bg = illness_term::Color::Indexed(3);
+        assert_ne!(before, fingerprint(&snapshot, &spec));
+    }
+
+    #[test]
+    fn dirty_bands_reports_changed_row_groups() {
+        let base = ColorImage::filled([8, 4], Color32::BLACK);
+        assert!(dirty_bands(&base, &base).is_empty());
+
+        let mut changed = base.clone();
+        changed.pixels[8 * 2 + 1] = Color32::WHITE;
+        assert_eq!(dirty_bands(&base, &changed), vec![(2, 1)]);
+
+        let mut block = base.clone();
+        for row in 1..=2 {
+            block.pixels[8 * row] = Color32::WHITE;
+        }
+        assert_eq!(dirty_bands(&base, &block), vec![(1, 2)]);
+
+        let resized = ColorImage::filled([8, 6], Color32::BLACK);
+        assert_eq!(dirty_bands(&base, &resized), vec![(0, 6)]);
     }
 
     /// The GPU path reuses this compositor for backgrounds and decorations.

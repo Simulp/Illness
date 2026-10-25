@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui::{
     Color32, ColorImage, CursorIcon, Event, ImeEvent, Key as EguiKey, Modifiers, MouseWheelUnit,
@@ -30,6 +30,95 @@ struct SoftTexture(Option<TextureHandle>);
 impl std::fmt::Debug for SoftTexture {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("SoftTexture")
+    }
+}
+
+/// Last composited surface, kept for row-band diffing before uploads.
+#[derive(Default)]
+struct SoftImage(Option<ColorImage>);
+
+impl std::fmt::Debug for SoftImage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SoftImage")
+    }
+}
+
+/// Cost of the last partial surface upload, for the debug log and tests.
+#[derive(Debug, Default, Clone, Copy)]
+struct UploadStats {
+    bands: usize,
+    bytes: usize,
+    elapsed: Duration,
+}
+
+/// Grid size plus physical cell size; any change needs a PTY resize.
+type LayoutKey = (usize, usize, u32, u32);
+
+/// Delay before committing a drag-resize. Intermediate sizes are dropped so
+/// the 10k-line scrollback is not reflowed every pointer frame.
+const RESIZE_DEBOUNCE_SECS: f64 = 0.09;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ResizePoll {
+    Idle,
+    Apply,
+    Wait(f64),
+}
+
+/// Debounces terminal resizes until the size is stable or the pointer is
+/// released, while the cached surface keeps painting.
+#[derive(Debug, Default)]
+struct ResizeDebounce {
+    pending: Option<(LayoutKey, f64)>,
+}
+
+impl ResizeDebounce {
+    fn poll(
+        &mut self,
+        current: LayoutKey,
+        applied: Option<LayoutKey>,
+        now: f64,
+        immediate: bool,
+    ) -> ResizePoll {
+        if applied == Some(current) {
+            self.pending = None;
+            return ResizePoll::Idle;
+        }
+        // Startup and pointer release apply the exact final size at once.
+        if immediate {
+            self.pending = None;
+            return ResizePoll::Apply;
+        }
+        match self.pending {
+            Some((pending, deadline)) if pending == current => {
+                if now >= deadline {
+                    self.pending = None;
+                    ResizePoll::Apply
+                } else {
+                    ResizePoll::Wait(deadline)
+                }
+            }
+            _ => {
+                let deadline = now + RESIZE_DEBOUNCE_SECS;
+                self.pending = Some((current, deadline));
+                ResizePoll::Wait(deadline)
+            }
+        }
+    }
+}
+
+/// Seconds to wait before compositing, or `None` to render now.
+///
+/// Only coalesce inside the first half of the measured display interval. That
+/// removes the render/skip cadence at 75 Hz without ever delaying a changed
+/// frame by more than half a refresh.
+pub(crate) fn coalesce_delay(elapsed: f64, frame_dt: f64) -> Option<f64> {
+    let interval = frame_dt.clamp(1.0 / 240.0, 1.0 / 24.0);
+    let half = interval * 0.5;
+    if elapsed >= 0.0 && elapsed < half {
+        Some((half - elapsed).max(0.001))
+    } else {
+        None
     }
 }
 
@@ -70,10 +159,23 @@ pub struct TerminalView {
     selecting: bool,
     /// CPU-composited surface and its GPU texture, reused until the grid changes.
     soft_texture: SoftTexture,
+    soft_image: SoftImage,
     soft_size: Option<[usize; 2]>,
     soft_key: Option<u64>,
     soft_last_render: f64,
+    /// Logical rect the cached surface was composed for. Held during a
+    /// debounced resize so the old pixels are painted instead of re-rendering.
+    soft_rect: Option<Rect>,
+    /// Surface rect frozen for the duration of a drag resize.
+    frozen_rect: Option<Rect>,
     soft_texture_name: String,
+    /// Grid geometry actually applied to the session; drag resizes are
+    /// debounced before replacing it.
+    resize: ResizeDebounce,
+    /// Rolling frame window for trace-level presentation-rate measurements.
+    frame_count: u32,
+    frame_elapsed: Duration,
+    frame_last: Option<Instant>,
     /// Viewport IME commands are cached; sending them every frame forces egui
     /// to repaint at the display refresh rate even when nothing changed.
     ime_allowed: bool,
@@ -98,10 +200,83 @@ impl TerminalView {
         let rect = soft::snap_rect(response.rect, ppp);
         let metrics = atlas.metrics();
         let padding = config.padding.max(0.0);
-        let (cols, rows) = Self::grid_size(rect, &metrics, padding);
+        let (target_cols, target_rows) = Self::grid_size(rect, &metrics, padding);
         let first_layout = self.last_layout.is_none();
 
-        if cols == 0 || rows == 0 || metrics.width <= 0.0 || metrics.height <= 0.0 {
+        if target_cols == 0 || target_rows == 0 || metrics.width <= 0.0 || metrics.height <= 0.0 {
+            return TerminalResponse {
+                response,
+                actions: Vec::new(),
+                cols: target_cols,
+                rows: target_rows,
+            };
+        }
+
+        let now = ui.input(|input| input.time);
+        let any_input = ui.input(|input| !input.events.is_empty());
+        if first_layout || any_input {
+            self.blink_epoch = now;
+        }
+
+        let layout = (
+            target_cols,
+            target_rows,
+            metrics.width_px,
+            metrics.height_px,
+        );
+        let released = ui.input(|input| input.pointer.any_released());
+        let resize_was_pending = self.resize.pending.is_some();
+        match self
+            .resize
+            .poll(layout, self.last_layout, now, first_layout || released)
+        {
+            ResizePoll::Apply => {
+                session.resize(
+                    GridSize::new(target_cols, target_rows),
+                    (
+                        metrics.width_px.min(u32::from(u16::MAX)) as u16,
+                        metrics.height_px.min(u32::from(u16::MAX)) as u16,
+                    ),
+                );
+                self.last_layout = Some(layout);
+            }
+            ResizePoll::Wait(deadline) => {
+                ui.ctx()
+                    .request_repaint_after(Duration::from_secs_f64((deadline - now).max(0.001)));
+            }
+            ResizePoll::Idle => {}
+        }
+
+        // A debounced resize keeps compositing at the size applied when the
+        // drag started, so intermediate sizes never re-render the surface.
+        if !resize_was_pending && self.resize.pending.is_some() {
+            self.frozen_rect = self.soft_rect.or(Some(rect));
+        }
+        if self.resize.pending.is_none() {
+            self.frozen_rect = None;
+        }
+        let content_rect = if self.resize.pending.is_some() {
+            self.frozen_rect.unwrap_or(rect)
+        } else {
+            rect
+        };
+
+        // While a resize is debounced, paint the snapshot and grid that the
+        // session actually has so cells, selection, and search stay aligned.
+        let snapshot_started = Instant::now();
+        let snapshot = session.snapshot();
+        let snapshot_time = snapshot_started.elapsed();
+        if snapshot_time.as_millis() > 4 && log::log_enabled!(log::Level::Debug) {
+            log::debug!(
+                "session snapshot {}x{} took {:?}",
+                snapshot.cols,
+                snapshot.rows,
+                snapshot_time
+            );
+        }
+        self.modes = snapshot.modes;
+        let (cols, rows) = (snapshot.cols, snapshot.rows);
+        if cols == 0 || rows == 0 {
             return TerminalResponse {
                 response,
                 actions: Vec::new(),
@@ -109,32 +284,12 @@ impl TerminalView {
                 rows,
             };
         }
-
-        if self.last_layout != Some((cols, rows, metrics.width_px, metrics.height_px)) {
-            session.resize(
-                GridSize::new(cols, rows),
-                (
-                    metrics.width_px.min(u32::from(u16::MAX)) as u16,
-                    metrics.height_px.min(u32::from(u16::MAX)) as u16,
-                ),
-            );
-            self.last_layout = Some((cols, rows, metrics.width_px, metrics.height_px));
-        }
-
-        let snapshot = session.snapshot();
-        self.modes = snapshot.modes;
         let grid_rect = Rect::from_min_size(
-            pos2(rect.min.x + padding, rect.min.y + padding),
+            pos2(content_rect.min.x + padding, content_rect.min.y + padding),
             vec2(metrics.width * cols as f32, metrics.height * rows as f32),
         );
 
         let origin = grid_rect.min;
-        let now = ui.input(|input| input.time);
-        let any_input = ui.input(|input| !input.events.is_empty());
-        if first_layout || any_input {
-            self.blink_epoch = now;
-        }
-
         let selection = selection_ranges(&snapshot, cols, rows);
         let row_texts: Vec<String> = (0..rows)
             .map(|row| row_text(&snapshot, row, cols))
@@ -145,28 +300,30 @@ impl TerminalView {
             snapshot.cursor.visible && (!blinking || blink_phase(now - self.blink_epoch) < 0.53);
 
         let search = self.search.clone();
-        let spec = SurfaceSpec {
+        let mut spec = SurfaceSpec {
             cols,
             rows,
-            rect,
+            rect: content_rect,
             ppp,
             padding,
             material: config.material,
             show_cursor,
             search: search.as_ref(),
             text: true,
+            fills: true,
             theme,
             tokens,
             font_size: config.font_size,
             line_height: config.line_height,
         };
-        // Pack glyphs before the CPU pass so an atlas failure can turn text
-        // back on without drawing the same glyphs twice.
+        // Pack glyphs and fills before the CPU pass so an atlas failure can
+        // turn text back on without drawing the same glyphs twice.
         let gpu_frame = gpu_text
             .filter(|gpu| !gpu.failed())
             .and_then(|gpu| gpu.build_frame(atlas, &snapshot, &spec));
-        let mut spec = spec;
+        let gpu_fills = gpu_frame.as_ref().is_some_and(|frame| !frame.is_empty());
         spec.text = gpu_frame.is_none();
+        spec.fills = !gpu_fills;
         let soft_painted = self.paint_soft(ui, &painter, atlas, &snapshot, &spec);
         if !soft_painted {
             painter.rect_filled(rect, 0.0, design::color(theme.bg));
@@ -191,7 +348,7 @@ impl TerminalView {
         } else if let Some(frame) = gpu_frame
             && !frame.is_empty()
         {
-            painter.add(frame.into_shape(rect));
+            painter.add(frame.into_shape(content_rect));
         }
         if blinking && snapshot.cursor.visible {
             // Wake up when the cursor needs to flip.
@@ -351,6 +508,7 @@ impl TerminalView {
         }
 
         self.animate_scroll(ui, session, &snapshot);
+        self.record_frame();
 
         TerminalResponse {
             response,
@@ -358,6 +516,34 @@ impl TerminalView {
             cols,
             rows,
         }
+    }
+
+    /// Emits one trace-level presentation-rate sample per 60 consecutive
+    /// frames. Gaps longer than 100 ms (idle) restart the window.
+    fn record_frame(&mut self) {
+        let now = Instant::now();
+        if let Some(last) = self.frame_last {
+            let delta = now.saturating_duration_since(last);
+            if delta < Duration::from_millis(100) {
+                self.frame_elapsed += delta;
+                self.frame_count += 1;
+                if self.frame_count >= 60 {
+                    let seconds = self.frame_elapsed.as_secs_f64();
+                    if seconds > 0.0 && log::log_enabled!(log::Level::Trace) {
+                        log::trace!(
+                            "terminal presented 60 frames in {seconds:.3}s ({:.1} fps)",
+                            60.0 / seconds
+                        );
+                    }
+                    self.frame_count = 0;
+                    self.frame_elapsed = Duration::ZERO;
+                }
+            } else {
+                self.frame_count = 0;
+                self.frame_elapsed = Duration::ZERO;
+            }
+        }
+        self.frame_last = Some(now);
     }
 
     fn jump_to_bottom(
@@ -439,22 +625,41 @@ impl TerminalView {
         if needs_render {
             let now = ui.ctx().input(|input| input.time);
             let frame_dt = f64::from(frame_interval(ui));
-            // Coalesce bursts of PTY output to one composite per display frame.
-            if self.soft_texture.0.is_some() && now - self.soft_last_render < frame_dt {
+            // Defer only inside half a refresh; rendering on every changed
+            // fingerprint lets vsync pace the app at 75 Hz.
+            if self.soft_texture.0.is_some()
+                && let Some(delay) = coalesce_delay(now - self.soft_last_render, frame_dt)
+            {
                 ui.ctx()
-                    .request_repaint_after(Duration::from_secs_f64(frame_dt));
+                    .request_repaint_after(Duration::from_secs_f64(delay));
             } else {
+                let started = Instant::now();
                 match soft::render_surface(atlas, snapshot, spec) {
                     Some(image) => {
+                        let render_time = started.elapsed();
                         self.soft_key = Some(key);
                         self.soft_size = Some(image.size);
+                        self.soft_rect = Some(spec.rect);
                         self.soft_last_render = now;
-                        self.upload_soft(ui.ctx(), image);
+                        let stats = self.upload_soft(ui.ctx(), image);
+                        if log::log_enabled!(log::Level::Debug) {
+                            log::debug!(
+                                "soft surface {}x{} render {:?} upload {:?} bands {} bytes {}",
+                                self.soft_size.map_or(0, |size| size[0]),
+                                self.soft_size.map_or(0, |size| size[1]),
+                                render_time,
+                                stats.elapsed,
+                                stats.bands,
+                                stats.bytes
+                            );
+                        }
                     }
                     None => {
                         self.soft_key = None;
                         self.soft_size = None;
+                        self.soft_rect = None;
                         self.soft_texture.0 = None;
+                        self.soft_image = SoftImage(None);
                     }
                 }
             }
@@ -472,21 +677,61 @@ impl TerminalView {
         true
     }
 
-    fn upload_soft(&mut self, ctx: &egui::Context, image: ColorImage) {
+    /// Uploads only the row bands that changed since the last surface.
+    fn upload_soft(&mut self, ctx: &egui::Context, image: ColorImage) -> UploadStats {
         if self.soft_texture_name.is_empty() {
             self.soft_texture_name = format!(
                 "illness-terminal-soft-{}",
                 NEXT_SOFT_TEXTURE.fetch_add(1, Ordering::Relaxed)
             );
         }
+        let width = image.size[0];
+        let height = image.size[1];
+        let bands = match self.soft_image.0.as_ref() {
+            Some(previous) if previous.size == image.size => soft::dirty_bands(previous, &image),
+            _ => vec![(0, height)],
+        };
+        let bytes = bands
+            .iter()
+            .map(|(_, rows)| rows.saturating_mul(width).saturating_mul(4))
+            .sum();
+        let full = bands.len() == 1 && bands[0] == (0, height);
+        let started = Instant::now();
+
         if let Some(texture) = self.soft_texture.0.as_mut() {
-            texture.set(image, TextureOptions::NEAREST);
+            if full {
+                texture.set(image.clone(), TextureOptions::NEAREST);
+            } else {
+                for &(row, rows) in &bands {
+                    if rows == 0 {
+                        continue;
+                    }
+                    let start = row * width;
+                    let end = start + rows * width;
+                    texture.set_partial(
+                        [0, row],
+                        ColorImage::new([width, rows], image.pixels[start..end].to_vec()),
+                        TextureOptions::NEAREST,
+                    );
+                }
+            }
         } else {
             self.soft_texture.0 = Some(ctx.load_texture(
                 self.soft_texture_name.clone(),
-                image,
+                image.clone(),
                 TextureOptions::NEAREST,
             ));
+        }
+
+        let elapsed = started.elapsed();
+        if log::log_enabled!(log::Level::Debug) {
+            log::debug!("soft upload bands {bands:?}");
+        }
+        self.soft_image = SoftImage(Some(image));
+        UploadStats {
+            bands: bands.len(),
+            bytes,
+            elapsed,
         }
     }
 
@@ -1798,5 +2043,66 @@ mod tests {
         );
         output.textures_delta.clear();
         bytes
+    }
+
+    #[test]
+    fn coalescing_at_75_hz_defers_at_most_half_a_frame() {
+        let dt = 1.0 / 75.0;
+        assert_eq!(coalesce_delay(0.0, dt), Some(dt * 0.5));
+        assert!(
+            coalesce_delay(0.003, dt).is_some_and(|delay| delay < dt * 0.5),
+            "an early change waits only until the half-frame boundary"
+        );
+        assert_eq!(coalesce_delay(dt * 0.5, dt), None);
+        assert_eq!(coalesce_delay(dt, dt), None);
+        // A stall must not stretch the coalescing window past a display frame.
+        assert_eq!(coalesce_delay(0.0, 0.2), Some(1.0 / 48.0));
+    }
+
+    #[test]
+    fn resize_debounce_waits_for_stable_size_then_applies_exact_grid() {
+        let start = 10.0;
+        let mut debounce = ResizeDebounce::default();
+        let applied = Some((80, 24, 8, 18));
+        let target = (100, 30, 8, 18);
+
+        assert_eq!(
+            debounce.poll(target, applied, start, false),
+            ResizePoll::Wait(start + RESIZE_DEBOUNCE_SECS)
+        );
+        // The same target at 75 Hz keeps the original deadline.
+        assert_eq!(
+            debounce.poll(target, applied, start + 0.04, false),
+            ResizePoll::Wait(start + RESIZE_DEBOUNCE_SECS)
+        );
+        assert_eq!(
+            debounce.poll(target, applied, start + RESIZE_DEBOUNCE_SECS, false),
+            ResizePoll::Apply
+        );
+        assert_eq!(
+            debounce.poll(target, Some(target), start + 0.2, false),
+            ResizePoll::Idle
+        );
+
+        // A moving drag restarts the debounce for the new size.
+        let moved = (110, 31, 8, 18);
+        assert_eq!(
+            debounce.poll(moved, Some(target), start + 0.3, false),
+            ResizePoll::Wait(start + 0.3 + RESIZE_DEBOUNCE_SECS)
+        );
+        assert_eq!(
+            debounce.poll(moved, Some(target), start + 0.31, false),
+            ResizePoll::Wait(start + 0.3 + RESIZE_DEBOUNCE_SECS)
+        );
+
+        // Pointer release applies the final size immediately.
+        assert_eq!(
+            debounce.poll(moved, Some(target), start + 0.32, true),
+            ResizePoll::Apply
+        );
+        assert_eq!(
+            debounce.poll((112, 32, 8, 18), Some(moved), start + 0.4, true),
+            ResizePoll::Apply
+        );
     }
 }
