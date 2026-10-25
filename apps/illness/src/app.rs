@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use egui::{
@@ -62,6 +63,20 @@ const STARTUP_RECOVERY_WINDOW: Duration = Duration::from_secs(5);
 /// One deadline for all stored/startup/live folder probes before spawning. A
 /// dead UNC share can otherwise block the UI for the SMB timeout.
 const SPAWN_PATH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+/// A shell start that has not produced a session by this deadline is abandoned
+/// and kept as a recovery tab. The worker may be stuck inside CreateProcess on
+/// a cold UNC folder; the UI must still offer Restart/Close.
+const SPAWN_START_DEADLINE: Duration = Duration::from_secs(10);
+/// One cwd attempt gets at most this long before the worker tries the next
+/// candidate. A stuck CreateProcess thread cannot block the tab forever.
+const SPAWN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Show the lightweight "Starting…" card only when a normal start is slower
+/// than this, so fast shells do not flash a modal overlay.
+const SPAWN_STARTING_CARD_DELAY: Duration = Duration::from_millis(750);
+/// How often a spawn attempt checks its cancellation token while waiting.
+const SPAWN_CANCEL_POLL: Duration = Duration::from_millis(25);
+/// Cap keys buffered while a shell is still starting, keeping the newest.
+const MAX_PENDING_INPUT_EVENTS: usize = 512;
 
 /// Pending delayed config write. A pointer release flushes immediately so a
 /// click never waits for the timer.
@@ -258,6 +273,12 @@ struct Tab {
     exit_status: Option<i32>,
     /// Spawn error shown by the recovery card, when there is one.
     error: Option<String>,
+    /// Cancellation token for a detached spawn that has not attached yet.
+    spawn_cancel: Option<Arc<AtomicBool>>,
+    /// Keys/text typed while this tab was still waiting for its session. They
+    /// are encoded and written as soon as the session attaches, so a deliberate
+    /// quick exit still counts as user interaction.
+    pending_input: Vec<Event>,
 }
 
 impl Tab {
@@ -278,6 +299,8 @@ impl Tab {
             recovery: false,
             exit_status: None,
             error: None,
+            spawn_cancel: None,
+            pending_input: Vec::new(),
         }
     }
 }
@@ -306,6 +329,89 @@ struct SpawnedSession {
 struct SpawnResult {
     tab_id: u64,
     outcome: Result<SpawnedSession, String>,
+    /// Source tab and live path that a successful spawn inherited, so its
+    /// stored cwd can be refreshed after the off-thread probe validates it.
+    inherited: Option<(u64, PathBuf)>,
+}
+
+/// Outcome of waiting for one detached `Session::spawn` attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnWait<T> {
+    Ready(T),
+    Timeout,
+    Cancelled,
+    Disconnected,
+}
+
+/// Wait for a spawn attempt while honouring a tab's cancellation token.
+///
+/// Polling keeps a closed tab from waiting out an SMB/CreateProcess hang; the
+/// abandoned attempt thread drops the session (and its child) when its send
+/// eventually fails.
+fn wait_for_spawn<T>(
+    receiver: &Receiver<T>,
+    cancel: &AtomicBool,
+    timeout: Duration,
+) -> SpawnWait<T> {
+    let deadline = Instant::now().checked_add(timeout);
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return SpawnWait::Cancelled;
+        }
+        let now = Instant::now();
+        let left = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(timeout);
+        if left.is_zero() {
+            return SpawnWait::Timeout;
+        }
+        match receiver.recv_timeout(left.min(SPAWN_CANCEL_POLL)) {
+            Ok(value) => return SpawnWait::Ready(value),
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => return SpawnWait::Disconnected,
+        }
+    }
+}
+
+/// Run one `Session::spawn` on a detached thread and give up after
+/// [`SPAWN_ATTEMPT_TIMEOUT`].
+///
+/// The inner thread may still be blocked inside ConPTY/CreateProcess on a cold
+/// UNC folder when the deadline fires. Its result channel is dropped, so when
+/// the attempt eventually returns the session is dropped immediately and its
+/// child is shut down. The outer spawn worker can then try the next cwd or
+/// report the failure without ever leaving an unresponsive blank tab.
+fn spawn_with_deadline(
+    spec: SpawnSpec,
+    cell_px: (u16, u16),
+    waker: Arc<dyn Fn() + Send + Sync>,
+    cancel: &AtomicBool,
+    tab_id: u64,
+) -> Result<Session, String> {
+    let (sender, receiver) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name(format!("illness-shell-attempt-{tab_id}"))
+        .spawn(move || {
+            let _ = sender.send(Session::spawn(
+                spec,
+                GridSize::new(INITIAL_COLS, INITIAL_ROWS),
+                cell_px,
+                waker,
+            ));
+        });
+    if let Err(error) = spawned {
+        return Err(format!("could not create a spawn attempt thread: {error}"));
+    }
+    match wait_for_spawn(&receiver, cancel, SPAWN_ATTEMPT_TIMEOUT) {
+        SpawnWait::Ready(Ok(session)) => Ok(session),
+        SpawnWait::Ready(Err(error)) => Err(error.to_string()),
+        SpawnWait::Timeout => Err(format!(
+            "the shell did not start within {} seconds (the folder may be on an offline network share)",
+            SPAWN_ATTEMPT_TIMEOUT.as_secs()
+        )),
+        SpawnWait::Cancelled => Err("the tab was closed while its shell was starting".to_string()),
+        SpawnWait::Disconnected => Err("the spawn attempt stopped without a result".to_string()),
+    }
 }
 
 /// Apply a detached spawn result to its placeholder tab.
@@ -330,8 +436,18 @@ fn apply_spawn_outcome(tab: &mut Tab, outcome: Result<SpawnedSession, String>) {
             tab.session = None;
             tab.recovery = true;
             tab.error = Some(error);
+            tab.pending_input.clear();
         }
     }
+}
+
+/// Find the terminal tab a detached result belongs to. Missing ids are closed
+/// tabs; their late session is dropped instead of attaching to a new tab.
+fn terminal_tab_mut(tabs: &mut [TabEntry], tab_id: u64) -> Option<&mut Tab> {
+    tabs.iter_mut().find_map(|entry| match entry {
+        TabEntry::Terminal(tab) if tab.id == tab_id => Some(tab.as_mut()),
+        _ => None,
+    })
 }
 
 /// Result of a detached [`backdrop::warm_cache`] request.
@@ -572,14 +688,21 @@ impl IllnessApp {
     /// Spawn a tab for `profile` (or the configured default) and make it active.
     ///
     /// The tab is inserted immediately and its session starts on a worker:
-    /// `Session::spawn` can block for the SMB timeout on a dead UNC cwd and
-    /// must never stall the UI. If every spawn attempt fails, the tab is kept
-    /// with the Restart/Settings/Close card.
+    /// the cwd probe and `Session::spawn` can both block on a dead UNC cwd and
+    /// must never stall the UI. If every attempt fails or exceeds the start
+    /// deadline, the tab is kept with a cancel/restart card.
     pub fn open_tab(&mut self, profile: Option<&str>) {
         let profile = self.profile_for(profile);
-        let dirs = self.resolve_new_tab_cwd();
-        log::debug!("opening {} tab in {:?}", profile.name, dirs);
-        let tab = self.start_tab(&profile, dirs);
+        let (candidates, inherited) = self.spawn_candidates_for_new_tab();
+        log::debug!(
+            "opening {} tab with cwd candidates {:?}",
+            profile.name,
+            candidates
+                .iter()
+                .map(|candidate| candidate.path.as_path())
+                .collect::<Vec<_>>()
+        );
+        let tab = self.start_tab(&profile, candidates, inherited);
         let id = tab.id;
         let index = self.settings_index().unwrap_or(self.tabs.len());
         self.tabs.insert(index, TabEntry::Terminal(Box::new(tab)));
@@ -587,17 +710,19 @@ impl IllnessApp {
         self.last_terminal_id = Some(id);
     }
 
-    /// Resolve the spawn cwd plan for a new tab at the moment it is requested.
+    /// Collect new-tab cwd candidates at the moment it is requested.
     ///
-    /// The live PEB path is validated off-thread because a shell may have
-    /// `cd`ed to a deleted directory or an offline UNC share. A dead live path
-    /// falls through; a cold *launch* folder is kept on timeout so Explorer's
-    /// folder is not silently replaced by the process directory. WSL, elevated
-    /// shells and dead processes cannot be read and use stored/startup paths.
-    fn resolve_new_tab_cwd(&mut self) -> Vec<PathBuf> {
+    /// Only a cheap PEB read happens here; probing and `Session::spawn` run on
+    /// the spawn worker. A live path that was validated there refreshes the
+    /// source tab's stored cwd after a successful attach. WSL, elevated shells
+    /// and dead processes cannot be read and use stored/startup paths.
+    fn spawn_candidates_for_new_tab(&mut self) -> (Vec<SpawnCandidate>, Option<(u64, PathBuf)>) {
         let process = std::env::current_dir().ok();
         if !self.config.inherit_cwd {
-            return plan_spawn_cwds(None, None, self.startup_folder.clone(), process);
+            return (
+                spawn_candidates(None, None, self.startup_folder.clone(), process),
+                None,
+            );
         }
 
         let terminal_id = match self.tabs.get(self.active) {
@@ -611,15 +736,11 @@ impl IllnessApp {
                 _ => None,
             })
             .unwrap_or((None, None));
-        let plan = plan_spawn_cwds(live.clone(), stored, self.startup_folder.clone(), process);
-        if let Some(live) = live
-            && plan.first() == Some(&live)
-            && let Some(index) = terminal_id.and_then(|id| self.tab_index_by_id(id))
-            && let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index)
-        {
-            tab.cwd = Some(live);
-        }
-        plan
+        let inherited = terminal_id.zip(live.clone());
+        (
+            spawn_candidates(live, stored, self.startup_folder.clone(), process),
+            inherited,
+        )
     }
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
@@ -677,19 +798,47 @@ impl IllnessApp {
         matches!(self.tabs.get(self.active), Some(TabEntry::Terminal(_))).then_some(self.active)
     }
 
-    /// Insert a placeholder tab and start its shell(s) on a worker.
-    fn start_tab(&mut self, profile: &Profile, dirs: Vec<PathBuf>) -> Tab {
+    /// Insert a placeholder tab and start planning/spawning on a worker.
+    fn start_tab(
+        &mut self,
+        profile: &Profile,
+        candidates: Vec<SpawnCandidate>,
+        inherited: Option<(u64, PathBuf)>,
+    ) -> Tab {
         let id = self.next_terminal_id;
         self.next_terminal_id = self.next_terminal_id.saturating_add(1);
-        let specs = spawn_specs(profile, &self.config, &dirs);
-        let cwd = specs.first().and_then(|spec| spec.cwd.clone());
-        let tab = Tab::pending(id, profile, cwd);
-        self.launch_spawn(id, profile.name.clone(), specs);
+        let cwd = candidates
+            .iter()
+            .find(|candidate| !candidate.process || candidate.explicit)
+            .map(|candidate| candidate.path.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut tab = Tab::pending(id, profile, cwd);
+        tab.spawn_cancel = Some(Arc::clone(&cancel));
+        self.launch_spawn(
+            id,
+            profile.clone(),
+            self.config.clone(),
+            candidates,
+            inherited,
+            cancel,
+        );
         tab
     }
 
-    /// Try each cwd candidate in order on a worker thread.
-    fn launch_spawn(&self, tab_id: u64, profile_name: String, specs: Vec<SpawnSpec>) {
+    /// Probe cwd candidates, build specs, and try each one on a worker thread.
+    ///
+    /// Nothing here runs on the UI thread. Each `Session::spawn` attempt has its
+    /// own deadline and checks the tab's cancellation token, so a closed tab
+    /// does not wait out an SMB timeout or leave a child behind.
+    fn launch_spawn(
+        &self,
+        tab_id: u64,
+        profile: Profile,
+        config: Config,
+        candidates: Vec<SpawnCandidate>,
+        inherited: Option<(u64, PathBuf)>,
+        cancel: Arc<AtomicBool>,
+    ) {
         let metrics = self.atlas.metrics();
         let cell_px = (cell_pixel(metrics.width_px), cell_pixel(metrics.height_px));
         let ctx = self.ctx.clone();
@@ -699,25 +848,35 @@ impl IllnessApp {
         });
         let done = Arc::clone(&waker);
         let sender = self.spawn_tx.clone();
+        let profile_name = profile.name.clone();
         let thread_error =
             format!("Could not start {profile_name}: could not create the spawn worker");
         let worker_error = thread_error.clone();
+        let reported_inherited = inherited.clone();
         let spawned = std::thread::Builder::new()
-            .name("illness-shell-spawn".to_string())
+            .name(format!("illness-shell-spawn-{tab_id}"))
             .spawn(move || {
+                let dirs = plan_spawn_cwds(&candidates, Some(&cancel));
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
+                let specs = spawn_specs(&profile, &config, &dirs);
                 let mut last_error = worker_error;
                 for spec in specs {
+                    if cancel.load(Ordering::Acquire) {
+                        return;
+                    }
                     let cwd = spec.cwd.clone();
-                    match Session::spawn(
-                        spec,
-                        GridSize::new(INITIAL_COLS, INITIAL_ROWS),
-                        cell_px,
-                        Arc::clone(&waker),
-                    ) {
+                    match spawn_with_deadline(spec, cell_px, Arc::clone(&waker), &cancel, tab_id) {
                         Ok(session) => {
+                            if cancel.load(Ordering::Acquire) {
+                                session.shutdown();
+                                return;
+                            }
                             let _ = sender.send(SpawnResult {
                                 tab_id,
                                 outcome: Ok(SpawnedSession { session, cwd }),
+                                inherited: inherited.clone(),
                             });
                             done();
                             return;
@@ -727,9 +886,13 @@ impl IllnessApp {
                         }
                     }
                 }
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 let _ = sender.send(SpawnResult {
                     tab_id,
                     outcome: Err(last_error),
+                    inherited: inherited.clone(),
                 });
                 done();
             });
@@ -737,23 +900,82 @@ impl IllnessApp {
             let _ = self.spawn_tx.send(SpawnResult {
                 tab_id,
                 outcome: Err(thread_error),
+                inherited: reported_inherited,
             });
             self.ctx.request_repaint();
         }
     }
 
     /// Drain completed detached spawns and fill or mark their tabs.
+    ///
+    /// This runs before this frame's input is read, so a result that arrived
+    /// while the tab was pending attaches its session and any buffered keys
+    /// first. Results for tabs closed meanwhile are discarded (the session is
+    /// dropped, shutting its child down).
     fn apply_spawn_results(&mut self) {
+        let modifiers = self.ctx.input(|input| input.modifiers);
+        let mut cwd_updates = Vec::new();
         while let Ok(result) = self.spawn_rx.try_recv() {
-            let Some(index) = self.tab_index_by_id(result.tab_id) else {
-                // The tab was closed while its shell was starting; dropping the
-                // session shuts the process down.
+            let Some(tab) = terminal_tab_mut(&mut self.tabs, result.tab_id) else {
                 continue;
             };
-            let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index) else {
-                continue;
-            };
+            let inherited = result.inherited.clone();
+            tab.spawn_cancel = None;
             apply_spawn_outcome(tab, result.outcome);
+            let Some(session) = tab.session.as_ref() else {
+                continue;
+            };
+            if let Some((source, live)) = &inherited
+                && tab.cwd.as_ref() == Some(live)
+            {
+                cwd_updates.push((*source, live.clone()));
+            }
+            let pending = std::mem::take(&mut tab.pending_input);
+            if pending.is_empty() || session.is_exited() {
+                continue;
+            }
+            if let Some(bytes) = tab.view.encode_input(&pending, modifiers) {
+                session.write(&bytes);
+                tab.user_acted = true;
+            }
+        }
+        for (source, live) in cwd_updates {
+            if let Some(index) = self.tab_index_by_id(source)
+                && let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index)
+            {
+                tab.cwd = Some(live);
+            }
+        }
+    }
+
+    /// Give a tab that never receives a session a visible, cancellable state.
+    fn expire_stalled_spawns(&mut self) {
+        let now = Instant::now();
+        for entry in &mut self.tabs {
+            let TabEntry::Terminal(tab) = entry else {
+                continue;
+            };
+            if tab.session.is_some() || tab.recovery {
+                continue;
+            }
+            if now.saturating_duration_since(tab.spawned_at) < SPAWN_START_DEADLINE {
+                continue;
+            }
+            tab.recovery = true;
+            tab.pending_input.clear();
+            if let Some(cancel) = tab.spawn_cancel.take() {
+                cancel.store(true, Ordering::Release);
+            }
+            tab.error = Some(format!(
+                "{} did not start within {} seconds. The launch folder may be on an offline network share.",
+                tab.profile_name,
+                SPAWN_START_DEADLINE.as_secs()
+            ));
+            log::warn!(
+                "{} did not start within {:?}; offering recovery actions",
+                tab.profile_name,
+                SPAWN_START_DEADLINE
+            );
         }
     }
 
@@ -1928,6 +2150,9 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
+            if let Some(cancel) = &tab.spawn_cancel {
+                cancel.store(true, Ordering::Release);
+            }
             if let Some(session) = &tab.session {
                 session.shutdown();
             }
@@ -1996,6 +2221,11 @@ impl IllnessApp {
         if index >= self.tabs.len() {
             return;
         }
+        if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index)
+            && let Some(cancel) = tab.spawn_cancel.take()
+        {
+            cancel.store(true, Ordering::Release);
+        }
         self.tabs.remove(index);
         if removal_closes_window(self.tabs.len()) {
             self.active = 0;
@@ -2063,36 +2293,22 @@ impl IllnessApp {
         let profile_name = tab.profile_name.clone();
         let cwd = tab.cwd.clone();
         let profile = self.profile_for(Some(&profile_name));
-        let dirs = plan_spawn_cwds(
+        if let Some(TabEntry::Terminal(old)) = self.tabs.get_mut(index)
+            && let Some(cancel) = old.spawn_cancel.take()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+        let candidates = spawn_candidates(
             None,
             cwd,
             self.startup_folder.clone(),
             std::env::current_dir().ok(),
         );
-        let tab = self.start_tab(&profile, dirs);
+        let tab = self.start_tab(&profile, candidates, None);
         let id = tab.id;
         self.tabs[index] = TabEntry::Terminal(Box::new(tab));
         self.active = index;
         self.last_terminal_id = Some(id);
-    }
-
-    /// Mark the active terminal as used when the user presses a key or clicks.
-    /// A shell that exits before this is a profile failure, not a normal exit.
-    fn note_user_activity(&mut self, ctx: &egui::Context) {
-        let acted = ctx.input(|input| {
-            input.events.iter().any(|event| {
-                matches!(
-                    event,
-                    Event::Key { pressed: true, .. }
-                        | Event::PointerButton { pressed: true, .. }
-                        | Event::MouseWheel { .. }
-                        | Event::Text(_)
-                )
-            })
-        });
-        if acted && let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active) {
-            tab.user_acted = true;
-        }
     }
 
     fn move_tab(&mut self, from: usize, to: usize) {
@@ -2136,11 +2352,15 @@ impl IllnessApp {
             return;
         }
 
-        if let Some(tab) = self.active_terminal()
+        if let Some(tab) = self.active_terminal_mut()
             && let Some(session) = &tab.session
+            && !session.is_exited()
         {
             let bracketed = session.snapshot().modes.bracketed_paste;
             session.write(&format_paste(&text, bracketed));
+            // Clipboard paste is real input to this shell, unlike a titlebar
+            // click or a Settings control.
+            tab.user_acted = true;
         }
     }
 
@@ -2609,8 +2829,11 @@ impl IllnessApp {
 impl IllnessApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        self.note_user_activity(&ctx);
+        // Attach completed spawns before reading this frame's input: buffered
+        // pre-attach keys are written first, and chrome/overlay activity is
+        // never counted as shell use.
         self.apply_spawn_results();
+        self.expire_stalled_spawns();
         // Apply a requested material change before building any shape. The
         // platform call, design tokens, backdrop drop/upload and clear colour
         // then describe one material for the whole pass.
@@ -2717,6 +2940,7 @@ impl IllnessApp {
         let mut terminal_rect = None;
         let mut context_menu_pos = None;
         let mut recovery_action = None;
+        let mut starting_action = None;
         let mut settings_outcome = overlays::SettingsOutcome::default();
 
         if settings_active {
@@ -2749,9 +2973,12 @@ impl IllnessApp {
             egui::CentralPanel::no_frame().show(ui, |ui| {
                 let Some(TabEntry::Terminal(tab)) = tabs.get_mut(active) else {
                     // The host closes the window when the last tab is
-                    // removed; paint only the background for this pass.
-                    ui.painter()
-                        .rect_filled(ui.available_rect_before_wrap(), 0.0, tokens.bg);
+                    // removed; paint only the material surface for this pass.
+                    ui.painter().rect_filled(
+                        ui.available_rect_before_wrap(),
+                        0.0,
+                        placeholder_fill(tokens, surface_material),
+                    );
                     return;
                 };
 
@@ -2767,7 +2994,11 @@ impl IllnessApp {
                         surface_material,
                     );
                     terminal_rect = Some(response.response.rect);
+                    let input_sent = response.input_sent && !session.is_exited();
                     terminal_actions = response.actions;
+                    if input_sent {
+                        tab.user_acted = true;
+                    }
                     if response.response.secondary_clicked()
                         && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
                     {
@@ -2780,13 +3011,42 @@ impl IllnessApp {
                         && let Some(bytes) = tab.view.take_input(ui)
                     {
                         session.write(&bytes);
+                        // Only bytes actually delivered to this shell count
+                        // as use. Titlebar/tab/Settings clicks do not.
+                        tab.user_acted = true;
                     }
                 } else {
-                    // Pending spawns and failed spawns have no grid yet. Keep
-                    // the themed surface instead of the host clear colour.
+                    // Pending spawns and failed spawns have no grid yet. Keep a
+                    // material-aware surface (translucent under Mica/Acrylic)
+                    // instead of an opaque block over the native backdrop.
                     let rect = ui.available_rect_before_wrap();
-                    ui.painter().rect_filled(rect, 0.0, tokens.bg);
+                    ui.painter()
+                        .rect_filled(rect, 0.0, placeholder_fill(tokens, surface_material));
                     terminal_rect = Some(rect);
+                    if !tab.recovery {
+                        let elapsed = Instant::now().saturating_duration_since(tab.spawned_at);
+                        if elapsed >= SPAWN_STARTING_CARD_DELAY {
+                            starting_action = show_starting_card(
+                                ui.ctx(),
+                                tokens,
+                                tab.id,
+                                &tab.profile_name,
+                                elapsed,
+                            )
+                            .map(|action| (tab.id, action));
+                        }
+                        if !overlay_open && !shortcut_used {
+                            buffer_pending_input(ui, &mut tab.pending_input);
+                        }
+                        let wait_until = if elapsed < SPAWN_STARTING_CARD_DELAY {
+                            SPAWN_STARTING_CARD_DELAY - elapsed
+                        } else {
+                            SPAWN_START_DEADLINE.saturating_sub(elapsed)
+                        };
+                        if !wait_until.is_zero() {
+                            ui.ctx().request_repaint_after(wait_until);
+                        }
+                    }
                 }
                 if tab.recovery {
                     recovery_action = show_recovery_card(
@@ -2826,7 +3086,7 @@ impl IllnessApp {
             self.handle_terminal_action(action);
         }
 
-        if let Some((id, action)) = recovery_action {
+        if let Some((id, action)) = starting_action.or(recovery_action) {
             let index = self
                 .tab_index_by_id(id)
                 .or_else(|| self.active_terminal_index());
@@ -2880,6 +3140,54 @@ impl IllnessApp {
             self.native_transparency,
             self.theme.bg,
         )
+    }
+}
+
+/// Surface painted behind a tab that has no grid yet (starting or failed).
+///
+/// Solid stays opaque; Mica/Acrylic use the same alpha as chrome and terminal
+/// surfaces so the native backdrop shows through instead of an opaque block.
+fn placeholder_fill(tokens: &Tokens, material: Material) -> Color32 {
+    let alpha = design::material_alpha(material);
+    if alpha == 255 {
+        tokens.bg
+    } else {
+        Color32::from_rgba_unmultiplied(tokens.bg.r(), tokens.bg.g(), tokens.bg.b(), alpha)
+    }
+}
+
+/// Input events that belong to a terminal session. Pointer/titlebar/window
+/// events are deliberately excluded from pre-attach buffering.
+fn session_input_events(events: &[Event]) -> Vec<Event> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                Event::Key { pressed: true, .. }
+                    | Event::Text(_)
+                    | Event::Ime(egui::ImeEvent::Commit(_))
+                    | Event::Paste(_)
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+/// Buffer keys typed while a shell is starting; the newest events win when the
+/// cap is exceeded. They are encoded and written by `apply_spawn_results`.
+fn buffer_pending_input(ui: &egui::Ui, pending: &mut Vec<Event>) {
+    let events = ui.input(|input| session_input_events(&input.events));
+    push_pending_input(pending, events);
+}
+
+fn push_pending_input(pending: &mut Vec<Event>, events: Vec<Event>) {
+    if events.is_empty() {
+        return;
+    }
+    pending.extend(events);
+    if pending.len() > MAX_PENDING_INPUT_EVENTS {
+        pending.drain(..pending.len() - MAX_PENDING_INPUT_EVENTS);
     }
 }
 
@@ -3129,20 +3437,22 @@ fn push_unique_path(plan: &mut Vec<PathBuf>, path: &Path) {
     }
 }
 
-/// Probe every candidate once, off-thread, and return the ordered spawn plan.
-fn plan_spawn_cwds(
-    live: Option<PathBuf>,
-    stored: Option<PathBuf>,
-    startup: Option<PathBuf>,
-    process: Option<PathBuf>,
-) -> Vec<PathBuf> {
-    let candidates = spawn_candidates(live, stored, startup, process);
+/// Probe every candidate once on the spawn worker and return the ordered plan.
+///
+/// Local candidates are checked inline; only network paths use the probe pool,
+/// so this worker never blocks the UI and an unrelated local path never waits
+/// behind a dead UNC share. The cancellation token stops a closed tab before
+/// any `CreateProcess` attempt.
+fn plan_spawn_cwds(candidates: &[SpawnCandidate], cancel: Option<&AtomicBool>) -> Vec<PathBuf> {
     let paths: Vec<PathBuf> = candidates
         .iter()
         .map(|candidate| candidate.path.clone())
         .collect();
-    let kinds = platform::probe_paths(&paths, SPAWN_PATH_PROBE_TIMEOUT);
-    plan_from_probes(&candidates, &kinds)
+    let kinds = match cancel {
+        Some(cancel) => platform::probe_paths_cancellable(&paths, SPAWN_PATH_PROBE_TIMEOUT, cancel),
+        None => platform::probe_paths(&paths, SPAWN_PATH_PROBE_TIMEOUT),
+    };
+    plan_from_probes(candidates, &kinds)
 }
 
 /// The full attempt list for one tab: the probed plan plus a final
@@ -3422,6 +3732,49 @@ fn recovery_frame(tokens: &Tokens) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(18, 14))
 }
 
+/// Lightweight card shown while a shell is unusually slow to attach.
+///
+/// It only offers Cancel, which closes the tab and cancels the worker. At the
+/// hard deadline the tab switches to the normal recovery card, so there is
+/// never an unexplained blank terminal with no action.
+fn show_starting_card(
+    ctx: &egui::Context,
+    tokens: &Tokens,
+    tab_id: u64,
+    profile: &str,
+    elapsed: Duration,
+) -> Option<RecoveryAction> {
+    let mut action = None;
+    egui::Window::new("Starting shell")
+        .id(Id::unique(("illness-starting", tab_id)))
+        .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+        .collapsible(false)
+        .resizable(false)
+        .frame(recovery_frame(tokens))
+        .show(ctx, |ui| {
+            ui.set_max_width(360.0);
+            ui.label(
+                egui::RichText::new(format!("Starting {profile}…"))
+                    .size(tokens.font_body)
+                    .color(tokens.text),
+            );
+            ui.add_space(tokens.gap_sm);
+            ui.label(
+                egui::RichText::new(format!(
+                    "Waiting {:.1}s. A launch folder on an offline network share can delay this.",
+                    elapsed.as_secs_f32()
+                ))
+                .size(tokens.font_small)
+                .color(tokens.text_dim),
+            );
+            ui.add_space(tokens.gap_md);
+            if ui.button("Cancel").clicked() {
+                action = Some(RecoveryAction::Close);
+            }
+        });
+    action
+}
+
 /// Centered recovery card for a shell that failed to start or exited during
 /// startup. Returns the clicked action; the tab stays open until Close.
 fn show_recovery_card(
@@ -3511,15 +3864,18 @@ fn show_recovery_card(
 /// being removed.
 ///
 /// Recovery is limited to the startup window: an unattended shell that exits
-/// ten minutes later is normal, not a broken profile. Inside the window a
-/// shell the user never touched (or one that failed with a non-zero status) is
-/// kept. A deliberate `exit` after input closes the tab even if it is quick;
-/// spawn failures are represented separately by the tab itself.
+/// ten minutes later is normal, not a broken profile. Inside the window only a
+/// confirmed clean exit (`Some(0)`) after real input closes the tab. A missing
+/// status (`None`) is always recovery because the child-exit event may not have
+/// reached the UI yet, and treating that race as a normal exit hid failures.
 fn needs_recovery(elapsed: Duration, user_acted: bool, exit_status: Option<i32>) -> bool {
     if elapsed > STARTUP_RECOVERY_WINDOW {
         return false;
     }
-    !user_acted || exit_status.is_some_and(|code| code != 0)
+    match exit_status {
+        Some(0) => !user_acted,
+        Some(_) | None => true,
+    }
 }
 
 /// New active strip index after removing `closing` from `remaining` entries.
@@ -4854,6 +5210,38 @@ mod tests {
     }
 
     #[test]
+    fn pending_input_keeps_newest_events_and_encodes_an_exit() {
+        let mut pending = Vec::new();
+        let mut events = Vec::new();
+        for index in 0..(MAX_PENDING_INPUT_EVENTS + 10) {
+            events.push(Event::Text(format!("{index}")));
+        }
+        push_pending_input(&mut pending, events);
+        assert_eq!(pending.len(), MAX_PENDING_INPUT_EVENTS);
+        assert!(
+            matches!(pending.first(), Some(Event::Text(text)) if text == "10"),
+            "the oldest pre-attach keys are discarded, not the newest"
+        );
+
+        let exit = session_input_events(&[
+            Event::Text("exit".to_string()),
+            Event::Key {
+                key: Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::default(),
+            },
+        ]);
+        let view = TerminalView::default();
+        assert_eq!(
+            view.encode_input(&exit, Modifiers::default()),
+            Some(b"exit\r".to_vec()),
+            "buffered pre-attach typing is written once the session attaches"
+        );
+    }
+
+    #[test]
     fn recovery_is_bounded_and_respects_a_deliberate_exit() {
         // A profile that fails during startup must not become "no tabs".
         assert!(needs_recovery(Duration::ZERO, false, None));
@@ -4863,8 +5251,10 @@ mod tests {
             false,
             Some(0)
         ));
-        // A deliberate `exit` after typing closes even inside the window.
+        // A deliberate `exit` after typing closes only with a confirmed 0.
         assert!(!needs_recovery(Duration::from_millis(200), true, Some(0)));
+        // A missing status is a race, never a normal exit.
+        assert!(needs_recovery(Duration::from_millis(200), true, None));
         // A non-zero status inside the window is still a failure.
         assert!(needs_recovery(Duration::from_millis(200), true, Some(1)));
         // After the startup window an unattended normal exit is expected.
@@ -4874,6 +5264,165 @@ mod tests {
             false,
             None
         ));
+    }
+
+    #[test]
+    fn chrome_clicks_are_not_shell_activity() {
+        let key = Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::default(),
+        };
+        let text = Event::Text("a".to_string());
+        let pointer = Event::PointerButton {
+            pos: pos2(10.0, 10.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: Modifiers::default(),
+        };
+        let wheel = Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, 20.0),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Unknown,
+            modifiers: Modifiers::default(),
+        };
+        let moved = Event::PointerMoved(pos2(5.0, 5.0));
+
+        let session = session_input_events(&[key.clone(), text.clone(), pointer, wheel, moved]);
+        assert_eq!(session, vec![key, text]);
+        assert!(
+            session_input_events(&[
+                Event::PointerButton {
+                    pos: pos2(1.0, 1.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Modifiers::default(),
+                },
+                Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: vec2(0.0, 1.0),
+                    phase: egui::TouchPhase::Move,
+                    source: egui::MouseWheelSource::Unknown,
+                    modifiers: Modifiers::default(),
+                },
+            ])
+            .is_empty(),
+            "titlebar/plus/settings clicks must not mark the shell used"
+        );
+    }
+
+    #[test]
+    fn spawn_wait_times_out_and_cancels() {
+        let (sender, receiver) = mpsc::channel::<u8>();
+        let cancel = AtomicBool::new(false);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_spawn(&receiver, &cancel, Duration::from_millis(30)),
+            SpawnWait::Timeout
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(sender);
+
+        let (_sender, receiver) = mpsc::channel::<u8>();
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_spawn(&receiver, &cancel, Duration::from_secs(5)),
+            SpawnWait::Cancelled
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let (sender, receiver) = mpsc::channel::<u8>();
+        sender.send(7).expect("send");
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            wait_for_spawn(&receiver, &cancel, Duration::from_secs(1)),
+            SpawnWait::Ready(7)
+        );
+    }
+
+    #[test]
+    fn cold_unc_cancel_and_closed_tab_results_are_discarded() {
+        // A stuck CreateProcess on a cold share is abandoned as soon as the tab
+        // is closed; the wait does not run out the full attempt deadline.
+        let (sender, receiver) = mpsc::channel::<u8>();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = sender.send(1);
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            setter.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_spawn(&receiver, &cancel, Duration::from_secs(5)),
+            SpawnWait::Cancelled
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "closing the tab must interrupt the spawn wait quickly"
+        );
+
+        // A tab that was closed has no target: the late session is dropped
+        // rather than attached to another tab.
+        let profile = profile("PowerShell");
+        let mut tabs = vec![TabEntry::Terminal(Box::new(Tab::pending(
+            4,
+            &profile,
+            Some(PathBuf::from(r"\\cold\share")),
+        )))];
+        assert!(terminal_tab_mut(&mut tabs, 4).is_some());
+        assert!(terminal_tab_mut(&mut tabs, 5).is_none());
+    }
+
+    #[test]
+    fn pending_input_is_cleared_when_a_spawn_fails() {
+        let profile = profile("Missing");
+        let mut tab = Tab::pending(9, &profile, Some(PathBuf::from(r"C:\gone")));
+        tab.pending_input.push(Event::Text("exit\r".to_string()));
+        apply_spawn_outcome(&mut tab, Err("program not found".to_string()));
+        assert!(
+            tab.pending_input.is_empty(),
+            "keys typed while starting must not survive a failed spawn"
+        );
+    }
+
+    #[test]
+    fn sessionless_placeholder_keeps_the_material_alpha() {
+        for theme in Theme::all() {
+            let tokens = Tokens::from_theme(theme);
+            assert_eq!(placeholder_fill(&tokens, Material::Solid), tokens.bg);
+            for (material, alpha) in [
+                (Material::Mica, design::material_alpha(Material::Mica)),
+                (Material::Acrylic, design::material_alpha(Material::Acrylic)),
+            ] {
+                let fill = placeholder_fill(&tokens, material);
+                assert_eq!(fill.a(), alpha, "{} {material:?}", theme.name);
+                let [red, green, blue, _] = fill.to_srgba_unmultiplied();
+                assert!(
+                    red.abs_diff(tokens.bg.r()) <= 2
+                        && green.abs_diff(tokens.bg.g()) <= 2
+                        && blue.abs_diff(tokens.bg.b()) <= 2,
+                    "{} {material:?} must keep the theme background color",
+                    theme.name
+                );
+                assert_ne!(fill.a(), 255, "the native backdrop must show through");
+            }
+        }
+    }
+
+    #[test]
+    fn spawn_result_is_kept_for_recovery_without_a_status() {
+        // `remove_exited_tabs` uses this predicate before the ChildExit event
+        // can be drained; a missing status must never close the tab.
+        assert!(needs_recovery(Duration::ZERO, true, None));
+        assert!(needs_recovery(STARTUP_RECOVERY_WINDOW, true, None));
     }
 
     #[test]

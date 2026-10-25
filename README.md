@@ -82,29 +82,38 @@ when a tab is spawned: enabling it later does not retrofit already-open tabs.
 PowerShell 7 syncs its cwd through `LocationChangedAction` without touching `prompt`. Windows
 PowerShell 5.1 has no equivalent hook, so Illness only wraps the built-in/default prompt there.
 A custom 5.1 prompt is left untouched, which preserves its `$?` but means its folder may not be
-inherited; the tab keeps the last known folder instead. The live shell cwd is validated off-thread
-before a spawn, and the stored, launch and process candidates share one short probe batch. A shell
-that has `cd`ed to a deleted folder or offline UNC share therefore falls back, while a cold launch
-folder survives a probe timeout. Shell creation itself runs on a worker thread, so neither a slow
-SMB path nor a missing shell can freeze the UI.
+inherited; the tab keeps the last known folder instead. A cheap PEB read supplies the live shell
+cwd; every folder probe and shell attempt then runs on the spawn worker. Local candidates are
+checked inline on that worker; only network paths use a small probe pool, so an unrelated local path
+never waits behind a dead UNC share. A per-tab deadline and cancellation token mean a closed or
+restarted tab stops waiting, and a shell that has not started within ten seconds becomes a visible
+recovery card instead of a blank tab. A shell that has `cd`ed to a deleted folder or offline UNC
+share falls back, while a cold launch folder survives a probe timeout. Keys typed while a shell is
+starting are buffered and delivered when it attaches.
 
 ### Explorer context menu
 
 The per-machine installer adds **Open with Illness** verbs for folder backgrounds, selected folders
 and drive roots (no file association) under `HKLM\Software\Classes`, so they work for every user
-without a first launch. Portable and current-user copies fall back to HKCU only when no HKLM verbs
-exist. A normal launch only updates the verbs when running from a stable installed location
-(`%ProgramFiles%`, `%ProgramFiles(x86)%`, or `%LOCALAPPDATA%\Programs`); running a `target\debug`,
-temporary or USB copy will not repoint an installed menu. Explicitly register or remove the current
-copy with:
+without a first launch. While those machine verbs are complete, they are authoritative: a normal
+launch deletes the current user's stale HKCU copy so an older portable install cannot shadow HKLM.
+If HKLM is missing, partial, or names a deleted executable, a launch from a stable installed
+location repairs the user's menu with a per-user HKCU copy. A normal launch only touches the menu
+when running from a stable installed location (`%ProgramFiles%`, `%ProgramFiles(x86)%`, or
+`%LOCALAPPDATA%\Programs`); running a `target\debug`, temporary or USB copy will not repoint an
+installed menu. Explicitly register or remove the current copy with:
 
 ```pwsh
 illness.exe --register-context-menu
 illness.exe --unregister-context-menu
 ```
 
-`--unregister-context-menu` removes the HKCU fallback and, when machine-wide verbs exist,
-HKLM; run it elevated for the latter.
+An explicit registration also repairs a stale shadowing HKCU entry when complete machine verbs
+exist. The installer and uninstaller write/remove HKLM and clean HKCU plus every loaded
+`HKEY_USERS` hive, so upgrades and uninstalls do not leave other logged-on users' old verbs behind.
+An offline account's hive is not mounted; its stale HKCU entry is removed on that user's next launch
+once HKLM is complete. `--unregister-context-menu` removes the HKCU fallback and any HKLM keys; run it
+elevated for the latter.
 
 ### Windows installer
 
@@ -119,9 +128,10 @@ The result is `dist\illness_0.1.0_x64-setup.exe`. It installs to `%ProgramFiles%
 users (UAC prompt), creates an All Users Start Menu shortcut, and registers an uninstaller in
 Programs and Features. Settings remain per-user in `%APPDATA%\illness`; the uninstaller offers to
 remove them but keeps them by default. Before deleting the install directory, the uninstaller
-removes the machine-wide Explorer verbs from `HKLM\Software\Classes` once, plus the installing
-user's legacy HKCU copy; it does not depend on the app being launched again or on which users are
-logged on.
+removes the machine-wide Explorer verbs from `HKLM\Software\Classes`, plus HKCU and every loaded
+`HKEY_USERS` hive so other logged-on users' legacy per-user verbs do not survive. It does not depend
+on the app being launched again; an offline user's hive is repaired by the app on that user's next
+launch while the complete HKLM menu is authoritative.
 
 ## Prescription
 

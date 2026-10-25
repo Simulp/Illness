@@ -108,6 +108,10 @@ struct EventProxy {
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: Event) {
+        // Send the exact exit event before publishing `exited`, so a UI that
+        // observes `is_exited` can drain the status it belongs to. A missing
+        // status is still treated as recovery by `needs_recovery`.
+        let mut mark_exited = false;
         let mapped = match event {
             Event::Title(title) => {
                 set_title(&self.title, Some(title.clone()));
@@ -123,13 +127,13 @@ impl EventListener for EventProxy {
             Event::ColorRequest(index, _) => Some(SessionEvent::ColorRequest(index)),
             Event::TextAreaSizeRequest(_) => Some(SessionEvent::TextAreaSizeRequest),
             Event::ChildExit(status) => {
-                self.exited.store(true, Ordering::Release);
+                mark_exited = true;
                 Some(SessionEvent::ChildExit(status.code().unwrap_or(-1)))
             }
             Event::CursorBlinkingChange => Some(SessionEvent::CursorBlinkingChange),
             Event::MouseCursorDirty => Some(SessionEvent::MouseCursorDirty),
             Event::Exit => {
-                self.exited.store(true, Ordering::Release);
+                mark_exited = true;
                 Some(SessionEvent::Exit)
             }
             Event::Wakeup => Some(SessionEvent::Wakeup),
@@ -141,6 +145,9 @@ impl EventListener for EventProxy {
             // A closed channel only means the UI dropped the session; the PTY must keep running
             // until the session itself is dropped.
             let _ = self.events.send(event);
+        }
+        if mark_exited {
+            self.exited.store(true, Ordering::Release);
         }
         (self.waker)();
     }

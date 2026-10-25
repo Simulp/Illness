@@ -136,6 +136,9 @@ pub struct TerminalResponse {
     pub actions: Vec<TerminalAction>,
     pub cols: usize,
     pub rows: usize,
+    /// Whether the view wrote input bytes (mouse reports, alternate-screen
+    /// wheel keys) straight to this session during the frame.
+    pub input_sent: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -210,6 +213,7 @@ impl TerminalView {
                 actions: Vec::new(),
                 cols: target_cols,
                 rows: target_rows,
+                input_sent: false,
             };
         }
 
@@ -283,6 +287,7 @@ impl TerminalView {
                 actions: Vec::new(),
                 cols,
                 rows,
+                input_sent: false,
             };
         }
         let grid_rect = Rect::from_min_size(
@@ -434,6 +439,7 @@ impl TerminalView {
             }
         }
 
+        let mut input_sent = false;
         let wheel = wheel_notches(ui, rows);
         if !ctrl && response.hovered() && wheel != 0.0 {
             self.wheel_accum += wheel;
@@ -452,6 +458,7 @@ impl TerminalView {
                 for report in wheel_reports(notches, col, row, mouse_mods, self.modes.sgr_mouse) {
                     session.write(&report);
                 }
+                input_sent = true;
             } else if notches != 0 && self.modes.alternate_screen && !self.modes.mouse_reporting {
                 let count = notches.unsigned_abs().saturating_mul(3);
                 let key = if notches > 0 { Key::Up } else { Key::Down };
@@ -465,6 +472,7 @@ impl TerminalView {
                 for _ in 0..count {
                     session.write(&bytes);
                 }
+                input_sent = true;
             } else if notches != 0 {
                 self.scroll_target = apply_wheel(self.scroll_target, notches);
                 self.scroll_target = self
@@ -476,7 +484,7 @@ impl TerminalView {
         if let Some(pos) = pointer {
             let in_pill = pill.is_some_and(|pill_rect| pill_rect.contains(pos));
             if !in_pill {
-                self.handle_mouse(
+                input_sent |= self.handle_mouse(
                     ui,
                     &response,
                     session,
@@ -516,6 +524,7 @@ impl TerminalView {
             actions,
             cols,
             rows,
+            input_sent,
         }
     }
 
@@ -751,7 +760,7 @@ impl TerminalView {
         mods: &Modifiers,
         copy_on_select: bool,
         actions: &mut Vec<TerminalAction>,
-    ) {
+    ) -> bool {
         let cell = Self::cell_at(pos, grid_rect, metrics, grid);
         let mouse_mode = self.modes.mouse_reporting && !mods.shift;
         let mouse_mods = Mods {
@@ -759,12 +768,13 @@ impl TerminalView {
             alt: mods.alt,
             shift: mods.shift,
         };
+        let mut wrote = false;
 
         if mouse_mode {
             // `encode_mouse` takes zero-based coordinates and emits xterm's
             // one-based `col;row` payload.
             let Some((row, col)) = Self::cell_at_clamped(pos, grid_rect, metrics, grid) else {
-                return;
+                return false;
             };
             let sgr = self.modes.sgr_mouse;
             if ui.input(|input| input.pointer.button_pressed(PointerButton::Primary)) {
@@ -776,6 +786,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if ui.input(|input| input.pointer.button_pressed(PointerButton::Middle)) {
                 session.write(&encode_mouse(
@@ -786,6 +797,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary)) {
                 session.write(&encode_mouse(
@@ -796,6 +808,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if ui.input(|input| input.pointer.button_released(PointerButton::Primary)) {
                 session.write(&encode_mouse(
@@ -806,6 +819,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if ui.input(|input| input.pointer.button_released(PointerButton::Middle)) {
                 session.write(&encode_mouse(
@@ -816,6 +830,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if ui.input(|input| input.pointer.button_released(PointerButton::Secondary)) {
                 session.write(&encode_mouse(
@@ -826,6 +841,7 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             if response.dragged_by(PointerButton::Primary) {
                 session.write(&encode_mouse(
@@ -836,9 +852,10 @@ impl TerminalView {
                     mouse_mods,
                     sgr,
                 ));
+                wrote = true;
             }
             self.selecting = false;
-            return;
+            return wrote;
         }
 
         let primary_pressed =
@@ -851,7 +868,7 @@ impl TerminalView {
             });
             if ctrl && link.is_some() {
                 self.selecting = false;
-                return;
+                return false;
             }
             if let Some((row, col)) = cell {
                 let now = ui.input(|input| input.time);
@@ -895,6 +912,7 @@ impl TerminalView {
                 }
             }
         }
+        false
     }
 
     fn click_count(&mut self, now: f64, pos: Pos2) -> u8 {
@@ -915,7 +933,14 @@ impl TerminalView {
     /// should filter its global shortcuts first and call this only when no
     /// overlay wants the keyboard.
     pub fn take_input(&mut self, ui: &mut Ui) -> Option<Vec<u8>> {
-        let events = ui.input(|input| input.events.clone());
+        let (events, modifiers) = ui.input(|input| (input.events.clone(), input.modifiers));
+        self.encode_input(&events, modifiers)
+    }
+
+    /// Encode already captured input events with the current terminal modes.
+    /// The app uses this to attach keys typed while a shell was still starting;
+    /// those events are no longer in the next frame's input queue.
+    pub fn encode_input(&self, events: &[Event], modifiers: Modifiers) -> Option<Vec<u8>> {
         let has_text = events
             .iter()
             .any(|event| matches!(event, Event::Text(_) | Event::Ime(ImeEvent::Commit(_))));
@@ -933,12 +958,12 @@ impl TerminalView {
                     modifiers,
                     ..
                 } => {
-                    let mods = key_mods(&modifiers);
-                    if let Some(key) = map_key(key) {
+                    let mods = key_mods(modifiers);
+                    if let Some(key) = map_key(*key) {
                         bytes.extend_from_slice(&encode_key(KeyInput::new(key, mods, None), modes));
                     } else if mods.ctrl
                         && (!mods.alt || !has_text)
-                        && let Some(ch) = printable_char(key)
+                        && let Some(ch) = printable_char(*key)
                     {
                         // Ctrl+Alt is AltGr on many layouts. When it produces a
                         // text event, that event carries the composed
@@ -951,7 +976,7 @@ impl TerminalView {
                     } else if !has_text
                         && !mods.ctrl
                         && !mods.alt
-                        && let Some(ch) = printable_char(key)
+                        && let Some(ch) = printable_char(*key)
                     {
                         bytes.extend_from_slice(&encode_key(
                             KeyInput::new(Key::Char(ch), mods, None),
@@ -960,14 +985,13 @@ impl TerminalView {
                     }
                 }
                 Event::Text(text) => {
-                    let mods = ui.input(|input| input.modifiers);
-                    if mods.ctrl && !mods.alt {
+                    if modifiers.ctrl && !modifiers.alt {
                         continue;
                     }
-                    if mods.alt && !mods.ctrl {
+                    if modifiers.alt && !modifiers.ctrl {
                         for ch in text.chars() {
                             bytes.extend_from_slice(&encode_key(
-                                KeyInput::new(Key::Char(ch), key_mods(&mods), None),
+                                KeyInput::new(Key::Char(ch), key_mods(&modifiers), None),
                                 modes,
                             ));
                         }
@@ -979,7 +1003,7 @@ impl TerminalView {
                     bytes.extend_from_slice(text.as_bytes());
                 }
                 Event::Paste(text) => {
-                    bytes.extend_from_slice(&encode_paste(&text, modes.bracketed_paste));
+                    bytes.extend_from_slice(&encode_paste(text, modes.bracketed_paste));
                 }
                 _ => {}
             }

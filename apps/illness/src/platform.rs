@@ -11,7 +11,8 @@ use raw_window_handle::HasWindowHandle;
 use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,106 +66,314 @@ pub enum PathKind {
 /// Reuse a recent negative result so a dead folder is not re-probed every time
 /// a tab starts. Kept short: a path can be created moments after it is checked.
 const PATH_PROBE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
-/// Reuse a timeout long enough to cover window creation. This is what makes a
-/// startup probe and the first tab's probe one operation for a cold network
-/// folder; the worker still replaces it with a real result if it finishes.
+/// Reuse a timeout long enough to cover window creation, and keep completed
+/// positive results this long as generations that reject an older timeout.
 const PATH_PROBE_TIMEOUT_TTL: Duration = Duration::from_secs(10);
 /// Bound the cache so a long session cannot accumulate dead paths forever.
 const PATH_PROBE_CACHE_CAP: usize = 64;
+/// Concurrent network-path probes. A dead SMB share can hold one worker for the
+/// full SMB timeout; another tab's unrelated local or network path must still
+/// make progress.
+const PATH_PROBE_WORKERS: usize = 4;
+/// How often a cancellable batch checks its token while waiting.
+const PATH_PROBE_CANCEL_POLL: Duration = Duration::from_millis(25);
+
+/// One cached probe result plus the generation that produced it.
+///
+/// Generations are what keep a caller's deadline timeout from overwriting a
+/// real `Dir` that completed after the deadline but before the timeout was
+/// cached. A result always carries a newer generation than the request that
+/// started it.
+#[derive(Debug, Clone, Copy)]
+struct PathProbeEntry {
+    at: Instant,
+    kind: PathKind,
+    generation: u64,
+}
 
 #[derive(Debug, Default)]
 struct PathProbeCache {
-    entries: HashMap<PathBuf, (Instant, PathKind)>,
+    entries: HashMap<PathBuf, PathProbeEntry>,
+    generation: u64,
 }
 
 impl PathProbeCache {
+    fn next_generation(&mut self) -> u64 {
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+
     fn get(&mut self, path: &Path, now: Instant) -> Option<PathKind> {
-        let (at, kind) = *self.entries.get(path)?;
-        let ttl = match kind {
+        let entry = *self.entries.get(path)?;
+        let ttl = match entry.kind {
             // A positive result is cheap to re-check and can become stale
-            // immediately when a directory is deleted, so it is never cached.
-            PathKind::Dir => return None,
+            // immediately when a directory is deleted, so it is never served.
+            PathKind::Dir => {
+                if now.saturating_duration_since(entry.at) >= PATH_PROBE_TIMEOUT_TTL {
+                    self.entries.remove(path);
+                }
+                return None;
+            }
             PathKind::NotDir => PATH_PROBE_NEGATIVE_TTL,
             PathKind::Timeout => PATH_PROBE_TIMEOUT_TTL,
         };
-        if now.saturating_duration_since(at) < ttl {
-            Some(kind)
+        if now.saturating_duration_since(entry.at) < ttl {
+            Some(entry.kind)
         } else {
             self.entries.remove(path);
             None
         }
     }
 
-    fn put(&mut self, path: &Path, kind: PathKind, now: Instant) {
-        if kind == PathKind::Dir {
-            self.entries.remove(path);
+    fn put_result(&mut self, path: &Path, kind: PathKind, now: Instant) {
+        let generation = self.next_generation();
+        self.insert(
+            path,
+            PathProbeEntry {
+                at: now,
+                kind,
+                generation,
+            },
+            now,
+        );
+    }
+
+    /// Cache a caller deadline only when no result newer than its request has
+    /// landed. A late `Dir` result therefore wins and the next tab rechecks it
+    /// instead of inheriting a false timeout.
+    fn put_timeout(&mut self, path: &Path, request_generation: u64, now: Instant) {
+        if self.entries.get(path).is_some_and(|entry| {
+            entry.kind == PathKind::Dir || entry.generation > request_generation
+        }) {
             return;
         }
+        self.insert(
+            path,
+            PathProbeEntry {
+                at: now,
+                kind: PathKind::Timeout,
+                generation: request_generation,
+            },
+            now,
+        );
+    }
+
+    fn insert(&mut self, path: &Path, entry: PathProbeEntry, now: Instant) {
         if self.entries.len() >= PATH_PROBE_CACHE_CAP {
-            self.entries
-                .retain(|_, (at, _)| now.saturating_duration_since(*at) < PATH_PROBE_NEGATIVE_TTL);
+            self.entries.retain(|_, known| {
+                now.saturating_duration_since(known.at) < PATH_PROBE_TIMEOUT_TTL
+            });
         }
-        self.entries.insert(path.to_path_buf(), (now, kind));
+        if self.entries.len() < PATH_PROBE_CACHE_CAP {
+            self.entries.insert(path.to_path_buf(), entry);
+        }
     }
 }
 
-/// One batch of unique paths for the reusable probe thread.
-struct PathProbeJob {
-    paths: Vec<PathBuf>,
-    reply: Sender<(usize, PathKind)>,
+/// One network path handed to the probe pool. `index` is the caller's unique
+/// path slot; the reply channel is per batch so unrelated batches never share
+/// result slots.
+struct PathProbeTask {
+    index: usize,
+    path: PathBuf,
+    reply: crossbeam_channel::Sender<(usize, PathKind)>,
 }
 
-/// A single long-lived probe thread plus its shared negative cache.
+/// Long-lived probe pool plus its generation-safe cache.
 ///
-/// A fresh thread per request used to leave one blocked SMB check behind for
-/// every New Tab/startup. The worker is intentionally serial: duplicate paths
-/// are collapsed before they reach it, and the cache absorbs repeats.
-struct PathProbeWorker {
-    jobs: Sender<PathProbeJob>,
+/// Local paths are probed inline by [`start_probe_paths`] before a batch is
+/// submitted, so an unrelated dead UNC path can never make them wait. Only
+/// network paths use the pool, where a stuck SMB check occupies one worker.
+struct PathProbePool {
+    jobs: crossbeam_channel::Sender<PathProbeTask>,
     cache: Arc<Mutex<PathProbeCache>>,
 }
 
-fn path_probe_worker() -> &'static PathProbeWorker {
-    static WORKER: OnceLock<PathProbeWorker> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (jobs, receiver) = mpsc::channel::<PathProbeJob>();
+fn path_probe_pool() -> &'static PathProbePool {
+    static POOL: OnceLock<PathProbePool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let (jobs, receiver) = crossbeam_channel::unbounded::<PathProbeTask>();
         let cache = Arc::new(Mutex::new(PathProbeCache::default()));
-        let worker_cache = Arc::clone(&cache);
-        let spawned = std::thread::Builder::new()
-            .name("illness-path-probe".to_string())
-            .spawn(move || {
-                while let Ok(job) = receiver.recv() {
-                    for (index, path) in job.paths.iter().enumerate() {
-                        let now = Instant::now();
-                        let cached = {
-                            let mut cache = worker_cache
-                                .lock()
-                                .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            cache.get(path, now)
+        for index in 0..PATH_PROBE_WORKERS {
+            let receiver = receiver.clone();
+            let worker_cache = Arc::clone(&cache);
+            let spawned = std::thread::Builder::new()
+                .name(format!("illness-path-probe-{index}"))
+                .spawn(move || {
+                    while let Ok(task) = receiver.recv() {
+                        let kind = if task.path.is_dir() {
+                            PathKind::Dir
+                        } else {
+                            PathKind::NotDir
                         };
-                        let kind = cached.unwrap_or_else(|| {
-                            let kind = if path.is_dir() {
-                                PathKind::Dir
-                            } else {
-                                PathKind::NotDir
-                            };
+                        {
                             let mut cache = worker_cache
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-                            cache.put(path, kind, Instant::now());
-                            kind
-                        });
-                        // The receiver may have given up at its deadline; the
-                        // probe still finishes and warms the cache for later.
-                        let _ = job.reply.send((index, kind));
+                            cache.put_result(&task.path, kind, Instant::now());
+                        }
+                        // The batch may have timed out or been cancelled; the
+                        // probe still warms the cache for later requests.
+                        let _ = task.reply.send((task.index, kind));
                     }
-                }
-            });
-        if let Err(error) = spawned {
-            log::warn!("could not start the path probe thread: {error}");
+                });
+            if let Err(error) = spawned {
+                log::warn!("could not start path probe worker {index}: {error}");
+            }
         }
-        PathProbeWorker { jobs, cache }
+        PathProbePool { jobs, cache }
     })
+}
+
+/// Whether a path may block on a network share and therefore belongs on the
+/// probe pool rather than the caller's thread.
+#[cfg(target_os = "windows")]
+fn is_network_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    const DRIVE_REMOTE: u32 = 4;
+    let Some(Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    match prefix.kind() {
+        Prefix::UNC(_, _) | Prefix::VerbatimUNC(_, _) => true,
+        Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+            let root = [u16::from(letter), u16::from(b':'), u16::from(b'\\'), 0];
+            // Safety: `root` is a live, null-terminated wide drive root.
+            unsafe { GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_network_path(path: &Path) -> bool {
+    path.to_string_lossy().starts_with(r"\\")
+}
+
+/// A submitted probe batch. Callers wait at most their own deadline and never
+/// block the UI thread; late pool results keep warming the generation cache.
+struct ProbeBatch {
+    mapping: Vec<usize>,
+    unique: Vec<PathBuf>,
+    results: Vec<Option<PathKind>>,
+    pending: Vec<(usize, u64)>,
+    replies: Option<crossbeam_channel::Receiver<(usize, PathKind)>>,
+    cache: Arc<Mutex<PathProbeCache>>,
+}
+
+impl ProbeBatch {
+    fn wait(mut self, timeout: Duration, cancel: Option<&AtomicBool>) -> Vec<PathKind> {
+        let deadline = Instant::now().checked_add(timeout);
+        if let Some(receiver) = self.replies.take() {
+            while !self.pending.is_empty() {
+                if cancel.is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire)) {
+                    break;
+                }
+                let now = Instant::now();
+                let left = deadline
+                    .map(|deadline| deadline.saturating_duration_since(now))
+                    .unwrap_or(timeout);
+                if left.is_zero() {
+                    break;
+                }
+                let poll = if cancel.is_some() {
+                    left.min(PATH_PROBE_CANCEL_POLL)
+                } else {
+                    left
+                };
+                match receiver.recv_timeout(poll) {
+                    Ok((index, kind)) => {
+                        if let Some(slot) = self.results.get_mut(index)
+                            && slot.is_none()
+                        {
+                            *slot = Some(kind);
+                        }
+                        self.pending.retain(|(pending, _)| *pending != index);
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, generation) in self.pending.drain(..) {
+            if self.results.get(index).is_some_and(Option::is_none) {
+                self.results[index] = Some(PathKind::Timeout);
+                cache.put_timeout(&self.unique[index], generation, now);
+            }
+        }
+        drop(cache);
+
+        self.mapping
+            .iter()
+            .map(|index| self.results[*index].unwrap_or(PathKind::Timeout))
+            .collect()
+    }
+}
+
+/// Submit one probe batch without waiting. Local paths complete inline; only
+/// network paths are queued, and duplicate paths share one batch slot.
+fn start_probe_paths(paths: &[PathBuf]) -> ProbeBatch {
+    let (unique, mapping) = unique_probe_paths(paths);
+    let pool = path_probe_pool();
+    let mut results: Vec<Option<PathKind>> = vec![None; unique.len()];
+    let mut pending = Vec::new();
+    let (reply, receiver) = crossbeam_channel::unbounded();
+    let now = Instant::now();
+
+    {
+        let mut cache = pool
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, path) in unique.iter().enumerate() {
+            if let Some(kind) = cache.get(path, now) {
+                results[index] = Some(kind);
+                continue;
+            }
+            if !is_network_path(path) {
+                // A local directory check is cheap and must never queue behind
+                // a dead SMB probe.
+                let kind = if path.is_dir() {
+                    PathKind::Dir
+                } else {
+                    PathKind::NotDir
+                };
+                cache.put_result(path, kind, Instant::now());
+                results[index] = Some(kind);
+                continue;
+            }
+            let generation = cache.next_generation();
+            let task = PathProbeTask {
+                index,
+                path: path.clone(),
+                reply: reply.clone(),
+            };
+            if pool.jobs.send(task).is_ok() {
+                pending.push((index, generation));
+            } else {
+                cache.put_timeout(path, generation, Instant::now());
+                results[index] = Some(PathKind::Timeout);
+            }
+        }
+    }
+    drop(reply);
+
+    ProbeBatch {
+        mapping,
+        unique,
+        results,
+        pending,
+        replies: Some(receiver),
+        cache: Arc::clone(&pool.cache),
+    }
 }
 
 /// Collapse duplicate paths while preserving first-seen order.
@@ -191,72 +400,22 @@ fn unique_probe_paths(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<usize>) {
 /// unresolved entries become [`PathKind::Timeout`]. That distinction lets a
 /// cold launch folder survive while a dead live shell cwd falls through to a
 /// usable stored/startup/process directory.
+///
+/// The app calls this only from its shell-spawn worker or before the window is
+/// created; a network path never blocks the UI thread. Local paths are checked
+/// inline, so they are unaffected by another tab's stuck UNC probe.
 pub fn probe_paths(paths: &[PathBuf], timeout: Duration) -> Vec<PathKind> {
-    if paths.is_empty() {
-        return Vec::new();
-    }
-    let (unique, mapping) = unique_probe_paths(paths);
-    let worker = path_probe_worker();
-    let now = Instant::now();
-    let mut unique_kinds: Vec<Option<PathKind>> = vec![None; unique.len()];
-    let mut pending = Vec::new();
+    start_probe_paths(paths).wait(timeout, None)
+}
 
-    {
-        let mut cache = worker
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for (index, path) in unique.iter().enumerate() {
-            if let Some(kind) = cache.get(path, now) {
-                unique_kinds[index] = Some(kind);
-            } else {
-                pending.push(index);
-            }
-        }
-    }
-
-    if !pending.is_empty() {
-        let (reply, results) = mpsc::channel();
-        let job = PathProbeJob {
-            paths: pending.iter().map(|index| unique[*index].clone()).collect(),
-            reply,
-        };
-        if worker.jobs.send(job).is_ok() {
-            let deadline = now.checked_add(timeout).unwrap_or(now);
-            let mut remaining = pending.len();
-            while remaining > 0 {
-                let left = deadline.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                let Ok((job_index, kind)) = results.recv_timeout(left) else {
-                    break;
-                };
-                if let Some(&index) = pending.get(job_index)
-                    && unique_kinds[index].is_none()
-                {
-                    unique_kinds[index] = Some(kind);
-                    remaining -= 1;
-                }
-            }
-        }
-
-        let mut cache = worker
-            .cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for index in pending {
-            if unique_kinds[index].is_none() {
-                unique_kinds[index] = Some(PathKind::Timeout);
-                cache.put(&unique[index], PathKind::Timeout, Instant::now());
-            }
-        }
-    }
-
-    mapping
-        .iter()
-        .map(|index| unique_kinds[*index].unwrap_or(PathKind::Timeout))
-        .collect()
+/// Cancellable form for a shell spawn. A closed/restarted tab sets the token,
+/// so a worker waiting for a cold share stops before creating a process.
+pub fn probe_paths_cancellable(
+    paths: &[PathBuf],
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Vec<PathKind> {
+    start_probe_paths(paths).wait(timeout, Some(cancel))
 }
 
 /// Single-path form of [`probe_paths`]. Multi-candidate callers use the batch
@@ -471,7 +630,6 @@ pub fn wsl_profiles() -> Vec<illness_core::Profile> {
 /// `%V`; `Directory` is a selected folder and `Drive` a drive root, both of
 /// which receive `%1`. No file association is added, so double-clicking a file
 /// is unchanged.
-#[cfg(target_os = "windows")]
 const CONTEXT_MENU_VERBS: &[(&str, &str)] = &[
     (r"Software\Classes\Directory\Background\shell\Illness", "%V"),
     (r"Software\Classes\Directory\shell\Illness", "%1"),
@@ -665,18 +823,130 @@ fn set_registry_string(key: &RegistryKey, name: &str, value: &OsStr) -> Result<(
     Ok(())
 }
 
-/// Whether the machine-wide Explorer verbs are present.
+/// What an app launch should do with the per-user Explorer verbs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuAction {
+    /// Transient copy without an explicit flag: leave the installed menu alone.
+    Skip,
+    /// Machine-wide verbs are authoritative and valid; remove this user's
+    /// legacy HKCU copy so it cannot shadow HKLM.
+    RemoveStaleHkcu,
+    /// Machine-wide verbs are absent or incomplete; write the HKCU fallback.
+    WriteHkcu,
+}
+
+/// Whether a launch should skip, repair HKCU, or write HKCU.
+///
+/// `automatic` means the executable lives in a stable installed root and may
+/// touch the user's menu without an explicit flag. A complete HKLM menu wins
+/// over HKCU, but only when *all* three verbs exist and their command points at
+/// an existing executable. An explicit `--register-context-menu` still repairs
+/// in that case by deleting a stale shadowing HKCU copy.
+fn context_menu_action(force: bool, automatic: bool, machine_complete: bool) -> ContextMenuAction {
+    if !force && !automatic {
+        ContextMenuAction::Skip
+    } else if machine_complete {
+        ContextMenuAction::RemoveStaleHkcu
+    } else {
+        ContextMenuAction::WriteHkcu
+    }
+}
+
+/// Extract the executable from a registry verb command such as
+/// `"C:\Program Files\Illness\illness.exe" "%V"`.
+///
+/// The installer and runtime always quote an executable path, but accept an
+/// unquoted first token too so a manually created verb is still validated.
+fn context_menu_command_executable(command: &str) -> Option<&str> {
+    let command = command.trim();
+    if let Some(rest) = command.strip_prefix('"') {
+        let end = rest.find('"')?;
+        (!rest[..end].is_empty()).then_some(&rest[..end])
+    } else {
+        command.split_whitespace().next()
+    }
+}
+
+/// Whether a command points at a file that still exists.
+fn context_menu_command_valid(command: &str) -> bool {
+    context_menu_command_executable(command)
+        .is_some_and(|executable| Path::new(executable).is_file())
+}
+
+/// `true` only when every verb has a readable command naming an existing
+/// executable. A partial or stale HKLM registration is not authoritative.
+fn context_menu_verbs_complete(commands: &[Option<String>]) -> bool {
+    commands.len() == CONTEXT_MENU_VERBS.len()
+        && commands
+            .iter()
+            .all(|command| command.as_deref().is_some_and(context_menu_command_valid))
+}
+
+/// Read one string value from a registry key.
+#[cfg(target_os = "windows")]
+fn read_registry_string(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+    name: &str,
+) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
+
+    let key_path = registry_wide(OsStr::new(path));
+    let value_name = registry_wide(OsStr::new(name));
+    let mut data = [0u16; 4096];
+    let mut data_len = u32::try_from(data.len() * std::mem::size_of::<u16>()).ok()?;
+    // Safety: key_path and value_name are null-terminated and live for the
+    // call; data is a correctly sized WCHAR buffer and data_len is its byte
+    // capacity.
+    let status = unsafe {
+        RegGetValueW(
+            root,
+            key_path.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            data.as_mut_ptr().cast(),
+            &mut data_len,
+        )
+    };
+    if status != ERROR_SUCCESS {
+        return None;
+    }
+    let chars = usize::try_from(data_len / 2)
+        .unwrap_or(0)
+        .saturating_sub(1)
+        .min(data.len());
+    Some(String::from_utf16_lossy(&data[..chars]))
+}
+
+/// Whether *all* machine-wide Explorer verbs exist and point at a real file.
 ///
 /// The per-machine installer owns `HKLM\Software\Classes`; the application
-/// must not add a shadowing per-user copy when those keys exist. A portable or
-/// current-user install has no HKLM keys and falls back to HKCU.
+/// must not leave a per-user copy shadowing it when the machine menu is healthy.
+/// A single leftover key, or a command naming a deleted executable, is not
+/// complete and falls back to repairing HKCU.
 #[cfg(target_os = "windows")]
-fn machine_context_menu_registered() -> bool {
+fn machine_context_menu_complete() -> bool {
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+
+    let commands: Vec<Option<String>> = CONTEXT_MENU_VERBS
+        .iter()
+        .map(|(path, _)| read_registry_string(HKEY_LOCAL_MACHINE, path, ""))
+        .collect();
+    context_menu_verbs_complete(&commands)
+}
+
+/// Whether any per-machine verb key exists, even if stale or incomplete.
+///
+/// Uninstall uses this broader check so it removes leftover keys, while the
+/// runtime's decision to trust HKLM requires [`machine_context_menu_complete`].
+#[cfg(target_os = "windows")]
+fn machine_context_menu_present() -> bool {
     use windows_sys::Win32::System::Registry::{
         HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
     };
 
-    fn key_exists(path: &str) -> bool {
+    CONTEXT_MENU_VERBS.iter().any(|(path, _)| {
         let key_path = registry_wide(OsStr::new(path));
         let mut key: HKEY = std::ptr::null_mut();
         // Safety: key_path is null-terminated and live for the call; `key` is
@@ -689,14 +959,7 @@ fn machine_context_menu_registered() -> bool {
         // Safety: key was opened successfully above and is not used again.
         unsafe { RegCloseKey(key) };
         true
-    }
-
-    CONTEXT_MENU_VERBS.iter().any(|(path, _)| key_exists(path))
-}
-
-/// Whether an application launch should write its portable HKCU fallback.
-fn hkcu_registration_needed(machine_registered: bool) -> bool {
-    !machine_registered
+    })
 }
 
 /// Register the "Open with Illness" verbs for folders and drives.
@@ -705,10 +968,15 @@ fn hkcu_registration_needed(machine_registered: bool) -> bool {
 /// current executable from anywhere. Normal startup only updates the verbs
 /// when running from a stable installed root; a `target\debug`, temporary,
 /// portable or USB copy must not repoint an installed menu at a path that will
-/// vanish. A per-machine install owns HKLM verbs, so the runtime skips HKCU
-/// when those exist; portable/current-user installs use HKCU. Program Files
-/// launches still update idempotently, so an installer upgrade repairs a stale
-/// path. Existing unrelated classes and verbs are never touched.
+/// vanish.
+///
+/// A complete per-machine menu is authoritative: it must not be shadowed by a
+/// stale HKCU verb from an older portable/current-user install, so this launch
+/// deletes the current user's copy instead of writing another one. If HKLM is
+/// absent, partial, or names a deleted executable, a normal stable install and
+/// an explicit flag repair the user's menu with HKCU. The installer repairs
+/// HKLM and every loaded user hive; an offline user's stale HKCU entry is
+/// deleted on that user's next launch once HKLM is complete.
 pub fn register_context_menu(force: bool) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -718,29 +986,36 @@ pub fn register_context_menu(force: bool) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        if !hkcu_registration_needed(machine_context_menu_registered()) {
-            log::info!("machine-wide Explorer verbs present; skipping HKCU registration");
-            return Ok(());
-        }
+        use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 
         let executable =
             std::env::current_exe().context("could not resolve the Illness executable")?;
-        let stable_roots = stable_install_roots();
-        let temp_root = std::env::temp_dir();
-        if !force
-            && !automatic_context_menu_allowed(
-                &executable,
-                &stable_roots,
-                &temp_root,
-                is_removable_path(&executable),
-            )
-        {
-            log::info!(
-                "skipping automatic Explorer registration from transient path {}",
-                executable.display()
-            );
-            return Ok(());
+        let automatic = automatic_context_menu_allowed(
+            &executable,
+            &stable_install_roots(),
+            &std::env::temp_dir(),
+            is_removable_path(&executable),
+        );
+        let machine_complete = machine_context_menu_complete();
+        match context_menu_action(force, automatic, machine_complete) {
+            ContextMenuAction::Skip => {
+                log::info!(
+                    "skipping automatic Explorer registration from transient path {}",
+                    executable.display()
+                );
+                return Ok(());
+            }
+            ContextMenuAction::RemoveStaleHkcu => {
+                remove_context_menu_root(HKEY_CURRENT_USER, "HKCU")
+                    .context("removing a stale per-user Explorer verb")?;
+                log::info!(
+                    "complete machine-wide Explorer verbs are authoritative; removed stale HKCU verbs"
+                );
+                return Ok(());
+            }
+            ContextMenuAction::WriteHkcu => {}
         }
+
         for (path, placeholder) in CONTEXT_MENU_VERBS {
             let key =
                 create_registry_key(path).with_context(|| format!("registering HKCU\\{path}"))?;
@@ -774,28 +1049,37 @@ fn remove_context_menu_root(
 ) -> Result<()> {
     use windows_sys::Win32::System::Registry::{RegDeleteKeyW, RegDeleteTreeW};
 
+    let mut failure = None;
     for (path, _) in CONTEXT_MENU_VERBS {
         let key_path = registry_wide(OsStr::new(path));
         // Safety: key_path is null-terminated and live for the call.
         let tree_status = unsafe { RegDeleteTreeW(root, key_path.as_ptr()) };
         if tree_status != ERROR_SUCCESS && tree_status != ERROR_FILE_NOT_FOUND {
-            anyhow::bail!("could not clear {name}\\{path}: Windows error {tree_status}");
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("could not clear {name}\\{path}: Windows error {tree_status}")
+            });
         }
         // RegDeleteTree removes values and subkeys; this removes the now empty
         // verb key itself. Safety: same null-terminated path.
         let key_status = unsafe { RegDeleteKeyW(root, key_path.as_ptr()) };
         if key_status != ERROR_SUCCESS && key_status != ERROR_FILE_NOT_FOUND {
-            anyhow::bail!("could not remove {name}\\{path}: Windows error {key_status}");
+            failure.get_or_insert_with(|| {
+                anyhow::anyhow!("could not remove {name}\\{path}: Windows error {key_status}")
+            });
         }
     }
-    Ok(())
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 /// Remove the Illness Explorer verbs created by [`register_context_menu`].
 ///
-/// HKCU is the portable fallback. When machine-wide verbs exist, the explicit
-/// uninstall/flag path also removes HKLM; running it without elevation returns
-/// an error instead of pretending the menu is gone.
+/// HKCU is the portable fallback. When any machine-wide key exists, the
+/// explicit uninstall/flag path also removes HKLM, including partial or stale
+/// registrations; running it without elevation returns an error instead of
+/// pretending the menu is gone.
 pub fn unregister_context_menu() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -806,12 +1090,20 @@ pub fn unregister_context_menu() -> Result<()> {
     {
         use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 
-        remove_context_menu_root(HKEY_CURRENT_USER, "HKCU")?;
-        if machine_context_menu_registered() {
-            remove_context_menu_root(
+        let mut failure = None;
+        if let Err(error) = remove_context_menu_root(HKEY_CURRENT_USER, "HKCU") {
+            failure = Some(error);
+        }
+        if machine_context_menu_present()
+            && let Err(error) = remove_context_menu_root(
                 windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
                 "HKLM",
-            )?;
+            )
+        {
+            failure.get_or_insert(error);
+        }
+        if let Some(error) = failure {
+            return Err(error);
         }
         log::info!("removed Explorer folder verbs");
         Ok(())
@@ -1529,9 +1821,11 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{
-        CONTEXT_MENU_VERBS, PEB_LAYOUT_32, PEB_LAYOUT_64, PathKind, PathProbeCache, acrylic_tint,
-        automatic_context_menu_allowed, context_menu_command, curdir_header_layout,
-        decode_curdir_header, decode_curdir_text, hkcu_registration_needed, machine_is_wow64,
+        CONTEXT_MENU_VERBS, ContextMenuAction, PEB_LAYOUT_32, PEB_LAYOUT_64, PathKind,
+        PathProbeCache, ProbeBatch, acrylic_tint, automatic_context_menu_allowed,
+        context_menu_action, context_menu_command, context_menu_command_executable,
+        context_menu_command_valid, context_menu_verbs_complete, curdir_header_layout,
+        decode_curdir_header, decode_curdir_text, is_network_path, machine_is_wow64,
         path_has_prefix, path_kind_with_deadline, peb_layout_for_target, plausible_process_path,
         probe_paths, probe_with_deadline, process_cwd, strip_nt_prefix, terminated_curdir_len,
         transparency_allowed, unique_probe_paths,
@@ -1539,6 +1833,8 @@ mod tests {
     use illness_core::Rgb;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1684,7 +1980,53 @@ mod tests {
     }
 
     #[test]
-    fn installer_registers_hklm_for_per_machine_and_removes_it_once() {
+    fn context_menu_command_paths_are_extracted_and_validated() {
+        let exe = std::env::current_exe().expect("test executable");
+        let quoted = context_menu_command(exe.as_os_str(), "%V");
+        assert_eq!(
+            context_menu_command_executable(&quoted),
+            Some(exe.to_str().expect("unicode test path"))
+        );
+        assert!(context_menu_command_valid(&quoted));
+        assert_eq!(
+            context_menu_command_executable("illness.exe \"%1\""),
+            Some("illness.exe")
+        );
+        assert_eq!(
+            context_menu_command_executable("\"C:\\missing\\illness.exe\" \"%V\""),
+            Some(r"C:\missing\illness.exe")
+        );
+        assert!(!context_menu_command_valid(""));
+        assert!(!context_menu_command_valid("\"\" \"%V\""));
+        assert!(
+            !context_menu_command_valid(r#""C:\definitely-missing-illness.exe" "%V""#),
+            "a command naming a deleted executable is not authoritative"
+        );
+    }
+
+    #[test]
+    fn complete_machine_verbs_need_all_three_valid_commands() {
+        let exe = std::env::current_exe().expect("test executable");
+        let command = context_menu_command(exe.as_os_str(), "%V");
+        let complete = vec![Some(command.clone()), Some(command.clone()), Some(command)];
+        assert!(context_menu_verbs_complete(&complete));
+
+        let partial = vec![Some(complete[0].clone().unwrap()), None, None];
+        assert!(
+            !context_menu_verbs_complete(&partial),
+            "a single leftover HKLM verb must not suppress HKCU repair"
+        );
+        let stale = vec![
+            Some(r#""C:\missing\illness.exe" "%V""#.to_string()),
+            Some(complete[0].clone().unwrap()),
+            Some(complete[0].clone().unwrap()),
+        ];
+        assert!(!context_menu_verbs_complete(&stale));
+        assert!(!context_menu_verbs_complete(&[]));
+    }
+
+    #[test]
+    fn installer_registers_hklm_and_cleans_loaded_user_hives() {
         const TEMPLATE: &str = include_str!("../installer.nsi");
         assert!(TEMPLATE.contains("!insertmacro RegisterExplorerVerbs HKLM"));
         assert!(TEMPLATE.contains("!insertmacro UnregisterExplorerVerbs HKLM"));
@@ -1694,13 +2036,29 @@ mod tests {
             "the macro must write classes relative to its root"
         );
         assert!(
-            !TEMPLATE.contains("EnumRegKey $1 HKU"),
-            "the uninstaller must not depend on loaded/offline user hives"
+            TEMPLATE.contains("EnumRegKey $1 HKU"),
+            "per-machine install/uninstall must clean loaded per-user hives"
         );
         assert!(
-            !TEMPLATE.contains("DeleteRegKey HKU"),
-            "offlined hives cannot be cleaned reliably; use HKLM instead"
+            TEMPLATE.contains(r#"DeleteRegKey HKU "$1\Software\Classes\Directory\shell\Illness""#),
+            "the enumerated hives must have their Illness verbs removed"
         );
+        assert!(
+            TEMPLATE.contains("offline"),
+            "the installer must document the offline-hive limit"
+        );
+        let install = TEMPLATE
+            .find("Section Install")
+            .expect("install section exists");
+        let install_tail = &TEMPLATE[install..];
+        let hklm = install_tail
+            .find("RegisterExplorerVerbs HKLM")
+            .expect("per-machine registration exists");
+        let hkcu_cleanup = install_tail
+            .find("UnregisterExplorerVerbsFromLoadedHives")
+            .expect("installer cleans loaded hives");
+        assert!(hklm < hkcu_cleanup);
+
         let call = TEMPLATE
             .find("Call un.RemoveExplorerVerbs")
             .expect("uninstall calls the verb cleanup");
@@ -1711,9 +2069,43 @@ mod tests {
     }
 
     #[test]
-    fn runtime_skips_hkcu_when_machine_verbs_exist() {
-        assert!(!hkcu_registration_needed(true));
-        assert!(hkcu_registration_needed(false));
+    fn runtime_repairs_hkcu_only_while_machine_verbs_are_incomplete() {
+        // A complete machine menu is authoritative; repair the current user's
+        // stale copy instead of shadowing it with another verb.
+        assert_eq!(
+            context_menu_action(false, true, true),
+            ContextMenuAction::RemoveStaleHkcu
+        );
+        // An explicit --register-context-menu also repairs instead of skipping.
+        assert_eq!(
+            context_menu_action(true, false, true),
+            ContextMenuAction::RemoveStaleHkcu
+        );
+        // Program Files with a partial/stale HKLM writes the HKCU repair.
+        assert_eq!(
+            context_menu_action(false, true, false),
+            ContextMenuAction::WriteHkcu
+        );
+        assert_eq!(
+            context_menu_action(true, false, false),
+            ContextMenuAction::WriteHkcu
+        );
+        // A transient debug/USB copy still leaves an installed menu alone.
+        assert_eq!(
+            context_menu_action(false, false, false),
+            ContextMenuAction::Skip
+        );
+        assert_eq!(
+            context_menu_action(false, false, true),
+            ContextMenuAction::Skip
+        );
+    }
+
+    #[test]
+    fn network_paths_use_the_probe_pool_and_local_paths_do_not() {
+        assert!(!is_network_path(&std::env::temp_dir()));
+        assert!(is_network_path(Path::new(r"\\server\share\folder")));
+        assert!(is_network_path(Path::new(r"\\?\UNC\server\share")));
     }
 
     #[test]
@@ -1779,26 +2171,113 @@ mod tests {
         let now = Instant::now();
         let path = Path::new(r"C:\dead");
 
-        cache.put(path, PathKind::NotDir, now);
+        cache.put_result(path, PathKind::NotDir, now);
         assert_eq!(
             cache.get(path, now + Duration::from_secs(1)),
             Some(PathKind::NotDir)
         );
         assert_eq!(cache.get(path, now + Duration::from_secs(6)), None);
 
-        cache.put(path, PathKind::Timeout, now);
+        cache.put_result(path, PathKind::Timeout, now);
         assert_eq!(
             cache.get(path, now + Duration::from_secs(1)),
             Some(PathKind::Timeout)
         );
         assert_eq!(cache.get(path, now + Duration::from_secs(11)), None);
 
-        cache.put(path, PathKind::Dir, now);
+        cache.put_result(path, PathKind::Dir, now);
         assert_eq!(
             cache.get(path, now),
             None,
             "a directory must be re-checked after deletion"
         );
+    }
+
+    #[test]
+    fn stale_timeout_cannot_overwrite_a_newer_completed_probe() {
+        let mut cache = PathProbeCache::default();
+        let now = Instant::now();
+        let path = Path::new(r"\\cold\share");
+
+        // Tab A starts a request, then the pool completes a Dir after the
+        // caller deadline. A stale timeout for A must not replace that result.
+        let request = cache.next_generation();
+        cache.put_result(path, PathKind::Dir, now);
+        cache.put_timeout(path, request, now + Duration::from_millis(1));
+        assert_eq!(
+            cache.entries.get(path).map(|entry| entry.kind),
+            Some(PathKind::Dir),
+            "a completed Dir must survive an older request's timeout"
+        );
+
+        // A timeout from an even newer request still must not replace a known
+        // completed directory; positive results are rechecked, never overridden.
+        let newer = cache.next_generation();
+        cache.put_timeout(path, newer, now + Duration::from_millis(2));
+        assert_eq!(
+            cache.entries.get(path).map(|entry| entry.kind),
+            Some(PathKind::Dir)
+        );
+
+        // A path without a completed positive result still caches its timeout
+        // until a real result arrives.
+        let fresh = Path::new(r"\\cold\share\fresh");
+        cache.put_timeout(fresh, newer, now + Duration::from_millis(2));
+        assert_eq!(
+            cache.entries.get(fresh).map(|entry| entry.kind),
+            Some(PathKind::Timeout)
+        );
+        cache.put_result(fresh, PathKind::Dir, now + Duration::from_millis(3));
+        assert_eq!(
+            cache.entries.get(fresh).map(|entry| entry.kind),
+            Some(PathKind::Dir)
+        );
+    }
+
+    fn pending_batch(
+        path: PathBuf,
+        request: u64,
+    ) -> (
+        ProbeBatch,
+        crossbeam_channel::Sender<(usize, PathKind)>,
+        Arc<Mutex<PathProbeCache>>,
+    ) {
+        let (reply, receiver) = crossbeam_channel::unbounded();
+        let cache = Arc::new(Mutex::new(PathProbeCache::default()));
+        (
+            ProbeBatch {
+                mapping: vec![0],
+                unique: vec![path],
+                results: vec![None],
+                pending: vec![(0, request)],
+                replies: Some(receiver),
+                cache: Arc::clone(&cache),
+            },
+            reply,
+            cache,
+        )
+    }
+
+    #[test]
+    fn probe_batch_deadline_is_bounded_and_kind_is_timeout() {
+        let (batch, _reply, _cache) = pending_batch(PathBuf::from(r"\\cold\share"), 1);
+        let started = Instant::now();
+        let kinds = batch.wait(Duration::from_millis(30), None);
+        assert_eq!(kinds, vec![PathKind::Timeout]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a dead network probe must not hold the spawn worker past its own deadline"
+        );
+    }
+
+    #[test]
+    fn probe_batch_cancellation_stops_the_wait() {
+        let (batch, _reply, _cache) = pending_batch(PathBuf::from(r"\\cold\share"), 1);
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let kinds = batch.wait(Duration::from_secs(5), Some(&cancel));
+        assert_eq!(kinds, vec![PathKind::Timeout]);
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     #[test]

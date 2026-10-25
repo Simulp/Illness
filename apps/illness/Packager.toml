@@ -34,9 +34,10 @@ before-packaging-command = "cargo build --release -p illness"
 # config key is `installMode` (alias: `installer-mode`).
 installMode = "perMachine"
 # Project copy of cargo-packager's NSIS template. A perMachine install registers
-# the Explorer verbs under HKLM\Software\Classes and removes them once at
-# uninstall; a portable/current-user copy falls back to HKCU. Keep it in sync
-# with the cargo-packager version pinned by build-installer.ps1.
+# the Explorer verbs under HKLM\Software\Classes and removes them plus legacy
+# HKCU/loaded-HKEY_USERS copies at install/uninstall; a portable/current-user
+# copy falls back to HKCU. Keep it in sync with the cargo-packager version
+# pinned by build-installer.ps1.
 template = "installer.nsi"
 installer-icon = "../../assets/illness.ico"
 compression = "lzma"
