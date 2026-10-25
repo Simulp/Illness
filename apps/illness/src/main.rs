@@ -128,9 +128,11 @@ enum Startup {
 /// Parse the command line, ignoring the executable path.
 ///
 /// Arguments are `OsString`s so non-Unicode paths survive. A positional
-/// argument is only used when it resolves to a directory; files and flags are
-/// ignored rather than reported as errors. The two registry flags are
-/// maintenance entry points for the installer and uninstaller.
+/// argument is used when it resolves to a directory or the probe times out: a
+/// cold SMB/VPN folder must survive instead of disappearing into the process
+/// directory. Files and flags are ignored rather than reported as errors. The
+/// two registry flags are maintenance entry points for the installer and
+/// uninstaller.
 fn parse_command_line(args: impl IntoIterator<Item = OsString>) -> Startup {
     let args: Vec<OsString> = args.into_iter().collect();
     if args
@@ -180,7 +182,22 @@ fn directory_argument(argument: &OsStr) -> Option<PathBuf> {
     {
         path = PathBuf::from(format!("{text}\\"));
     }
-    platform::path_is_dir_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT).then_some(path)
+    let kind = platform::path_kind_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT);
+    startup_folder_from_probe(path, kind)
+}
+
+/// Keep a folder when its probe times out; only a confirmed non-directory is
+/// discarded. The timeout entry is cached by the shared probe worker, so the
+/// first tab does not repeat the same slow check on the UI thread.
+fn startup_folder_from_probe(path: PathBuf, kind: platform::PathKind) -> Option<PathBuf> {
+    match kind {
+        platform::PathKind::Dir => Some(path),
+        platform::PathKind::NotDir => None,
+        platform::PathKind::Timeout => {
+            log::warn!("startup folder probe timed out; keeping {}", path.display());
+            Some(path)
+        }
+    }
 }
 
 /// A bare drive prefix such as `C:` with no root separator.
@@ -193,7 +210,8 @@ fn is_bare_drive(text: &str) -> bool {
 #[cfg(not(target_os = "windows"))]
 fn directory_argument(argument: &OsStr) -> Option<PathBuf> {
     let path = PathBuf::from(argument);
-    platform::path_is_dir_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT).then_some(path)
+    let kind = platform::path_kind_with_deadline(&path, STARTUP_PATH_PROBE_TIMEOUT);
+    startup_folder_from_probe(path, kind)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -248,7 +266,7 @@ fn run(startup_folder: Option<PathBuf>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Startup, directory_argument, parse_command_line};
+    use super::{Startup, directory_argument, parse_command_line, platform};
     use std::ffi::{OsStr, OsString};
     use std::path::PathBuf;
 
@@ -307,5 +325,23 @@ mod tests {
         // escapes the closing quote. It still names the drive root.
         let path = directory_argument(OsStr::new("C:\"")).expect("drive root exists");
         assert_eq!(path, PathBuf::from(r"C:\"));
+    }
+
+    #[test]
+    fn startup_probe_timeout_keeps_the_launch_folder() {
+        let path = PathBuf::from(r"C:\cold-share");
+        assert_eq!(
+            super::startup_folder_from_probe(path.clone(), platform::PathKind::Dir),
+            Some(path.clone())
+        );
+        assert_eq!(
+            super::startup_folder_from_probe(path.clone(), platform::PathKind::Timeout),
+            Some(path),
+            "a cold SMB/VPN folder must not become the process directory"
+        );
+        assert_eq!(
+            super::startup_folder_from_probe(PathBuf::from(r"C:\gone"), platform::PathKind::NotDir),
+            None
+        );
     }
 }

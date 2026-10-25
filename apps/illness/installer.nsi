@@ -1,6 +1,8 @@
 ; Based on cargo-packager 0.11.8's NSIS template (MIT OR Apache-2.0).
-; Local change: `un.RemoveExplorerVerbs` removes per-user Explorer verbs from
-; HKCU and every loaded HKEY_USERS hive before the install directory is deleted.
+; Local change: Explorer verbs follow the install scope. A perMachine install
+; writes HKLM\Software\Classes and removes those keys once at uninstall; a
+; portable/current-user copy falls back to HKCU. No HKEY_USERS enumeration:
+; loaded hives do not cover offline users and unchecked deletes were incomplete.
 ; Set the compression algorithm.
 !if "{{compression}}" == ""
   SetCompressor /SOLID lzma
@@ -378,6 +380,27 @@ FunctionEnd
   ${EndIf}
 !macroend
 
+; Explorer folder verbs. The command quotes both the executable and the
+; placeholder so an install path with spaces works and %V/%1 stays one
+; argument. The app runtime skips its HKCU fallback when HKLM is present.
+!macro RegisterExplorerVerb ROOT CLASS PLACEHOLDER
+  WriteRegStr ${ROOT} "Software\Classes\${CLASS}\shell\Illness" "MUIVerb" "Open with Illness"
+  WriteRegStr ${ROOT} "Software\Classes\${CLASS}\shell\Illness" "Icon" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\""
+  WriteRegStr ${ROOT} "Software\Classes\${CLASS}\shell\Illness" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" $\"${PLACEHOLDER}$\""
+!macroend
+
+!macro RegisterExplorerVerbs ROOT
+  !insertmacro RegisterExplorerVerb ${ROOT} "Directory\Background" "%V"
+  !insertmacro RegisterExplorerVerb ${ROOT} "Directory" "%1"
+  !insertmacro RegisterExplorerVerb ${ROOT} "Drive" "%1"
+!macroend
+
+!macro UnregisterExplorerVerbs ROOT
+  DeleteRegKey ${ROOT} "Software\Classes\Directory\Background\shell\Illness"
+  DeleteRegKey ${ROOT} "Software\Classes\Directory\shell\Illness"
+  DeleteRegKey ${ROOT} "Software\Classes\Drive\shell\Illness"
+!macroend
+
 Var PassiveMode
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
@@ -495,6 +518,19 @@ Section Install
     File /a "/oname={{this}}" "{{@key}}"
   {{/each}}
 
+  ; Explorer folder verbs. Per-machine keys are visible to every user and are
+  ; removed by the uninstaller; the per-user copy is only a portable fallback.
+  !if "${INSTALLMODE}" == "perMachine"
+    !insertmacro RegisterExplorerVerbs HKLM
+    ; Remove verbs written by an older portable build for this user so the
+    ; context menu does not show two identical entries after an upgrade.
+    !insertmacro UnregisterExplorerVerbs HKCU
+  !else if "${INSTALLMODE}" == "currentUser"
+    !insertmacro RegisterExplorerVerbs HKCU
+  !else
+    !insertmacro RegisterExplorerVerbs SHCTX
+  !endif
+
   ; Create file associations
   {{#each file_associations as |association| ~}}
     {{#each association.extensions as |ext| ~}}
@@ -578,25 +614,21 @@ Function un.onInit
   !insertmacro MUI_UNGETLANGUAGE
 FunctionEnd
 
-; Remove Illness's per-user Explorer verbs. Per-user keys live in every
-; logged-on user's HKCU, so a machine-wide uninstall cannot rely on the
-; application being launched again. Enumerate the loaded user hives (and HKCU
-; for the current/elevated user) before deleting the install directory.
+; Remove Illness's Explorer verbs once, before the install directory is
+; deleted. A perMachine install owns HKLM keys; HKCU is also cleaned for the
+; installing user's legacy/portable registration. Uninstalling does not need to
+; enumerate HKEY_USERS: HKLM keys are shared by every account and are deleted
+; here regardless of who is logged on.
 Function un.RemoveExplorerVerbs
-  DeleteRegKey HKCU "Software\Classes\Directory\Background\shell\Illness"
-  DeleteRegKey HKCU "Software\Classes\Directory\shell\Illness"
-  DeleteRegKey HKCU "Software\Classes\Drive\shell\Illness"
-
-  StrCpy $0 0
-  EnumUsers:
-    EnumRegKey $1 HKU "" $0
-    StrCmp $1 "" EnumUsersDone
-    IntOp $0 $0 + 1
-    DeleteRegKey HKU "$1\Software\Classes\Directory\Background\shell\Illness"
-    DeleteRegKey HKU "$1\Software\Classes\Directory\shell\Illness"
-    DeleteRegKey HKU "$1\Software\Classes\Drive\shell\Illness"
-    Goto EnumUsers
-  EnumUsersDone:
+  !if "${INSTALLMODE}" == "perMachine"
+    !insertmacro UnregisterExplorerVerbs HKLM
+    !insertmacro UnregisterExplorerVerbs HKCU
+  !else if "${INSTALLMODE}" == "currentUser"
+    !insertmacro UnregisterExplorerVerbs HKCU
+  !else
+    !insertmacro UnregisterExplorerVerbs SHCTX
+    !insertmacro UnregisterExplorerVerbs HKCU
+  !endif
 FunctionEnd
 
 Section Uninstall

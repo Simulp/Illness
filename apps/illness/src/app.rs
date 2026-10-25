@@ -55,12 +55,12 @@ const WARM_RECOVERY_CAP: u32 = 5;
 /// this floor so alt-tab spam cannot exhaust the warm retry cap.
 const BACKDROP_REVALIDATE_INTERVAL: Duration = Duration::from_secs(45);
 const FOCUS_REVALIDATE_FLOOR: Duration = Duration::from_secs(8);
-/// A shell that exits within this window (or before the user has interacted
-/// with it) is treated as a failed profile: the tab is kept with a recovery
-/// card instead of closing the window. Normal `exit` after use still closes.
-const FAST_EXIT_WINDOW: Duration = Duration::from_secs(2);
-/// Deadline for checking a stored/startup folder before spawning. A dead UNC
-/// share can otherwise block the UI for the SMB timeout.
+/// A shell that fails during this startup window is kept with a recovery card
+/// instead of closing the window. After the window an unattended normal exit is
+/// treated as expected; a deliberate `exit` after input closes immediately.
+const STARTUP_RECOVERY_WINDOW: Duration = Duration::from_secs(5);
+/// One deadline for all stored/startup/live folder probes before spawning. A
+/// dead UNC share can otherwise block the UI for the SMB timeout.
 const SPAWN_PATH_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Pending delayed config write. A pointer release flushes immediately so a
@@ -227,11 +227,15 @@ fn material_change_needs_rebuild(
 const FOCUS_IN: &[u8] = b"\x1b[I";
 const FOCUS_OUT: &[u8] = b"\x1b[O";
 
-/// One live terminal tab: the PTY session plus everything the UI remembers.
+/// One terminal tab: the PTY session plus everything the UI remembers.
+///
+/// `session` is optional while the shell is starting on a worker thread and
+/// after a spawn failure. A failed spawn stays as a real tab so Restart,
+/// Settings and Close remain available instead of leaving an empty window.
 struct Tab {
     /// Stable across reordering, closing other tabs, and Settings focus.
     id: u64,
-    session: Session,
+    session: Option<Session>,
     view: TerminalView,
     title: String,
     profile_name: String,
@@ -247,9 +251,35 @@ struct Tab {
     /// that exits before use is a failed profile, not a normal exit.
     spawned_at: Instant,
     user_acted: bool,
-    /// Set when an immediate/spontaneous exit is kept for recovery instead of
-    /// being removed by [`IllnessApp::remove_exited_tabs`].
+    /// Set when an immediate/spontaneous exit or a spawn failure is kept for
+    /// recovery instead of being removed by [`IllnessApp::remove_exited_tabs`].
     recovery: bool,
+    /// Child exit status, when ConPTY reported one.
+    exit_status: Option<i32>,
+    /// Spawn error shown by the recovery card, when there is one.
+    error: Option<String>,
+}
+
+impl Tab {
+    /// Placeholder tab shown while its shell starts on the spawn worker.
+    fn pending(id: u64, profile: &Profile, cwd: Option<PathBuf>) -> Self {
+        Self {
+            id,
+            session: None,
+            view: TerminalView::default(),
+            title: profile.name.clone(),
+            profile_name: profile.name.clone(),
+            program: profile.program.clone(),
+            cwd,
+            accent: profile.accent,
+            focus_reported: false,
+            spawned_at: Instant::now(),
+            user_acted: false,
+            recovery: false,
+            exit_status: None,
+            error: None,
+        }
+    }
 }
 
 /// A slot in the tab strip. Settings is a real tab but has no PTY session.
@@ -264,6 +294,44 @@ enum RecoveryAction {
     Restart,
     Settings,
     Close,
+}
+
+/// A session created on the spawn worker, with the cwd that actually worked.
+struct SpawnedSession {
+    session: Session,
+    cwd: Option<PathBuf>,
+}
+
+/// Result of one tab's detached spawn attempts.
+struct SpawnResult {
+    tab_id: u64,
+    outcome: Result<SpawnedSession, String>,
+}
+
+/// Apply a detached spawn result to its placeholder tab.
+///
+/// Failure is represented in the tab itself (no session, recovery card) so the
+/// window never becomes empty and Restart can retry from the same tab.
+fn apply_spawn_outcome(tab: &mut Tab, outcome: Result<SpawnedSession, String>) {
+    match outcome {
+        Ok(spawned) => {
+            tab.session = Some(spawned.session);
+            tab.cwd = spawned.cwd;
+            // Interaction with the placeholder is not shell use. Reset both
+            // fields so a shell that dies immediately still gets the card.
+            tab.spawned_at = Instant::now();
+            tab.user_acted = false;
+            tab.recovery = false;
+            tab.exit_status = None;
+            tab.error = None;
+        }
+        Err(error) => {
+            log::warn!("{} failed to start: {error}", tab.profile_name);
+            tab.session = None;
+            tab.recovery = true;
+            tab.error = Some(error);
+        }
+    }
 }
 
 /// Result of a detached [`backdrop::warm_cache`] request.
@@ -343,6 +411,10 @@ pub struct IllnessApp {
     /// Cancellation handle for the current warm. Superseded requests exit
     /// before opening or decoding a file.
     backdrop_warm_token: backdrop::WarmToken,
+    /// Detached shell starts. Spawning can block on a dead UNC cwd, so it must
+    /// not run on the UI thread.
+    spawn_tx: Sender<SpawnResult>,
+    spawn_rx: Receiver<SpawnResult>,
     /// Consecutive backdrop warm failures and the next automatic retry. The
     /// retry stops after [`WARM_RETRY_CAP`] so a deleted/dead source cannot
     /// loop forever.
@@ -439,6 +511,7 @@ impl IllnessApp {
         }
 
         let (backdrop_warm_tx, backdrop_warm_rx) = mpsc::channel();
+        let (spawn_tx, spawn_rx) = mpsc::channel();
         let mut app = Self {
             ctx,
             window: Arc::clone(&window),
@@ -470,6 +543,8 @@ impl IllnessApp {
             backdrop_warming: None,
             backdrop_warm_seq: 0,
             backdrop_warm_token: backdrop::WarmToken::new(),
+            spawn_tx,
+            spawn_rx,
             backdrop_warm_failures: 0,
             backdrop_warm_retry_at: None,
             backdrop_revalidate_at: None,
@@ -496,71 +571,55 @@ impl IllnessApp {
 
     /// Spawn a tab for `profile` (or the configured default) and make it active.
     ///
-    /// The new shell starts in the active terminal's current directory. If
-    /// Settings is focused, the most recently active terminal is used; a
-    /// missing or unreadable shell falls back to its stored cwd and then to
-    /// the command-line folder.
+    /// The tab is inserted immediately and its session starts on a worker:
+    /// `Session::spawn` can block for the SMB timeout on a dead UNC cwd and
+    /// must never stall the UI. If every spawn attempt fails, the tab is kept
+    /// with the Restart/Settings/Close card.
     pub fn open_tab(&mut self, profile: Option<&str>) {
         let profile = self.profile_for(profile);
-        let cwd = self.resolve_new_tab_cwd();
-        log::debug!("opening {} tab in {:?}", profile.name, cwd);
-        match self.build_tab_for(&profile, cwd) {
-            Ok(tab) => {
-                let id = tab.id;
-                let index = self.settings_index().unwrap_or(self.tabs.len());
-                self.tabs.insert(index, TabEntry::Terminal(Box::new(tab)));
-                self.active = index;
-                self.last_terminal_id = Some(id);
-            }
-            Err(error) => {
-                self.overlays.set_toast(error);
-            }
-        }
+        let dirs = self.resolve_new_tab_cwd();
+        log::debug!("opening {} tab in {:?}", profile.name, dirs);
+        let tab = self.start_tab(&profile, dirs);
+        let id = tab.id;
+        let index = self.settings_index().unwrap_or(self.tabs.len());
+        self.tabs.insert(index, TabEntry::Terminal(Box::new(tab)));
+        self.active = index;
+        self.last_terminal_id = Some(id);
     }
 
-    /// Resolve the spawn cwd for a new tab at the moment it is requested.
+    /// Resolve the spawn cwd plan for a new tab at the moment it is requested.
     ///
-    /// A successful PEB read updates the active tab's stored cwd, so a later
-    /// spawn still has a recent value. WSL, elevated shells and dead
-    /// processes cannot be read and use the stored/startup path.
-    fn resolve_new_tab_cwd(&mut self) -> Option<PathBuf> {
+    /// The live PEB path is validated off-thread because a shell may have
+    /// `cd`ed to a deleted directory or an offline UNC share. A dead live path
+    /// falls through; a cold *launch* folder is kept on timeout so Explorer's
+    /// folder is not silently replaced by the process directory. WSL, elevated
+    /// shells and dead processes cannot be read and use stored/startup paths.
+    fn resolve_new_tab_cwd(&mut self) -> Vec<PathBuf> {
+        let process = std::env::current_dir().ok();
         if !self.config.inherit_cwd {
-            return select_new_tab_cwd(
-                false,
-                None,
-                None,
-                self.startup_folder.clone(),
-                std::env::current_dir().ok(),
-            );
+            return plan_spawn_cwds(None, None, self.startup_folder.clone(), process);
         }
 
         let terminal_id = match self.tabs.get(self.active) {
             Some(TabEntry::Terminal(tab)) => Some(tab.id),
             _ => self.last_terminal_id,
         };
-        let live = terminal_id
+        let (live, stored) = terminal_id
             .and_then(|id| self.tab_index_by_id(id))
-            .and_then(|index| match self.tabs.get_mut(index) {
-                Some(TabEntry::Terminal(tab)) => {
-                    // Trust the PEB path from a live shell. It was already
-                    // validated when the shell was spawned, and probing every
-                    // read would reintroduce the UNC stall this path removed.
-                    let live = tab_live_cwd(tab);
-                    if let Some(cwd) = &live {
-                        tab.cwd = Some(cwd.clone());
-                    }
-                    Some((live, tab.cwd.clone()))
-                }
+            .and_then(|index| match self.tabs.get(index) {
+                Some(TabEntry::Terminal(tab)) => Some((tab_live_cwd(tab), tab.cwd.clone())),
                 _ => None,
-            });
-        let (live, stored) = live.unwrap_or((None, None));
-        select_new_tab_cwd(
-            true,
-            live,
-            stored,
-            self.startup_folder.clone(),
-            std::env::current_dir().ok(),
-        )
+            })
+            .unwrap_or((None, None));
+        let plan = plan_spawn_cwds(live.clone(), stored, self.startup_folder.clone(), process);
+        if let Some(live) = live
+            && plan.first() == Some(&live)
+            && let Some(index) = terminal_id.and_then(|id| self.tab_index_by_id(id))
+            && let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index)
+        {
+            tab.cwd = Some(live);
+        }
+        plan
     }
 
     fn tab_index_by_id(&self, id: u64) -> Option<usize> {
@@ -618,37 +677,84 @@ impl IllnessApp {
         matches!(self.tabs.get(self.active), Some(TabEntry::Terminal(_))).then_some(self.active)
     }
 
-    fn build_tab_for(&mut self, profile: &Profile, cwd: Option<PathBuf>) -> Result<Tab, String> {
+    /// Insert a placeholder tab and start its shell(s) on a worker.
+    fn start_tab(&mut self, profile: &Profile, dirs: Vec<PathBuf>) -> Tab {
+        let id = self.next_terminal_id;
+        self.next_terminal_id = self.next_terminal_id.saturating_add(1);
+        let specs = spawn_specs(profile, &self.config, &dirs);
+        let cwd = specs.first().and_then(|spec| spec.cwd.clone());
+        let tab = Tab::pending(id, profile, cwd);
+        self.launch_spawn(id, profile.name.clone(), specs);
+        tab
+    }
+
+    /// Try each cwd candidate in order on a worker thread.
+    fn launch_spawn(&self, tab_id: u64, profile_name: String, specs: Vec<SpawnSpec>) {
         let metrics = self.atlas.metrics();
         let cell_px = (cell_pixel(metrics.width_px), cell_pixel(metrics.height_px));
         let ctx = self.ctx.clone();
-        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new(move || ctx.request_repaint());
-        let cwd = cwd.or_else(|| std::env::current_dir().ok());
+        let waker: Arc<dyn Fn() + Send + Sync> = Arc::new({
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        });
+        let done = Arc::clone(&waker);
+        let sender = self.spawn_tx.clone();
+        let thread_error =
+            format!("Could not start {profile_name}: could not create the spawn worker");
+        let worker_error = thread_error.clone();
+        let spawned = std::thread::Builder::new()
+            .name("illness-shell-spawn".to_string())
+            .spawn(move || {
+                let mut last_error = worker_error;
+                for spec in specs {
+                    let cwd = spec.cwd.clone();
+                    match Session::spawn(
+                        spec,
+                        GridSize::new(INITIAL_COLS, INITIAL_ROWS),
+                        cell_px,
+                        Arc::clone(&waker),
+                    ) {
+                        Ok(session) => {
+                            let _ = sender.send(SpawnResult {
+                                tab_id,
+                                outcome: Ok(SpawnedSession { session, cwd }),
+                            });
+                            done();
+                            return;
+                        }
+                        Err(error) => {
+                            last_error = format!("Could not start {profile_name}: {error}");
+                        }
+                    }
+                }
+                let _ = sender.send(SpawnResult {
+                    tab_id,
+                    outcome: Err(last_error),
+                });
+                done();
+            });
+        if spawned.is_err() {
+            let _ = self.spawn_tx.send(SpawnResult {
+                tab_id,
+                outcome: Err(thread_error),
+            });
+            self.ctx.request_repaint();
+        }
+    }
 
-        let session = Session::spawn(
-            spawn_spec(profile, &self.config, cwd.as_deref()),
-            GridSize::new(INITIAL_COLS, INITIAL_ROWS),
-            cell_px,
-            waker,
-        )
-        .map_err(|error| format!("Could not start {}: {error}", profile.name))?;
-
-        let id = self.next_terminal_id;
-        self.next_terminal_id = self.next_terminal_id.saturating_add(1);
-        Ok(Tab {
-            id,
-            session,
-            view: TerminalView::default(),
-            title: profile.name.clone(),
-            profile_name: profile.name.clone(),
-            program: profile.program.clone(),
-            cwd,
-            accent: profile.accent,
-            focus_reported: false,
-            spawned_at: Instant::now(),
-            user_acted: false,
-            recovery: false,
-        })
+    /// Drain completed detached spawns and fill or mark their tabs.
+    fn apply_spawn_results(&mut self) {
+        while let Ok(result) = self.spawn_rx.try_recv() {
+            let Some(index) = self.tab_index_by_id(result.tab_id) else {
+                // The tab was closed while its shell was starting; dropping the
+                // session shuts the process down.
+                continue;
+            };
+            let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(index) else {
+                continue;
+            };
+            apply_spawn_outcome(tab, result.outcome);
+        }
     }
 
     fn profile_for(&self, requested: Option<&str>) -> Profile {
@@ -1822,7 +1928,9 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
-            tab.session.shutdown();
+            if let Some(session) = &tab.session {
+                session.shutdown();
+            }
         }
 
         // If the window closes while a name field is focused and empty, restore
@@ -1916,17 +2024,22 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
-            if !tab.session.is_exited() || tab.recovery {
+            let Some(session) = &tab.session else {
+                // A pending or failed spawn has no process to remove.
+                continue;
+            };
+            if !session.is_exited() || tab.recovery {
                 continue;
             }
             let elapsed = now.saturating_duration_since(tab.spawned_at);
-            if needs_recovery(elapsed, tab.user_acted) {
+            if needs_recovery(elapsed, tab.user_acted, tab.exit_status) {
                 tab.recovery = true;
                 log::warn!(
-                    "keeping exited {} tab for recovery (spawned {:?} ago, user acted: {})",
+                    "keeping exited {} tab for recovery (spawned {:?} ago, user acted: {}, exit: {:?})",
                     tab.profile_name,
                     elapsed,
-                    tab.user_acted
+                    tab.user_acted,
+                    tab.exit_status
                 );
             } else {
                 exited.push(index);
@@ -1939,6 +2052,10 @@ impl IllnessApp {
     }
 
     /// Restart a failed tab in place, preserving its profile and last cwd.
+    ///
+    /// The replacement is inserted immediately as a pending tab; a second
+    /// failed spawn keeps the recovery card instead of leaving a toast-only
+    /// dead end.
     fn restart_tab(&mut self, index: usize) {
         let Some(TabEntry::Terminal(tab)) = self.tabs.get(index) else {
             return;
@@ -1946,15 +2063,17 @@ impl IllnessApp {
         let profile_name = tab.profile_name.clone();
         let cwd = tab.cwd.clone();
         let profile = self.profile_for(Some(&profile_name));
-        match self.build_tab_for(&profile, cwd) {
-            Ok(tab) => {
-                let id = tab.id;
-                self.tabs[index] = TabEntry::Terminal(Box::new(tab));
-                self.active = index;
-                self.last_terminal_id = Some(id);
-            }
-            Err(error) => self.overlays.set_toast(error),
-        }
+        let dirs = plan_spawn_cwds(
+            None,
+            cwd,
+            self.startup_folder.clone(),
+            std::env::current_dir().ok(),
+        );
+        let tab = self.start_tab(&profile, dirs);
+        let id = tab.id;
+        self.tabs[index] = TabEntry::Terminal(Box::new(tab));
+        self.active = index;
+        self.last_terminal_id = Some(id);
     }
 
     /// Mark the active terminal as used when the user presses a key or clicks.
@@ -1995,7 +2114,11 @@ impl IllnessApp {
     }
 
     fn selection_text(&self) -> Option<String> {
-        let text = self.active_terminal()?.session.selection_to_string()?;
+        let text = self
+            .active_terminal()?
+            .session
+            .as_ref()?
+            .selection_to_string()?;
         let text = trim_copy(&text);
         (!text.is_empty()).then_some(text)
     }
@@ -2013,9 +2136,11 @@ impl IllnessApp {
             return;
         }
 
-        if let Some(tab) = self.active_terminal() {
-            let bracketed = tab.session.snapshot().modes.bracketed_paste;
-            tab.session.write(&format_paste(&text, bracketed));
+        if let Some(tab) = self.active_terminal()
+            && let Some(session) = &tab.session
+        {
+            let bracketed = session.snapshot().modes.bracketed_paste;
+            session.write(&format_paste(&text, bracketed));
         }
     }
 
@@ -2027,23 +2152,25 @@ impl IllnessApp {
     }
 
     fn select_all(&mut self) {
-        if let Some(tab) = self.active_terminal() {
-            let snapshot = tab.session.snapshot();
+        if let Some(tab) = self.active_terminal()
+            && let Some(session) = &tab.session
+        {
+            let snapshot = session.snapshot();
             if snapshot.cols > 0 && snapshot.rows > 0 {
-                tab.session
-                    .selection_start(SelectionType::Simple, 0, 0, Side::Left);
-                tab.session
-                    .selection_update(snapshot.cols - 1, snapshot.rows - 1, Side::Right);
+                session.selection_start(SelectionType::Simple, 0, 0, Side::Left);
+                session.selection_update(snapshot.cols - 1, snapshot.rows - 1, Side::Right);
             }
         }
     }
 
     fn clear_view(&mut self) {
-        if let Some(tab) = self.active_terminal_mut() {
-            tab.session.selection_clear();
-            let offset = i32::try_from(tab.session.snapshot().display_offset).unwrap_or(i32::MAX);
+        if let Some(tab) = self.active_terminal_mut()
+            && let Some(session) = &tab.session
+        {
+            session.selection_clear();
+            let offset = i32::try_from(session.snapshot().display_offset).unwrap_or(i32::MAX);
             if offset > 0 {
-                tab.session.scroll(-offset);
+                session.scroll(-offset);
             }
             tab.view.scroll_target = 0;
         }
@@ -2064,7 +2191,11 @@ impl IllnessApp {
             self.overlays.search_index = Some((0, 0));
             return;
         };
-        let snapshot = tab.session.snapshot();
+        let Some(session) = tab.session.as_ref() else {
+            self.overlays.search_index = Some((0, 0));
+            return;
+        };
+        let snapshot = session.snapshot();
         let count = count_visible_matches(&snapshot, &query, request.case_sensitive);
         let repeated = self
             .last_search
@@ -2088,7 +2219,7 @@ impl IllnessApp {
         self.overlays.search_index = Some((current, count));
         self.last_search = Some((query.clone(), request.case_sensitive));
 
-        let found = tab.session.search(&query, request.forward);
+        let found = session.search(&query, request.forward);
         if found.is_none() {
             self.overlays
                 .set_toast(format!("No matches for \"{query}\""));
@@ -2096,8 +2227,8 @@ impl IllnessApp {
         if let Some((start_row, _, _, _)) = found
             && let Some(delta) = search_scroll_delta(start_row, snapshot.rows)
         {
-            tab.session.scroll(delta);
-            let after = tab.session.snapshot();
+            session.scroll(delta);
+            let after = session.snapshot();
             tab.view.scroll_target = i32::try_from(after.display_offset).unwrap_or(i32::MAX);
             let total = count_visible_matches(&after, &query, request.case_sensitive);
             let current = if total == 0 {
@@ -2138,7 +2269,11 @@ impl IllnessApp {
             self.overlays.search_index = Some((0, 0));
             return;
         };
-        let count = count_visible_matches(&tab.session.snapshot(), &query, case_sensitive);
+        let Some(session) = tab.session.as_ref() else {
+            self.overlays.search_index = Some((0, 0));
+            return;
+        };
+        let count = count_visible_matches(&session.snapshot(), &query, case_sensitive);
         let same_query =
             tab.view.search.as_ref().is_some_and(|search| {
                 search.query == query && search.case_sensitive == case_sensitive
@@ -2252,7 +2387,10 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
-            while let Ok(event) = tab.session.events().try_recv() {
+            let Some(session) = tab.session.as_mut() else {
+                continue;
+            };
+            while let Ok(event) = session.events().try_recv() {
                 match event {
                     SessionEvent::Title(title) => {
                         tab.title = display_title(&title, &tab.profile_name);
@@ -2260,18 +2398,19 @@ impl IllnessApp {
                     SessionEvent::ResetTitle => tab.title = tab.profile_name.clone(),
                     SessionEvent::Bell => bell = true,
                     SessionEvent::ClipboardStore(text) => ctx.copy_text(text),
-                    SessionEvent::PtyWrite(bytes) => tab.session.write(&bytes),
+                    SessionEvent::PtyWrite(bytes) => session.write(&bytes),
                     SessionEvent::ColorRequest(index) => {
-                        tab.session.write(color_response(index, theme).as_bytes());
+                        session.write(color_response(index, theme).as_bytes());
                     }
                     SessionEvent::TextAreaSizeRequest => {
-                        let snapshot = tab.session.snapshot();
+                        let snapshot = session.snapshot();
                         let reply = format!("\x1b[8;{};{}t", snapshot.rows, snapshot.cols);
-                        tab.session.write(reply.as_bytes());
+                        session.write(reply.as_bytes());
                     }
                     // `is_exited` is set before the event is sent; the tab is
-                    // removed in `sync_tabs`, so the code is not needed.
-                    SessionEvent::ChildExit(_) | SessionEvent::Exit => {}
+                    // handled in `sync_tabs`, so only the status is recorded.
+                    SessionEvent::ChildExit(status) => tab.exit_status = Some(status),
+                    SessionEvent::Exit => {}
                     SessionEvent::CursorBlinkingChange
                     | SessionEvent::MouseCursorDirty
                     | SessionEvent::Wakeup => {}
@@ -2289,7 +2428,7 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
-            if let Some(title) = tab.session.title() {
+            if let Some(title) = tab.session.as_ref().and_then(Session::title) {
                 tab.title = display_title(&title, &tab.profile_name);
             }
         }
@@ -2305,14 +2444,17 @@ impl IllnessApp {
             let TabEntry::Terminal(tab) = entry else {
                 continue;
             };
+            let Some(session) = tab.session.as_ref() else {
+                tab.focus_reported = false;
+                continue;
+            };
             let desired = window_focused && Some(index) == active;
-            if !tab.session.focus_reporting() {
+            if !session.focus_reporting() {
                 tab.focus_reported = false;
                 continue;
             }
             if tab.focus_reported != desired {
-                tab.session
-                    .write(if desired { FOCUS_IN } else { FOCUS_OUT });
+                session.write(if desired { FOCUS_IN } else { FOCUS_OUT });
                 tab.focus_reported = desired;
             }
         }
@@ -2468,6 +2610,7 @@ impl IllnessApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         self.note_user_activity(&ctx);
+        self.apply_spawn_results();
         // Apply a requested material change before building any shape. The
         // platform call, design tokens, backdrop drop/upload and clear colour
         // then describe one material for the whole pass.
@@ -2612,35 +2755,50 @@ impl IllnessApp {
                     return;
                 };
 
-                let response = tab.view.show(
-                    ui,
-                    &tab.session,
-                    theme,
-                    config,
-                    tokens,
-                    atlas,
-                    gpu_text,
-                    surface_material,
-                );
-                terminal_rect = Some(response.response.rect);
-                terminal_actions = response.actions;
-                if tab.recovery {
-                    recovery_action =
-                        show_recovery_card(ui.ctx(), tokens, tab.id, &tab.profile_name, &tab.title)
-                            .map(|action| (tab.id, action));
-                }
-                if response.response.secondary_clicked()
-                    && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
-                {
-                    context_menu_pos = response.response.interact_pointer_pos();
-                }
+                if let Some(session) = &tab.session {
+                    let response = tab.view.show(
+                        ui,
+                        session,
+                        theme,
+                        config,
+                        tokens,
+                        atlas,
+                        gpu_text,
+                        surface_material,
+                    );
+                    terminal_rect = Some(response.response.rect);
+                    terminal_actions = response.actions;
+                    if response.response.secondary_clicked()
+                        && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
+                    {
+                        context_menu_pos = response.response.interact_pointer_pos();
+                    }
 
-                if !overlay_open
-                    && !shortcut_used
-                    && !tab.session.is_exited()
-                    && let Some(bytes) = tab.view.take_input(ui)
-                {
-                    tab.session.write(&bytes);
+                    if !overlay_open
+                        && !shortcut_used
+                        && !session.is_exited()
+                        && let Some(bytes) = tab.view.take_input(ui)
+                    {
+                        session.write(&bytes);
+                    }
+                } else {
+                    // Pending spawns and failed spawns have no grid yet. Keep
+                    // the themed surface instead of the host clear colour.
+                    let rect = ui.available_rect_before_wrap();
+                    ui.painter().rect_filled(rect, 0.0, tokens.bg);
+                    terminal_rect = Some(rect);
+                }
+                if tab.recovery {
+                    recovery_action = show_recovery_card(
+                        ui.ctx(),
+                        tokens,
+                        tab.id,
+                        &tab.profile_name,
+                        &tab.title,
+                        tab.error.as_deref(),
+                        tab.exit_status,
+                    )
+                    .map(|action| (tab.id, action));
                 }
             });
         }
@@ -2883,44 +3041,128 @@ fn spawn_spec(profile: &Profile, config: &Config, cwd: Option<&Path>) -> SpawnSp
     }
 }
 
-/// Choose a new tab's cwd from the live shell, its stored value, the
-/// command-line folder, or the process directory, in that order.
-///
-/// A path that no longer exists is skipped rather than handed to ConPTY,
-/// which would make the new tab fail instead of falling back.
-fn select_spawn_cwd(
+/// One cwd candidate and whether an unverifiable (timed-out) value should be
+/// kept. Only the explicit command-line launch folder is kept on timeout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpawnCandidate {
+    path: PathBuf,
+    startup: bool,
+    process: bool,
+    /// Came from the live shell, stored tab cwd, or launch folder rather than
+    /// being only the process fallback.
+    explicit: bool,
+}
+
+/// Collect live/stored/startup/process candidates once, in priority order.
+/// Duplicates are collapsed and keep every role the path played.
+fn spawn_candidates(
     live: Option<PathBuf>,
     stored: Option<PathBuf>,
     startup: Option<PathBuf>,
     process: Option<PathBuf>,
-) -> Option<PathBuf> {
-    // A live shell's PEB path is trusted: checking it here duplicated the
-    // caller's check and could stall on a UNC working directory. Stored and
-    // launch folders are probed off-thread with a short deadline so an offline
-    // share falls through instead of freezing New Tab/startup.
-    live.or_else(|| stored.and_then(probe_spawn_dir))
-        .or_else(|| startup.and_then(probe_spawn_dir))
-        .or(process)
-}
-
-fn probe_spawn_dir(path: PathBuf) -> Option<PathBuf> {
-    platform::path_is_dir_with_deadline(&path, SPAWN_PATH_PROBE_TIMEOUT).then_some(path)
-}
-
-/// Respect the Settings opt-out: disabled inheritance ignores the active
-/// terminal entirely and uses only the launch folder, then the process cwd.
-fn select_new_tab_cwd(
-    inherit: bool,
-    live: Option<PathBuf>,
-    stored: Option<PathBuf>,
-    startup: Option<PathBuf>,
-    process: Option<PathBuf>,
-) -> Option<PathBuf> {
-    if inherit {
-        select_spawn_cwd(live, stored, startup, process)
-    } else {
-        select_spawn_cwd(None, None, startup, process)
+) -> Vec<SpawnCandidate> {
+    let mut candidates: Vec<SpawnCandidate> = Vec::new();
+    for (path, is_startup, is_process, explicit) in [
+        (live, false, false, true),
+        (stored, false, false, true),
+        (startup, true, false, true),
+        (process, false, true, false),
+    ] {
+        let Some(path) = path else {
+            continue;
+        };
+        if let Some(existing) = candidates
+            .iter_mut()
+            .find(|candidate| candidate.path == path)
+        {
+            existing.startup |= is_startup;
+            existing.process |= is_process;
+            existing.explicit |= explicit;
+        } else {
+            candidates.push(SpawnCandidate {
+                path,
+                startup: is_startup,
+                process: is_process,
+                explicit,
+            });
+        }
     }
+    candidates
+}
+
+/// Pick the ordered spawn attempts from probe results.
+///
+/// Any verified directory wins over the unverified process directory. A
+/// timed-out *launch* folder is kept ahead of the process fallback, so a cold
+/// SMB/VPN folder still opens where Explorer asked. A timed-out live or stored
+/// path is dropped: a dead UNC shell cwd must not stall CreateProcess.
+fn plan_from_probes(candidates: &[SpawnCandidate], kinds: &[platform::PathKind]) -> Vec<PathBuf> {
+    let mut plan: Vec<PathBuf> = Vec::new();
+
+    // Verified non-process directories, including the launch folder.
+    for (candidate, kind) in candidates.iter().zip(kinds) {
+        let process_only = candidate.process && !candidate.explicit;
+        if !process_only && *kind == platform::PathKind::Dir {
+            push_unique_path(&mut plan, &candidate.path);
+        }
+    }
+    // A cold launch folder is more specific than the process fallback.
+    if plan.is_empty() {
+        for (candidate, kind) in candidates.iter().zip(kinds) {
+            if candidate.startup && *kind == platform::PathKind::Timeout {
+                push_unique_path(&mut plan, &candidate.path);
+            }
+        }
+    }
+    // The process directory is the final verified fallback.
+    for (candidate, kind) in candidates.iter().zip(kinds) {
+        if candidate.process && *kind == platform::PathKind::Dir {
+            push_unique_path(&mut plan, &candidate.path);
+        }
+    }
+    plan
+}
+
+fn push_unique_path(plan: &mut Vec<PathBuf>, path: &Path) {
+    if !plan.iter().any(|known| known == path) {
+        plan.push(path.to_path_buf());
+    }
+}
+
+/// Probe every candidate once, off-thread, and return the ordered spawn plan.
+fn plan_spawn_cwds(
+    live: Option<PathBuf>,
+    stored: Option<PathBuf>,
+    startup: Option<PathBuf>,
+    process: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let candidates = spawn_candidates(live, stored, startup, process);
+    let paths: Vec<PathBuf> = candidates
+        .iter()
+        .map(|candidate| candidate.path.clone())
+        .collect();
+    let kinds = platform::probe_paths(&paths, SPAWN_PATH_PROBE_TIMEOUT);
+    plan_from_probes(&candidates, &kinds)
+}
+
+/// The full attempt list for one tab: the probed plan plus a final
+/// process-directory attempt (`cwd = None`), deduplicated.
+fn spawn_specs(profile: &Profile, config: &Config, dirs: &[PathBuf]) -> Vec<SpawnSpec> {
+    let mut specs = Vec::new();
+    let mut seen = Vec::new();
+    for cwd in dirs
+        .iter()
+        .map(|path| Some(path.as_path()))
+        .chain(std::iter::once(None))
+    {
+        let spec = spawn_spec(profile, config, cwd);
+        if seen.contains(&spec.cwd) {
+            continue;
+        }
+        seen.push(spec.cwd.clone());
+        specs.push(spec);
+    }
+    specs
 }
 
 /// WSL's Windows-side process cwd is not the Linux shell's cwd, so a live
@@ -2932,10 +3174,11 @@ fn is_wsl_program(program: &str) -> bool {
 }
 
 fn tab_live_cwd(tab: &Tab) -> Option<PathBuf> {
-    if tab.session.is_exited() || is_wsl_program(&tab.program) {
+    let session = tab.session.as_ref()?;
+    if session.is_exited() || is_wsl_program(&tab.program) {
         return None;
     }
-    platform::process_cwd(tab.session.child_pid()?)
+    platform::process_cwd(session.child_pid()?)
 }
 
 /// Keep profiles saved in `config.toml` and append detected built-ins whose
@@ -3170,31 +3413,72 @@ fn removal_closes_window(remaining: usize) -> bool {
     remaining == 0
 }
 
-/// Centered recovery card for a shell that failed before it could be used.
-/// Returns the clicked action; the tab stays open until Close is chosen.
+/// Opaque, themed frame shared by the recovery card and tests.
+fn recovery_frame(tokens: &Tokens) -> egui::Frame {
+    egui::Frame::new()
+        .fill(tokens.bg_elev)
+        .stroke(Stroke::new(1.0, tokens.border))
+        .corner_radius(tokens.radius_md)
+        .inner_margin(egui::Margin::symmetric(18, 14))
+}
+
+/// Centered recovery card for a shell that failed to start or exited during
+/// startup. Returns the clicked action; the tab stays open until Close.
 fn show_recovery_card(
     ctx: &egui::Context,
     tokens: &Tokens,
     tab_id: u64,
     profile: &str,
     title: &str,
+    error: Option<&str>,
+    exit_status: Option<i32>,
 ) -> Option<RecoveryAction> {
     let mut action = None;
-    egui::Window::new("Shell ended")
+    let failed_to_start = error.is_some();
+    let window_title = if failed_to_start {
+        "Shell failed to start"
+    } else {
+        "Shell ended"
+    };
+    egui::Window::new(window_title)
         .id(Id::unique(("illness-recovery", tab_id)))
         .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
         .collapsible(false)
         .resizable(false)
+        .frame(recovery_frame(tokens))
         .show(ctx, |ui| {
             ui.set_max_width(380.0);
+            let heading = if failed_to_start {
+                format!("{profile} could not start.")
+            } else {
+                format!("{profile} exited during startup.")
+            };
             ui.label(
-                egui::RichText::new(format!("{profile} exited immediately."))
+                egui::RichText::new(heading)
                     .size(tokens.font_body)
                     .color(tokens.text),
             );
             if !title.trim().is_empty() && !title.eq_ignore_ascii_case(profile) {
                 ui.label(
                     egui::RichText::new(title)
+                        .size(tokens.font_small)
+                        .color(tokens.text_dim),
+                );
+            }
+            ui.add_space(tokens.gap_sm);
+            if let Some(error) = error {
+                ui.label(
+                    egui::RichText::new(error)
+                        .size(tokens.font_small)
+                        .color(tokens.text_dim),
+                );
+            } else {
+                let reason = match exit_status {
+                    Some(code) if code != 0 => format!("Exit code {code}."),
+                    _ => "The shell closed before it could be used.".to_string(),
+                };
+                ui.label(
+                    egui::RichText::new(reason)
                         .size(tokens.font_small)
                         .color(tokens.text_dim),
                 );
@@ -3224,11 +3508,18 @@ fn show_recovery_card(
 }
 
 /// Whether an exited shell should be kept with a recovery card instead of
-/// being removed. A spontaneous exit (no user interaction) is always treated
-/// as a failed profile; an exit in the first couple of seconds is also kept so
-/// a shell that fails on the first frame cannot close the window.
-fn needs_recovery(elapsed: Duration, user_acted: bool) -> bool {
-    !user_acted || elapsed < FAST_EXIT_WINDOW
+/// being removed.
+///
+/// Recovery is limited to the startup window: an unattended shell that exits
+/// ten minutes later is normal, not a broken profile. Inside the window a
+/// shell the user never touched (or one that failed with a non-zero status) is
+/// kept. A deliberate `exit` after input closes the tab even if it is quick;
+/// spawn failures are represented separately by the tab itself.
+fn needs_recovery(elapsed: Duration, user_acted: bool, exit_status: Option<i32>) -> bool {
+    if elapsed > STARTUP_RECOVERY_WINDOW {
+        return false;
+    }
+    !user_acted || exit_status.is_some_and(|code| code != 0)
 }
 
 /// New active strip index after removing `closing` from `remaining` entries.
@@ -4372,101 +4663,153 @@ mod tests {
         assert_eq!(spec.cwd, std::env::current_dir().ok());
     }
 
-    fn test_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!("illness-cwd-{}-{name}", std::process::id()));
-        std::fs::create_dir_all(&path).expect("create test directory");
-        path
+    #[test]
+    fn spawn_attempts_try_each_cwd_then_the_process_directory_once() {
+        let profile = profile("PowerShell");
+        let config = Config::default();
+        let first = PathBuf::from(r"C:\first");
+        let second = PathBuf::from(r"C:\second");
+
+        let specs = spawn_specs(&profile, &config, &[first.clone(), second.clone()]);
+        assert_eq!(specs.len(), 3);
+        assert_eq!(specs[0].cwd.as_ref(), Some(&first));
+        assert_eq!(specs[1].cwd.as_ref(), Some(&second));
+        assert_eq!(specs[2].cwd, std::env::current_dir().ok());
+
+        let process = std::env::current_dir().expect("test process cwd");
+        let specs = spawn_specs(&profile, &config, std::slice::from_ref(&process));
+        assert_eq!(
+            specs.len(),
+            1,
+            "the final process fallback must not repeat a candidate"
+        );
+        assert_eq!(specs[0].cwd.as_ref(), Some(&process));
     }
 
     #[test]
     fn live_shell_cwd_wins_for_a_new_tab() {
-        let live = test_dir("live");
-        let stored = test_dir("stored");
-        let startup = test_dir("startup");
-        let process = test_dir("process");
-
-        let selected = select_spawn_cwd(
+        let live = PathBuf::from(r"C:\live");
+        let stored = PathBuf::from(r"C:\stored");
+        let startup = PathBuf::from(r"C:\startup");
+        let process = PathBuf::from(r"C:\process");
+        let candidates = spawn_candidates(
             Some(live.clone()),
             Some(stored.clone()),
             Some(startup.clone()),
             Some(process.clone()),
         );
+        let kinds = [
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+        ];
 
-        assert_eq!(selected, Some(live));
-        for path in [stored, startup, process] {
-            let _ = std::fs::remove_dir(path);
-        }
+        assert_eq!(
+            plan_from_probes(&candidates, &kinds),
+            vec![live, stored, startup, process],
+            "verified cwds keep priority order; process is the final fallback"
+        );
     }
 
     #[test]
-    fn live_shell_path_is_trusted_and_missing_stored_dirs_fall_back() {
-        let missing = std::env::temp_dir().join("illness-cwd-missing");
-        let startup = test_dir("startup-fallback");
-        let process = test_dir("process-fallback");
+    fn deleted_live_cwd_falls_back_instead_of_failing_create_process() {
+        let live = PathBuf::from(r"C:\deleted");
+        let stored = PathBuf::from(r"C:\stored");
+        let startup = PathBuf::from(r"C:\startup");
+        let process = PathBuf::from(r"C:\process");
+        let candidates = spawn_candidates(
+            Some(live),
+            Some(stored.clone()),
+            Some(startup.clone()),
+            Some(process.clone()),
+        );
+        let kinds = [
+            platform::PathKind::NotDir,
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+        ];
 
-        // The PEB path comes from a live shell and is not probed again.
         assert_eq!(
-            select_spawn_cwd(
-                Some(missing.clone()),
-                Some(missing.clone()),
-                Some(startup.clone()),
-                Some(process.clone()),
-            ),
-            Some(missing.clone())
+            plan_from_probes(&candidates, &kinds),
+            vec![stored, startup, process]
         );
-        assert_eq!(
-            select_spawn_cwd(
-                None,
-                Some(missing.clone()),
-                Some(startup.clone()),
-                Some(process.clone())
-            ),
-            Some(startup.clone())
+    }
+
+    #[test]
+    fn dead_unc_live_cwd_is_not_handed_to_conpty() {
+        let live = PathBuf::from(r"\\offline\share\folder");
+        let startup = PathBuf::from(r"C:\startup");
+        let process = PathBuf::from(r"C:\process");
+        let candidates = spawn_candidates(
+            Some(live.clone()),
+            Some(live.clone()),
+            Some(startup.clone()),
+            Some(process.clone()),
         );
+        let kinds = [
+            platform::PathKind::Timeout,
+            platform::PathKind::Dir,
+            platform::PathKind::Dir,
+        ];
+
         assert_eq!(
-            select_spawn_cwd(None, None, Some(missing), Some(process.clone())),
-            Some(process.clone())
+            plan_from_probes(&candidates, &kinds),
+            vec![startup, process.clone()],
+            "a timed-out shell cwd must not stall or fail the new tab"
         );
 
-        for path in [startup, process] {
-            let _ = std::fs::remove_dir(path);
-        }
+        // Even a cold launch folder is preferred over the process fallback.
+        let candidates = spawn_candidates(None, None, Some(live.clone()), Some(process.clone()));
+        let kinds = [platform::PathKind::Timeout, platform::PathKind::Dir];
+        assert_eq!(
+            plan_from_probes(&candidates, &kinds),
+            vec![live, process],
+            "a launch folder timeout is kept, not replaced by C:\\Windows"
+        );
+    }
+
+    #[test]
+    fn spawn_candidates_dedupe_and_keep_launch_priority() {
+        let shared = PathBuf::from(r"C:\shared");
+        let process = PathBuf::from(r"C:\process");
+        let candidates = spawn_candidates(
+            Some(shared.clone()),
+            Some(shared.clone()),
+            Some(shared.clone()),
+            Some(process.clone()),
+        );
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].path, shared);
+        assert!(candidates[0].startup);
+        assert!(candidates[0].explicit);
+        assert!(!candidates[0].process);
+        assert_eq!(candidates[1].path, process);
+        assert!(candidates[1].process);
     }
 
     #[test]
     fn inherit_cwd_setting_chooses_active_folder_or_launch_folder() {
-        let live = test_dir("inherit-live");
-        let ignored = test_dir("inherit-ignored");
-        let ignored_stored = test_dir("inherit-ignored-stored");
-        let startup = test_dir("inherit-startup");
-        let process = test_dir("inherit-process");
-
-        assert_eq!(
-            select_new_tab_cwd(
-                true,
-                Some(live.clone()),
-                Some(live.clone()),
-                Some(startup.clone()),
-                Some(process.clone()),
-            ),
-            Some(live),
-            "enabled inheritance uses the active shell folder"
-        );
-        assert_eq!(
-            select_new_tab_cwd(
-                false,
-                Some(ignored.clone()),
-                Some(ignored_stored.clone()),
-                Some(startup.clone()),
-                Some(process.clone()),
-            ),
+        let live = PathBuf::from(r"C:\live");
+        let startup = PathBuf::from(r"C:\startup");
+        let process = PathBuf::from(r"C:\process");
+        let inherited = spawn_candidates(
+            Some(live.clone()),
+            Some(live.clone()),
             Some(startup.clone()),
-            "disabled inheritance uses the launch folder, never the active tab"
+            Some(process.clone()),
         );
+        assert_eq!(inherited[0].path, live);
+        assert!(inherited[0].explicit, "inheritance keeps the shell cwd");
 
-        for path in [ignored, ignored_stored, startup, process] {
-            let _ = std::fs::remove_dir(path);
-        }
+        let ignored = spawn_candidates(None, None, Some(startup.clone()), Some(process.clone()));
+        assert_eq!(ignored[0].path, startup);
+        assert!(
+            ignored[0].startup,
+            "disabled inheritance uses the launch folder"
+        );
     }
 
     #[test]
@@ -4511,20 +4854,63 @@ mod tests {
     }
 
     #[test]
-    fn fast_failed_shell_is_kept_but_normal_exit_closes() {
-        // A profile that fails immediately (even before a frame) must not
-        // become "no tabs" and close the window.
-        assert!(needs_recovery(Duration::ZERO, false));
-        assert!(needs_recovery(Duration::from_millis(100), false));
-        assert!(needs_recovery(Duration::from_secs(10), false));
-        // A quick exit is also kept, even if the user already typed.
+    fn recovery_is_bounded_and_respects_a_deliberate_exit() {
+        // A profile that fails during startup must not become "no tabs".
+        assert!(needs_recovery(Duration::ZERO, false, None));
+        assert!(needs_recovery(Duration::from_millis(100), false, Some(0)));
         assert!(needs_recovery(
-            FAST_EXIT_WINDOW - Duration::from_millis(1),
-            true
+            STARTUP_RECOVERY_WINDOW - Duration::from_millis(1),
+            false,
+            Some(0)
         ));
-        // Normal `exit` after use still removes the tab immediately.
-        assert!(!needs_recovery(FAST_EXIT_WINDOW, true));
-        assert!(!needs_recovery(Duration::from_secs(30), true));
+        // A deliberate `exit` after typing closes even inside the window.
+        assert!(!needs_recovery(Duration::from_millis(200), true, Some(0)));
+        // A non-zero status inside the window is still a failure.
+        assert!(needs_recovery(Duration::from_millis(200), true, Some(1)));
+        // After the startup window an unattended normal exit is expected.
+        assert!(!needs_recovery(Duration::from_secs(600), false, Some(0)));
+        assert!(!needs_recovery(
+            STARTUP_RECOVERY_WINDOW + Duration::from_millis(1),
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn spawn_failure_is_a_recovery_tab_without_a_session() {
+        let profile = profile("Missing");
+        let mut tab = Tab::pending(9, &profile, Some(PathBuf::from(r"C:\gone")));
+        assert!(tab.session.is_none());
+        assert!(!tab.recovery);
+
+        apply_spawn_outcome(
+            &mut tab,
+            Err("Could not start Missing: program not found".to_string()),
+        );
+
+        assert!(tab.recovery);
+        assert!(tab.session.is_none());
+        assert_eq!(
+            tab.error.as_deref(),
+            Some("Could not start Missing: program not found")
+        );
+        assert_eq!(tab.profile_name, "Missing");
+    }
+
+    #[test]
+    fn recovery_card_is_opaque_in_every_theme() {
+        for theme in Theme::all() {
+            let tokens = Tokens::from_theme(theme);
+            let frame = recovery_frame(&tokens);
+            assert_eq!(frame.fill, tokens.bg_elev);
+            assert_eq!(
+                frame.fill.a(),
+                255,
+                "card must cover the terminal in {}",
+                theme.name
+            );
+            assert_eq!(frame.stroke.color, tokens.border);
+        }
     }
 
     #[test]

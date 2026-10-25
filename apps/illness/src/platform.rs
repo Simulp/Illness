@@ -8,14 +8,15 @@
 use anyhow::{Context, Result};
 use illness_core::{Material, Rgb};
 use raw_window_handle::HasWindowHandle;
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(target_os = "windows")]
 use raw_window_handle::RawWindowHandle;
-#[cfg(target_os = "windows")]
-use std::sync::OnceLock;
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND};
 #[cfg(target_os = "windows")]
@@ -49,18 +50,246 @@ const ACCENT_DISABLED: u32 = 0;
 #[cfg(target_os = "windows")]
 const ACRYLIC_TINT_ALPHA_OPAQUE: f32 = 32.0;
 
+/// Outcome of a bounded path probe.
+///
+/// A timeout is deliberately distinct from "not a directory": a cold SMB or
+/// VPN folder may become available after the deadline, and callers must not
+/// silently replace it with an unrelated process directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathKind {
+    Dir,
+    NotDir,
+    Timeout,
+}
+
+/// Reuse a recent negative result so a dead folder is not re-probed every time
+/// a tab starts. Kept short: a path can be created moments after it is checked.
+const PATH_PROBE_NEGATIVE_TTL: Duration = Duration::from_secs(5);
+/// Reuse a timeout long enough to cover window creation. This is what makes a
+/// startup probe and the first tab's probe one operation for a cold network
+/// folder; the worker still replaces it with a real result if it finishes.
+const PATH_PROBE_TIMEOUT_TTL: Duration = Duration::from_secs(10);
+/// Bound the cache so a long session cannot accumulate dead paths forever.
+const PATH_PROBE_CACHE_CAP: usize = 64;
+
+#[derive(Debug, Default)]
+struct PathProbeCache {
+    entries: HashMap<PathBuf, (Instant, PathKind)>,
+}
+
+impl PathProbeCache {
+    fn get(&mut self, path: &Path, now: Instant) -> Option<PathKind> {
+        let (at, kind) = *self.entries.get(path)?;
+        let ttl = match kind {
+            // A positive result is cheap to re-check and can become stale
+            // immediately when a directory is deleted, so it is never cached.
+            PathKind::Dir => return None,
+            PathKind::NotDir => PATH_PROBE_NEGATIVE_TTL,
+            PathKind::Timeout => PATH_PROBE_TIMEOUT_TTL,
+        };
+        if now.saturating_duration_since(at) < ttl {
+            Some(kind)
+        } else {
+            self.entries.remove(path);
+            None
+        }
+    }
+
+    fn put(&mut self, path: &Path, kind: PathKind, now: Instant) {
+        if kind == PathKind::Dir {
+            self.entries.remove(path);
+            return;
+        }
+        if self.entries.len() >= PATH_PROBE_CACHE_CAP {
+            self.entries
+                .retain(|_, (at, _)| now.saturating_duration_since(*at) < PATH_PROBE_NEGATIVE_TTL);
+        }
+        self.entries.insert(path.to_path_buf(), (now, kind));
+    }
+}
+
+/// One batch of unique paths for the reusable probe thread.
+struct PathProbeJob {
+    paths: Vec<PathBuf>,
+    reply: Sender<(usize, PathKind)>,
+}
+
+/// A single long-lived probe thread plus its shared negative cache.
+///
+/// A fresh thread per request used to leave one blocked SMB check behind for
+/// every New Tab/startup. The worker is intentionally serial: duplicate paths
+/// are collapsed before they reach it, and the cache absorbs repeats.
+struct PathProbeWorker {
+    jobs: Sender<PathProbeJob>,
+    cache: Arc<Mutex<PathProbeCache>>,
+}
+
+fn path_probe_worker() -> &'static PathProbeWorker {
+    static WORKER: OnceLock<PathProbeWorker> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (jobs, receiver) = mpsc::channel::<PathProbeJob>();
+        let cache = Arc::new(Mutex::new(PathProbeCache::default()));
+        let worker_cache = Arc::clone(&cache);
+        let spawned = std::thread::Builder::new()
+            .name("illness-path-probe".to_string())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    for (index, path) in job.paths.iter().enumerate() {
+                        let now = Instant::now();
+                        let cached = {
+                            let mut cache = worker_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            cache.get(path, now)
+                        };
+                        let kind = cached.unwrap_or_else(|| {
+                            let kind = if path.is_dir() {
+                                PathKind::Dir
+                            } else {
+                                PathKind::NotDir
+                            };
+                            let mut cache = worker_cache
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            cache.put(path, kind, Instant::now());
+                            kind
+                        });
+                        // The receiver may have given up at its deadline; the
+                        // probe still finishes and warms the cache for later.
+                        let _ = job.reply.send((index, kind));
+                    }
+                }
+            });
+        if let Err(error) = spawned {
+            log::warn!("could not start the path probe thread: {error}");
+        }
+        PathProbeWorker { jobs, cache }
+    })
+}
+
+/// Collapse duplicate paths while preserving first-seen order.
+fn unique_probe_paths(paths: &[PathBuf]) -> (Vec<PathBuf>, Vec<usize>) {
+    let mut unique: Vec<PathBuf> = Vec::new();
+    let mut mapping = Vec::with_capacity(paths.len());
+    for path in paths {
+        let index = unique
+            .iter()
+            .position(|known| known == path)
+            .unwrap_or_else(|| {
+                unique.push(path.clone());
+                unique.len() - 1
+            });
+        mapping.push(index);
+    }
+    (unique, mapping)
+}
+
+/// Probe several candidate folders in one off-thread batch.
+///
+/// The caller waits at most `timeout` in total, not once per path. Duplicate
+/// paths are checked once, recent negative/timeout results are reused, and
+/// unresolved entries become [`PathKind::Timeout`]. That distinction lets a
+/// cold launch folder survive while a dead live shell cwd falls through to a
+/// usable stored/startup/process directory.
+pub fn probe_paths(paths: &[PathBuf], timeout: Duration) -> Vec<PathKind> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let (unique, mapping) = unique_probe_paths(paths);
+    let worker = path_probe_worker();
+    let now = Instant::now();
+    let mut unique_kinds: Vec<Option<PathKind>> = vec![None; unique.len()];
+    let mut pending = Vec::new();
+
+    {
+        let mut cache = worker
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, path) in unique.iter().enumerate() {
+            if let Some(kind) = cache.get(path, now) {
+                unique_kinds[index] = Some(kind);
+            } else {
+                pending.push(index);
+            }
+        }
+    }
+
+    if !pending.is_empty() {
+        let (reply, results) = mpsc::channel();
+        let job = PathProbeJob {
+            paths: pending.iter().map(|index| unique[*index].clone()).collect(),
+            reply,
+        };
+        if worker.jobs.send(job).is_ok() {
+            let deadline = now.checked_add(timeout).unwrap_or(now);
+            let mut remaining = pending.len();
+            while remaining > 0 {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                let Ok((job_index, kind)) = results.recv_timeout(left) else {
+                    break;
+                };
+                if let Some(&index) = pending.get(job_index)
+                    && unique_kinds[index].is_none()
+                {
+                    unique_kinds[index] = Some(kind);
+                    remaining -= 1;
+                }
+            }
+        }
+
+        let mut cache = worker
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for index in pending {
+            if unique_kinds[index].is_none() {
+                unique_kinds[index] = Some(PathKind::Timeout);
+                cache.put(&unique[index], PathKind::Timeout, Instant::now());
+            }
+        }
+    }
+
+    mapping
+        .iter()
+        .map(|index| unique_kinds[*index].unwrap_or(PathKind::Timeout))
+        .collect()
+}
+
+/// Single-path form of [`probe_paths`]. Multi-candidate callers use the batch
+/// form so one deadline covers every candidate instead of one per folder.
+pub fn path_kind_with_deadline(path: &Path, timeout: Duration) -> PathKind {
+    probe_paths(&[path.to_path_buf()], timeout)
+        .into_iter()
+        .next()
+        .unwrap_or(PathKind::Timeout)
+}
+
+/// Whether `path` is a directory, probed with a short deadline so an offline
+/// network path cannot freeze startup or tab creation. A timeout is not a
+/// directory for this boolean form; callers that must preserve a cold folder
+/// use [`path_kind_with_deadline`] instead.
+#[allow(dead_code)]
+pub fn path_is_dir_with_deadline(path: &Path, timeout: Duration) -> bool {
+    path_kind_with_deadline(path, timeout) == PathKind::Dir
+}
+
 /// Run a blocking probe on a detached thread and give up after `timeout`.
 ///
-/// Used only for folder existence checks at startup/New Tab. An offline UNC
-/// share can keep `is_dir` blocked for the SMB timeout; the UI must not wait
-/// that long. `None` means the probe did not finish in time.
+/// Kept for tests and small one-off probes; the app's folder checks use the
+/// reusable [`probe_paths`] worker so an offline share does not leave a new
+/// blocked thread behind on every request.
+#[allow(dead_code)]
 pub fn probe_with_deadline<T: Send + 'static>(
     timeout: Duration,
     probe: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = mpsc::channel();
     if std::thread::Builder::new()
-        .name("illness-path-probe".to_string())
+        .name("illness-one-shot-probe".to_string())
         .spawn(move || {
             let _ = sender.send(probe());
         })
@@ -69,13 +298,6 @@ pub fn probe_with_deadline<T: Send + 'static>(
         return None;
     }
     receiver.recv_timeout(timeout).ok()
-}
-
-/// Whether `path` is a directory, probed with a short deadline so an offline
-/// network path cannot freeze startup or tab creation.
-pub fn path_is_dir_with_deadline(path: &Path, timeout: Duration) -> bool {
-    let path = path.to_path_buf();
-    probe_with_deadline(timeout, move || path.is_dir()).unwrap_or(false)
 }
 
 /// `ACCENT_POLICY` from `winuser.h`.
@@ -443,15 +665,50 @@ fn set_registry_string(key: &RegistryKey, name: &str, value: &OsStr) -> Result<(
     Ok(())
 }
 
-/// Register the per-user "Open with Illness" verbs for folders and drives.
+/// Whether the machine-wide Explorer verbs are present.
+///
+/// The per-machine installer owns `HKLM\Software\Classes`; the application
+/// must not add a shadowing per-user copy when those keys exist. A portable or
+/// current-user install has no HKLM keys and falls back to HKCU.
+#[cfg(target_os = "windows")]
+fn machine_context_menu_registered() -> bool {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW,
+    };
+
+    fn key_exists(path: &str) -> bool {
+        let key_path = registry_wide(OsStr::new(path));
+        let mut key: HKEY = std::ptr::null_mut();
+        // Safety: key_path is null-terminated and live for the call; `key` is
+        // a valid out-pointer and is closed below when open succeeded.
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, key_path.as_ptr(), 0, KEY_READ, &mut key) };
+        if status != ERROR_SUCCESS {
+            return false;
+        }
+        // Safety: key was opened successfully above and is not used again.
+        unsafe { RegCloseKey(key) };
+        true
+    }
+
+    CONTEXT_MENU_VERBS.iter().any(|(path, _)| key_exists(path))
+}
+
+/// Whether an application launch should write its portable HKCU fallback.
+fn hkcu_registration_needed(machine_registered: bool) -> bool {
+    !machine_registered
+}
+
+/// Register the "Open with Illness" verbs for folders and drives.
 ///
 /// `force` is the explicit `--register-context-menu` path and registers the
 /// current executable from anywhere. Normal startup only updates the verbs
 /// when running from a stable installed root; a `target\debug`, temporary,
 /// portable or USB copy must not repoint an installed menu at a path that will
-/// vanish. Program Files launches still update idempotently, so an installer
-/// upgrade repairs a stale path. Existing unrelated classes and verbs are
-/// never touched.
+/// vanish. A per-machine install owns HKLM verbs, so the runtime skips HKCU
+/// when those exist; portable/current-user installs use HKCU. Program Files
+/// launches still update idempotently, so an installer upgrade repairs a stale
+/// path. Existing unrelated classes and verbs are never touched.
 pub fn register_context_menu(force: bool) -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -461,6 +718,11 @@ pub fn register_context_menu(force: bool) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
+        if !hkcu_registration_needed(machine_context_menu_registered()) {
+            log::info!("machine-wide Explorer verbs present; skipping HKCU registration");
+            return Ok(());
+        }
+
         let executable =
             std::env::current_exe().context("could not resolve the Illness executable")?;
         let stable_roots = stable_install_roots();
@@ -498,10 +760,42 @@ pub fn register_context_menu(force: bool) -> Result<()> {
     }
 }
 
-/// Remove only the Illness verbs created by [`register_context_menu`].
+/// Remove only the Illness Explorer verbs.
 ///
 /// Each key is deleted recursively, but the `shell` parent keys are left in
-/// place so verbs from other applications survive.
+/// place so verbs from other applications survive. Portable/current-user keys
+/// are always removed from HKCU. If machine-wide verbs exist, the explicit
+/// `--unregister-context-menu` also removes HKLM and reports an elevation
+/// error rather than silently claiming success.
+#[cfg(target_os = "windows")]
+fn remove_context_menu_root(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    name: &str,
+) -> Result<()> {
+    use windows_sys::Win32::System::Registry::{RegDeleteKeyW, RegDeleteTreeW};
+
+    for (path, _) in CONTEXT_MENU_VERBS {
+        let key_path = registry_wide(OsStr::new(path));
+        // Safety: key_path is null-terminated and live for the call.
+        let tree_status = unsafe { RegDeleteTreeW(root, key_path.as_ptr()) };
+        if tree_status != ERROR_SUCCESS && tree_status != ERROR_FILE_NOT_FOUND {
+            anyhow::bail!("could not clear {name}\\{path}: Windows error {tree_status}");
+        }
+        // RegDeleteTree removes values and subkeys; this removes the now empty
+        // verb key itself. Safety: same null-terminated path.
+        let key_status = unsafe { RegDeleteKeyW(root, key_path.as_ptr()) };
+        if key_status != ERROR_SUCCESS && key_status != ERROR_FILE_NOT_FOUND {
+            anyhow::bail!("could not remove {name}\\{path}: Windows error {key_status}");
+        }
+    }
+    Ok(())
+}
+
+/// Remove the Illness Explorer verbs created by [`register_context_menu`].
+///
+/// HKCU is the portable fallback. When machine-wide verbs exist, the explicit
+/// uninstall/flag path also removes HKLM; running it without elevation returns
+/// an error instead of pretending the menu is gone.
 pub fn unregister_context_menu() -> Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -510,23 +804,14 @@ pub fn unregister_context_menu() -> Result<()> {
 
     #[cfg(target_os = "windows")]
     {
-        use windows_sys::Win32::System::Registry::{
-            HKEY_CURRENT_USER, RegDeleteKeyW, RegDeleteTreeW,
-        };
+        use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 
-        for (path, _) in CONTEXT_MENU_VERBS {
-            let key_path = registry_wide(OsStr::new(path));
-            // Safety: key_path is null-terminated and live for the call.
-            let tree_status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, key_path.as_ptr()) };
-            if tree_status != ERROR_SUCCESS && tree_status != ERROR_FILE_NOT_FOUND {
-                anyhow::bail!("could not clear HKCU\\{path}: Windows error {tree_status}");
-            }
-            // RegDeleteTree removes values and subkeys; this removes the now
-            // empty verb key itself. Safety: same null-terminated path.
-            let key_status = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, key_path.as_ptr()) };
-            if key_status != ERROR_SUCCESS && key_status != ERROR_FILE_NOT_FOUND {
-                anyhow::bail!("could not remove HKCU\\{path}: Windows error {key_status}");
-            }
+        remove_context_menu_root(HKEY_CURRENT_USER, "HKCU")?;
+        if machine_context_menu_registered() {
+            remove_context_menu_root(
+                windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+                "HKLM",
+            )?;
         }
         log::info!("removed Explorer folder verbs");
         Ok(())
@@ -664,13 +949,6 @@ fn read_process_pointer(
     }
 }
 
-#[cfg(target_os = "windows")]
-fn read_process_u16(process: &ProcessHandle, address: usize) -> Option<u16> {
-    let mut bytes = [0u8; std::mem::size_of::<u16>()];
-    read_process_memory(process, address, &mut bytes)?;
-    Some(u16::from_ne_bytes(bytes))
-}
-
 /// Strip the Win32 object-manager prefix from a `DosPath`.
 fn strip_nt_prefix(path: &str) -> PathBuf {
     let path = path
@@ -709,6 +987,97 @@ fn plausible_process_path(text: &str) -> Option<PathBuf> {
         && (bytes[2] == b'\\' || bytes[2] == b'/');
     let unc = display.starts_with(r"\\") && display.len() > 2;
     (drive_absolute || unc).then_some(path)
+}
+
+/// Size and buffer-pointer offset of the `CURDIR` header for one target
+/// pointer size.
+///
+/// `CURDIR` starts with a `UNICODE_STRING` (`Length`, `MaximumLength`, pointer)
+/// and omits only the handle. On 64-bit targets the pointer is 8-byte aligned,
+/// so four bytes of padding follow `MaximumLength`; on 32-bit targets it starts
+/// immediately after them.
+#[cfg(target_os = "windows")]
+fn curdir_header_layout(pointer_size: usize) -> Option<(usize, usize)> {
+    match pointer_size {
+        4 => Some((4, 8)),
+        8 => Some((8, 16)),
+        _ => None,
+    }
+}
+
+/// Decode `Length` and the path buffer pointer from one `CURDIR` header read.
+///
+/// Requiring a non-empty, even byte length and a consistent maximum length
+/// rejects torn reads before the buffer address is dereferenced.
+#[cfg(target_os = "windows")]
+fn decode_curdir_header(header: &[u8], pointer_size: usize) -> Option<(u16, usize)> {
+    let (pointer_offset, header_size) = curdir_header_layout(pointer_size)?;
+    if header.len() < header_size {
+        return None;
+    }
+    let length = u16::from_le_bytes([header[0], header[1]]);
+    let maximum_length = u16::from_le_bytes([header[2], header[3]]);
+    if length < 2 || !length.is_multiple_of(2) {
+        return None;
+    }
+    if maximum_length != 0 && maximum_length < length {
+        return None;
+    }
+    let pointer = &header[pointer_offset..pointer_offset + pointer_size];
+    let buffer = if pointer_size == 4 {
+        u32::from_ne_bytes(pointer.try_into().ok()?) as usize
+    } else {
+        usize::from_ne_bytes(pointer.try_into().ok()?)
+    };
+    (buffer != 0).then_some((length, buffer))
+}
+
+/// Length of the path bytes including its NUL terminator.
+///
+/// Windows normally reports `CURDIR.Length` without the terminator, but some
+/// providers include it. Accept either representation only when a NUL is
+/// actually present; a fake or torn string with junk past `Length` is rejected
+/// before it reaches [`decode_curdir_text`].
+#[cfg(target_os = "windows")]
+fn terminated_curdir_len(bytes: &[u8], declared: usize) -> Option<usize> {
+    if declared == 0 || !declared.is_multiple_of(2) || declared > bytes.len() {
+        return None;
+    }
+    let units = bytes.as_chunks::<2>().0;
+    if units[declared / 2 - 1] == [0, 0] {
+        Some(declared)
+    } else if declared.checked_add(2)? <= bytes.len() && units.get(declared / 2) == Some(&[0, 0]) {
+        Some(declared + 2)
+    } else {
+        None
+    }
+}
+
+/// Decode the `CURDIR` DOS path, which must be NUL-terminated inside the slice.
+///
+/// Interior NULs, unpaired surrogates and non-DOS/UNC paths are rejected:
+/// those indicate a wrong offset or junk in the target's PEB, and passing them
+/// to ConPTY would fail in a confusing place.
+#[cfg(target_os = "windows")]
+fn decode_curdir_text(bytes: &[u8]) -> Option<PathBuf> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    if units.last().copied() != Some(0) {
+        return None;
+    }
+    let path_units = &units[..units.len() - 1];
+    if path_units.is_empty() || path_units.contains(&0) {
+        return None;
+    }
+    let text = String::from_utf16(path_units).ok()?;
+    plausible_process_path(&text)
 }
 
 /// Read a process's current working directory from its PEB.
@@ -796,29 +1165,22 @@ pub fn process_cwd(pid: u32) -> Option<PathBuf> {
         return None;
     }
     let current_directory = parameters.checked_add(layout.current_directory)?;
-    let length = read_process_u16(&process, current_directory)?;
-    if length == 0 || length % 2 != 0 {
-        return None;
-    }
-    let buffer = read_process_pointer(
-        &process,
-        current_directory.checked_add(layout.pointer_size)?,
-        layout.pointer_size,
-    )?;
-    if buffer == 0 {
-        return None;
-    }
+    // Read the whole CURDIR header in one operation. Separate Length and
+    // Buffer reads could observe a torn structure while the shell changes
+    // directory, pairing one call's length with another call's pointer.
+    let (_, header_size) = curdir_header_layout(layout.pointer_size)?;
+    let mut header = [0u8; 16];
+    read_process_memory(&process, current_directory, &mut header[..header_size])?;
+    let (length, buffer) = decode_curdir_header(&header[..header_size], layout.pointer_size)?;
 
-    let mut text = vec![0u8; usize::from(length)];
+    // Windows usually reports `Length` without the terminating NUL, but some
+    // providers include it. Read one extra unit and require a terminator at
+    // `Length` or just after it; a junk string without one is rejected.
+    let declared = usize::from(length);
+    let mut text = vec![0u8; declared.checked_add(2)?];
     read_process_memory(&process, buffer, &mut text)?;
-    let units: Vec<u16> = text
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect();
-    let text = String::from_utf16_lossy(&units);
-    plausible_process_path(&text)
+    let terminated_at = terminated_curdir_len(&text, declared)?;
+    decode_curdir_text(&text[..terminated_at])
 }
 
 /// Process inspection is Windows-only; other platforms use the stored cwd.
@@ -1167,15 +1529,17 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{
-        CONTEXT_MENU_VERBS, PEB_LAYOUT_32, PEB_LAYOUT_64, acrylic_tint,
-        automatic_context_menu_allowed, context_menu_command, machine_is_wow64, path_has_prefix,
-        peb_layout_for_target, plausible_process_path, probe_with_deadline, process_cwd,
-        strip_nt_prefix, transparency_allowed,
+        CONTEXT_MENU_VERBS, PEB_LAYOUT_32, PEB_LAYOUT_64, PathKind, PathProbeCache, acrylic_tint,
+        automatic_context_menu_allowed, context_menu_command, curdir_header_layout,
+        decode_curdir_header, decode_curdir_text, hkcu_registration_needed, machine_is_wow64,
+        path_has_prefix, path_kind_with_deadline, peb_layout_for_target, plausible_process_path,
+        probe_paths, probe_with_deadline, process_cwd, strip_nt_prefix, terminated_curdir_len,
+        transparency_allowed, unique_probe_paths,
     };
     use illness_core::Rgb;
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn peb_dos_paths_lose_object_manager_prefixes() {
@@ -1320,26 +1684,23 @@ mod tests {
     }
 
     #[test]
-    fn installer_removes_per_user_verbs_before_deleting_the_install_dir() {
+    fn installer_registers_hklm_for_per_machine_and_removes_it_once() {
         const TEMPLATE: &str = include_str!("../installer.nsi");
-        assert!(TEMPLATE.contains("Function un.RemoveExplorerVerbs"));
-        assert!(TEMPLATE.contains("EnumRegKey $1 HKU \"\" $0"));
-        for path in [
-            r"Software\Classes\Directory\Background\shell\Illness",
-            r"Software\Classes\Directory\shell\Illness",
-            r"Software\Classes\Drive\shell\Illness",
-        ] {
-            let delete_all_users = format!(r#"DeleteRegKey HKU "$1\{path}""#);
-            let delete_current = format!(r#"DeleteRegKey HKCU "{path}""#);
-            assert!(
-                TEMPLATE.contains(&delete_all_users),
-                "missing all-user cleanup for {path}"
-            );
-            assert!(
-                TEMPLATE.contains(&delete_current),
-                "missing current-user cleanup for {path}"
-            );
-        }
+        assert!(TEMPLATE.contains("!insertmacro RegisterExplorerVerbs HKLM"));
+        assert!(TEMPLATE.contains("!insertmacro UnregisterExplorerVerbs HKLM"));
+        assert!(TEMPLATE.contains("!macro RegisterExplorerVerb ROOT CLASS PLACEHOLDER"));
+        assert!(
+            TEMPLATE.contains(r#"WriteRegStr ${ROOT} "Software\Classes\${CLASS}\shell\Illness""#),
+            "the macro must write classes relative to its root"
+        );
+        assert!(
+            !TEMPLATE.contains("EnumRegKey $1 HKU"),
+            "the uninstaller must not depend on loaded/offline user hives"
+        );
+        assert!(
+            !TEMPLATE.contains("DeleteRegKey HKU"),
+            "offlined hives cannot be cleaned reliably; use HKLM instead"
+        );
         let call = TEMPLATE
             .find("Call un.RemoveExplorerVerbs")
             .expect("uninstall calls the verb cleanup");
@@ -1347,6 +1708,12 @@ mod tests {
             .find(r#"Delete "$INSTDIR\${MAINBINARYNAME}.exe""#)
             .expect("uninstall deletes the binary");
         assert!(call < delete, "verbs must be removed before $INSTDIR");
+    }
+
+    #[test]
+    fn runtime_skips_hkcu_when_machine_verbs_exist() {
+        assert!(!hkcu_registration_needed(true));
+        assert!(hkcu_registration_needed(false));
     }
 
     #[test]
@@ -1362,6 +1729,143 @@ mod tests {
             probe_with_deadline(Duration::from_millis(250), || true),
             Some(true)
         );
+    }
+
+    #[test]
+    fn probe_paths_dedupes_and_reports_tri_state() {
+        let dir = std::env::temp_dir();
+        let missing = std::env::temp_dir().join(format!(
+            "illness-probe-missing-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|time| time.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let kinds = probe_paths(
+            &[dir.clone(), dir.clone(), missing.clone(), missing.clone()],
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            kinds,
+            vec![
+                PathKind::Dir,
+                PathKind::Dir,
+                PathKind::NotDir,
+                PathKind::NotDir
+            ],
+            "duplicate candidates share one probe and keep the timeout distinction"
+        );
+        assert_eq!(
+            path_kind_with_deadline(&missing, Duration::from_secs(2)),
+            PathKind::NotDir
+        );
+    }
+
+    #[test]
+    fn unique_probe_paths_keeps_priority_order() {
+        let a = PathBuf::from(r"C:\a");
+        let b = PathBuf::from(r"C:\b");
+        let (unique, mapping) = unique_probe_paths(&[a.clone(), b.clone(), a.clone(), b.clone()]);
+        assert_eq!(unique, vec![a, b]);
+        assert_eq!(mapping, vec![0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn path_probe_cache_reuses_only_short_negative_and_timeout_results() {
+        let mut cache = PathProbeCache::default();
+        let now = Instant::now();
+        let path = Path::new(r"C:\dead");
+
+        cache.put(path, PathKind::NotDir, now);
+        assert_eq!(
+            cache.get(path, now + Duration::from_secs(1)),
+            Some(PathKind::NotDir)
+        );
+        assert_eq!(cache.get(path, now + Duration::from_secs(6)), None);
+
+        cache.put(path, PathKind::Timeout, now);
+        assert_eq!(
+            cache.get(path, now + Duration::from_secs(1)),
+            Some(PathKind::Timeout)
+        );
+        assert_eq!(cache.get(path, now + Duration::from_secs(11)), None);
+
+        cache.put(path, PathKind::Dir, now);
+        assert_eq!(
+            cache.get(path, now),
+            None,
+            "a directory must be re-checked after deletion"
+        );
+    }
+
+    #[test]
+    fn curdir_header_is_decoded_from_one_read() {
+        assert_eq!(curdir_header_layout(4), Some((4, 8)));
+        assert_eq!(curdir_header_layout(8), Some((8, 16)));
+        assert_eq!(curdir_header_layout(16), None);
+
+        let mut header = [0u8; 16];
+        header[0..2].copy_from_slice(&8u16.to_le_bytes());
+        header[2..4].copy_from_slice(&10u16.to_le_bytes());
+        header[8..16].copy_from_slice(&0x1234usize.to_le_bytes());
+        assert_eq!(decode_curdir_header(&header, 8), Some((8, 0x1234)));
+        // The 32-bit view of this 64-bit header points at zero.
+        assert_eq!(decode_curdir_header(&header, 4), None);
+
+        let mut header32 = [0u8; 8];
+        header32[0..2].copy_from_slice(&6u16.to_le_bytes());
+        header32[2..4].copy_from_slice(&6u16.to_le_bytes());
+        header32[4..8].copy_from_slice(&0x5678u32.to_le_bytes());
+        assert_eq!(decode_curdir_header(&header32, 4), Some((6, 0x5678)));
+
+        header[0..2].copy_from_slice(&7u16.to_le_bytes());
+        assert_eq!(decode_curdir_header(&header, 8), None, "odd length");
+        header[0..2].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode_curdir_header(&header, 8), None, "empty length");
+        assert_eq!(decode_curdir_header(&header[..8], 8), None, "truncated");
+    }
+
+    #[test]
+    fn curdir_text_requires_a_nul_terminator_and_rejects_junk() {
+        fn utf16(text: &str) -> Vec<u8> {
+            text.encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        }
+
+        let with_nul = utf16("C:\\Users\\Simulp\u{0}");
+        assert_eq!(
+            decode_curdir_text(&with_nul),
+            Some(PathBuf::from(r"C:\Users\Simulp"))
+        );
+        assert_eq!(decode_curdir_text(&utf16("C:\\missing-nul")), None);
+        assert_eq!(decode_curdir_text(&utf16("C:\\bad\u{0}junk\u{0}")), None);
+        assert_eq!(decode_curdir_text(&[0xff, 0x00]), None);
+        assert_eq!(decode_curdir_text(&[]), None);
+        assert_eq!(decode_curdir_text(&utf16("relative\u{0}")), None);
+
+        // CURDIR.Length may or may not include the terminator; accept exactly
+        // those two forms and reject a non-NUL extra unit.
+        let path_without_nul = utf16("C:\\Users\\Simulp");
+        let declared = path_without_nul.len();
+        let mut terminated_after = path_without_nul.clone();
+        terminated_after.extend_from_slice(&[0, 0]);
+        assert_eq!(
+            terminated_curdir_len(&terminated_after, declared),
+            Some(terminated_after.len())
+        );
+        assert_eq!(
+            terminated_curdir_len(&with_nul, with_nul.len()),
+            Some(with_nul.len()),
+            "Length may include the NUL"
+        );
+        let mut junk_after = path_without_nul;
+        junk_after.extend_from_slice(&[b'X', 0]);
+        assert_eq!(terminated_curdir_len(&junk_after, declared), None);
+        assert_eq!(terminated_curdir_len(&terminated_after, declared + 1), None);
     }
 
     #[test]
