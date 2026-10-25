@@ -25,9 +25,12 @@ antialiasing (no ClearType color fringing).
   an installed-font picker (Nerd Fonts included), and background controls.
 - Mica by default; Acrylic or Solid in Settings. Mica is the Windows 11 system backdrop and
   falls back to Solid when unavailable. Acrylic uses the legacy native behind-window accent
-  blur where Windows 10/11 expose it, and also falls back to Solid. Desktop mode is native
-  blur for Acrylic and an in-app live wallpaper for Mica; Image uses the chosen custom image,
-  and the opacity slider applies to all three.
+  blur where Windows 10/11 expose it, and also falls back to Solid. Acrylic's Desktop mode is
+  native behind-window blur; Mica's Desktop mode paints a decoded, blurred snapshot of the
+  current wallpaper that is refreshed when the backdrop is rebuilt, not continuously live.
+  Image uses the chosen custom image. The opacity slider affects Mica with a background and
+  Acrylic (including Acrylic with Background set to None, through its accent tint); Solid and
+  Mica with no background ignore it.
 - Command palette (`Ctrl+Shift+P`), inline search (`Ctrl+Shift+F`) and Settings (`Ctrl+,`).
 - Seven themes: Illness Dark, Campbell, One Half Dark, Nord, Gruvbox Dark, Solarized Dark, Light.
 - Crisp terminal grid with system fallback for CJK and emoji; wide cells, combining marks,

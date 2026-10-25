@@ -756,8 +756,9 @@ fn appearance_section(
             .inner;
     }
 
+    let opacity_enabled = background_opacity_enabled(config.material, config.background);
     changed |= setting_row(ui, tokens, "Background opacity", |ui| {
-        ui.add_enabled_ui(background_enabled, |ui| {
+        ui.add_enabled_ui(opacity_enabled, |ui| {
             ui.spacing_mut().slider_width = 150.0;
             let mut opacity = config.background_opacity;
             let changed = ui
@@ -778,17 +779,23 @@ fn appearance_section(
         })
         .inner
     });
-    if background_enabled {
+    if !background_enabled {
         muted_label(
             ui,
             tokens,
-            "0% paints a solid theme background; 100% keeps the material strength.",
+            "Solid paints an opaque theme background. Choose Mica or Acrylic to use a wallpaper.",
+        );
+    } else if !opacity_enabled {
+        muted_label(
+            ui,
+            tokens,
+            "Mica with no background ignores opacity. Choose Desktop or Image, or use Acrylic, to enable it.",
         );
     } else {
         muted_label(
             ui,
             tokens,
-            "Solid paints an opaque theme background. Choose Mica or Acrylic to use a wallpaper.",
+            "0% paints a solid theme background; 100% keeps the material strength.",
         );
     }
 
@@ -962,6 +969,17 @@ fn background_image_row(
 /// show through. Solid deliberately paints an opaque theme background.
 pub fn background_controls_enabled(material: Material) -> bool {
     material != Material::Solid
+}
+
+/// Whether the opacity slider has any visible effect.
+///
+/// Solid ignores it. Mica with no background paints only the native Mica
+/// backdrop, which has no opacity hook (the slider previously looked live but
+/// changed nothing). Acrylic keeps working even with `None` because the accent
+/// tint consumes the opacity.
+fn background_opacity_enabled(material: Material, mode: BackgroundMode) -> bool {
+    background_controls_enabled(material)
+        && !(material == Material::Mica && mode == BackgroundMode::None)
 }
 
 /// Copy a chosen image into `%APPDATA%\illness\backgrounds` under a safe,
@@ -1819,6 +1837,38 @@ mod tests {
         assert!(background_controls_enabled(Material::Mica));
         assert!(background_controls_enabled(Material::Acrylic));
         assert!(!background_controls_enabled(Material::Solid));
+    }
+
+    #[test]
+    fn opacity_is_disabled_only_for_mica_without_a_backdrop() {
+        assert!(!background_opacity_enabled(
+            Material::Mica,
+            BackgroundMode::None
+        ));
+        assert!(background_opacity_enabled(
+            Material::Mica,
+            BackgroundMode::Desktop
+        ));
+        assert!(background_opacity_enabled(
+            Material::Mica,
+            BackgroundMode::Image
+        ));
+        assert!(background_opacity_enabled(
+            Material::Acrylic,
+            BackgroundMode::None
+        ));
+        assert!(background_opacity_enabled(
+            Material::Acrylic,
+            BackgroundMode::Desktop
+        ));
+        assert!(!background_opacity_enabled(
+            Material::Solid,
+            BackgroundMode::Desktop
+        ));
+        assert!(!background_opacity_enabled(
+            Material::Solid,
+            BackgroundMode::None
+        ));
     }
 
     #[test]

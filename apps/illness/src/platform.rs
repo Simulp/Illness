@@ -291,7 +291,9 @@ pub fn apply(
                 // legacy accent first, then extend the frame so DWM paints
                 // Mica through the whole client area, and apply it last.
                 let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
-                extend_frame(hwnd, true);
+                if !extend_frame(hwnd, true) {
+                    anyhow::bail!("DWM frame extension is unavailable");
+                }
                 window_vibrancy::apply_mica(window, Some(dark))?;
             }
             Material::Acrylic => {
@@ -420,13 +422,13 @@ fn apply_theme(hwnd: HWND, dark: bool) {
     let _ = set_attribute(hwnd, corners, DWMWCP_ROUND);
 }
 
-/// Extend or reset the DWM frame.
+/// Extend or reset the DWM frame. Returns whether DWM accepted the request.
 ///
 /// Extending (negative margins) lets the system Mica backdrop reach the whole
 /// client area. Resetting to zero margins undoes that when switching to a
 /// material that must composite its own backdrop.
 #[cfg(target_os = "windows")]
-fn extend_frame(hwnd: HWND, extend: bool) {
+fn extend_frame(hwnd: HWND, extend: bool) -> bool {
     let margin = if extend { -1 } else { 0 };
     let margins = windows_sys::Win32::UI::Controls::MARGINS {
         cxLeftWidth: margin,
@@ -436,9 +438,8 @@ fn extend_frame(hwnd: HWND, extend: bool) {
     };
     // Safety: hwnd is live for the duration of this call; `margins` is a
     // correctly laid out MARGINS owned by this stack frame.
-    unsafe {
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-    }
+    let result = unsafe { DwmExtendFrameIntoClientArea(hwnd, &margins) };
+    result >= 0
 }
 
 /// Apply one accent policy. Returns `false` when the undocumented API is

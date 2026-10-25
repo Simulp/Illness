@@ -88,6 +88,11 @@ pub struct IllnessApp {
     window: Arc<Window>,
     config: Config,
     profiles: Vec<Profile>,
+    /// Whether the swapchain can present a transparent backbuffer. Queried
+    /// from the surface's alpha modes at startup; without it, Mica and
+    /// Acrylic would composite over an ignored clear alpha and show an opaque
+    /// black (or the raw desktop) instead of their intended backdrop.
+    native_transparency: bool,
     theme: &'static Theme,
     tokens: Tokens,
     atlas: GlyphAtlas,
@@ -124,6 +129,7 @@ impl IllnessApp {
         ctx: &egui::Context,
         render_state: Option<&egui_wgpu::RenderState>,
         window: Arc<Window>,
+        native_transparency: bool,
     ) -> Self {
         let mut config = Config::load();
         let mut detected = detect_profiles();
@@ -185,6 +191,7 @@ impl IllnessApp {
             window: Arc::clone(&window),
             config,
             profiles,
+            native_transparency,
             theme,
             tokens,
             atlas,
@@ -403,10 +410,20 @@ impl IllnessApp {
         let theme_bg = self.theme.bg;
         let opacity = self.config.background_opacity;
         let requested = self.config.material;
-        if let Err(error) = platform::apply(window, requested, dark, theme_bg, opacity) {
+        let (effective, native_unavailable) =
+            material_for_surface(requested, self.native_transparency);
+        if native_unavailable {
+            self.config.material = effective;
+            self.overlays.toast = Some("Native materials unavailable; using Solid".to_string());
+            log::warn!(
+                "surface has no transparent alpha mode; {} forced to Solid",
+                material_name(requested)
+            );
+        }
+        if let Err(error) = platform::apply(window, effective, dark, theme_bg, opacity) {
             log::warn!(
                 "window material {} (dark={dark}) failed: {error}",
-                material_name(requested)
+                material_name(effective)
             );
             self.config.material = Material::Solid;
             if let Err(error) = platform::apply(window, Material::Solid, dark, theme_bg, opacity) {
@@ -419,10 +436,13 @@ impl IllnessApp {
         } else {
             log::info!(
                 "window material {} (dark={dark}) applied",
-                material_name(requested)
+                material_name(effective)
             );
         }
         self.applied_material = self.config.material;
+        // A failed native material leaves any prewarmed texture unused. Drop
+        // it without decoding or toasting.
+        self.drop_unneeded_backdrop();
         // The panel fill follows the material: opaque for Solid, transparent
         // so the native backdrop can show through otherwise. This also covers
         // a fallback to Solid when the requested material is unavailable.
@@ -435,15 +455,33 @@ impl IllnessApp {
     /// Called only when the mode, path, a gradient-producing theme, or the
     /// material changes; opacity is applied at paint time. Images are decoded
     /// once per `(path, mtime)` and rejected when larger than the texture cap.
+    /// A pair that paints no backdrop -- Solid, or any material with
+    /// `BackgroundMode::None` -- returns immediately without decoding.
     ///
     /// Acrylic+Desktop also keeps a prewarmed texture even though the paint
     /// guard suppresses it. The first switch away from native Acrylic then
     /// reuses the path+mtime cache instead of paying for a cold wallpaper
-    /// decode in the middle of a frame.
+    /// decode in the middle of a frame. Startup thereby avoids the decode for
+    /// Solid but keeps the accepted Acrylic+Desktop prewarm.
     fn rebuild_backdrop(&mut self) {
-        let started = std::time::Instant::now();
         let mode = self.config.background;
         let path = self.config.background_path.clone();
+        if !needs_backdrop(self.config.material, mode) {
+            // Solid never paints a texture and a None background has nothing
+            // to paint. Drop it without decoding the wallpaper or reporting a
+            // misleading image failure.
+            self.backdrop = None;
+            self.applied_background = Some((mode, path));
+            self.applied_background_opacity = self.config.background_opacity;
+            self.ctx.request_repaint();
+            log::debug!(
+                "backdrop skipped for {:?}+{mode:?}: not needed",
+                self.config.material
+            );
+            return;
+        }
+
+        let started = std::time::Instant::now();
         match backdrop::build(&self.ctx, self.theme, mode, &path) {
             Ok(backdrop) => {
                 self.backdrop = backdrop;
@@ -473,17 +511,43 @@ impl IllnessApp {
         );
     }
 
+    /// Drop a backdrop texture the current material/mode cannot paint.
+    ///
+    /// Returns whether a texture was dropped. No decode or toast occurs.
+    fn drop_unneeded_backdrop(&mut self) -> bool {
+        if needs_backdrop(self.config.material, self.config.background) || self.backdrop.is_none() {
+            return false;
+        }
+        self.backdrop = None;
+        self.applied_background =
+            Some((self.config.background, self.config.background_path.clone()));
+        self.applied_background_opacity = self.config.background_opacity;
+        self.ctx.request_repaint();
+        log::debug!(
+            "backdrop dropped for {:?}+{:?}: not needed",
+            self.config.material,
+            self.config.background
+        );
+        true
+    }
+
     /// Keep the in-window backdrop in step with a material change.
     ///
     /// Entering Acrylic keeps the existing texture (the paint guard suppresses
-    /// it) and leaving Acrylic always rebuilds so a wallpaper changed while
-    /// native blur was active is re-read through the path+mtime cache.
-    fn sync_backdrop_for_material(&mut self) {
+    /// it) and leaving Acrylic rebuilds only when the new pair actually paints
+    /// a backdrop. Leaving for Solid or None drops it without decoding.
+    /// `background_changed` means `reapply_config` already rebuilt for the new
+    /// background; rebuilding again here would decode the same wallpaper twice.
+    fn sync_backdrop_for_material(&mut self, background_changed: bool) {
         let leaving_acrylic =
             self.applied_material == Material::Acrylic && self.config.material != Material::Acrylic;
-        let needs_load =
-            needs_backdrop(self.config.material, self.config.background) && self.backdrop.is_none();
-        if leaving_acrylic || needs_load {
+        if self.drop_unneeded_backdrop() {
+            return;
+        }
+        if !needs_backdrop(self.config.material, self.config.background) {
+            return;
+        }
+        if !background_changed && (leaving_acrylic || self.backdrop.is_none()) {
             self.rebuild_backdrop();
         }
     }
@@ -562,9 +626,11 @@ impl IllnessApp {
         }
 
         let background = (self.config.background, self.config.background_path.clone());
+        let background_changed =
+            background_dirty || self.applied_background.as_ref() != Some(&background);
         let opacity_changed =
             (self.config.background_opacity - self.applied_background_opacity).abs() > f32::EPSILON;
-        if background_dirty || self.applied_background.as_ref() != Some(&background) {
+        if background_changed {
             self.rebuild_backdrop();
         } else if opacity_changed {
             self.applied_background_opacity = self.config.background_opacity;
@@ -573,16 +639,16 @@ impl IllnessApp {
 
         if self.config.material != self.applied_material {
             self.pending_material = true;
-            // Acrylic+Desktop has no in-window backdrop, so switching to Mica
-            // or Image must load one now. An existing texture is reused to
-            // avoid decoding the wallpaper twice.
-            self.sync_backdrop_for_material();
+            // Acrylic+Desktop has no painted in-window backdrop, so switching
+            // to Mica or Image must load one now. An existing texture is
+            // reused, and a simultaneous background change is not rebuilt a
+            // second time.
+            self.sync_backdrop_for_material(background_changed);
         }
 
         // The legacy acrylic accent carries its own tint, so opacity changes
-        // must re-apply it. This is intentionally the only work done: no
-        // design token install and no backdrop rebuild, keeping a live slider
-        // drag cheap.
+        // must re-apply it. This is intentionally minimal: no design token
+        // install and no backdrop rebuild, keeping a live slider drag cheap.
         if opacity_changed
             && self.config.material == Material::Acrylic
             && self.applied_material == Material::Acrylic
@@ -594,7 +660,14 @@ impl IllnessApp {
                 !self.theme.is_light(),
                 self.config.background_opacity,
             ) {
+                // Do not leave the slider looking live when the tint cannot be
+                // reapplied: fall back exactly like a failed material apply.
                 log::warn!("failed to re-apply the acrylic tint: {error}");
+                self.config.material = Material::Solid;
+                self.pending_material = true;
+                self.overlays.toast =
+                    Some("Acrylic tint is unavailable here; using Solid".to_string());
+                self.sync_backdrop_for_material(false);
             }
         }
 
@@ -947,7 +1020,7 @@ impl IllnessApp {
             Action::ToggleMaterial => {
                 self.config.material = next_material(self.config.material);
                 self.pending_material = true;
-                self.sync_backdrop_for_material();
+                self.sync_backdrop_for_material(false);
                 self.persist();
             }
             Action::Copy => self.copy_selection(),
@@ -1463,22 +1536,44 @@ impl IllnessApp {
     }
 
     pub fn clear_color(&self) -> [f32; 4] {
-        match self.config.material {
-            Material::Solid => design::color(self.theme.bg).to_normalized_gamma_f32(),
-            // Mica was applied successfully (a failure falls back to Solid),
-            // so the swapchain must stay transparent for DWM to composite the
-            // system backdrop behind it, including Mica+None.
-            Material::Mica | Material::Acrylic => [0.0, 0.0, 0.0, 0.0],
-        }
+        clear_color_for(
+            self.config.material,
+            self.native_transparency,
+            self.theme.bg,
+        )
+    }
+}
+
+/// Swapchain clear colour for a material.
+///
+/// Transparent only when the surface really can present a transparent
+/// backbuffer and the material is not Solid. Otherwise DWM paints Mica or the
+/// acrylic accent over whatever the ignored clear alpha leaves behind, which
+/// is opaque black; keeping the theme background opaque at least matches Solid.
+fn clear_color_for(material: Material, native_transparency: bool, bg: Rgb) -> [f32; 4] {
+    if native_transparency && material != Material::Solid {
+        [0.0, 0.0, 0.0, 0.0]
+    } else {
+        design::color(bg).to_normalized_gamma_f32()
+    }
+}
+
+/// Native materials need a transparent swapchain; otherwise their DWM effect is
+/// hidden behind an opaque surface.
+fn material_for_surface(requested: Material, native_transparency: bool) -> (Material, bool) {
+    if requested != Material::Solid && !native_transparency {
+        (Material::Solid, true)
+    } else {
+        (requested, false)
     }
 }
 
 /// Whether the app should hold an in-window backdrop texture for this
-/// material/mode pair. Acrylic+Desktop uses native behind-window blur.
+/// material/mode pair. Acrylic+Desktop keeps a prewarmed texture but never
+/// paints it (native behind-window blur draws instead); Solid and None never
+/// need one.
 fn needs_backdrop(material: Material, mode: BackgroundMode) -> bool {
-    material != Material::Solid
-        && mode != BackgroundMode::None
-        && !(material == Material::Acrylic && mode == BackgroundMode::Desktop)
+    material != Material::Solid && mode != BackgroundMode::None
 }
 
 fn spawn_spec(profile: &Profile, config: &Config) -> SpawnSpec {
@@ -2252,13 +2347,63 @@ mod tests {
     }
 
     #[test]
-    fn backdrop_is_needed_except_for_native_acrylic_desktop() {
-        assert!(!needs_backdrop(Material::Acrylic, BackgroundMode::Desktop));
+    fn backdrop_is_needed_only_for_non_solid_materials_with_a_background() {
         assert!(!needs_backdrop(Material::Solid, BackgroundMode::Desktop));
-        assert!(!needs_backdrop(Material::Mica, BackgroundMode::None));
-        assert!(needs_backdrop(Material::Mica, BackgroundMode::Desktop));
-        assert!(needs_backdrop(Material::Mica, BackgroundMode::Image));
-        assert!(needs_backdrop(Material::Acrylic, BackgroundMode::Image));
+        assert!(!needs_backdrop(Material::Solid, BackgroundMode::Image));
+        assert!(!needs_backdrop(Material::Solid, BackgroundMode::None));
+        for material in [Material::Mica, Material::Acrylic] {
+            assert!(!needs_backdrop(material, BackgroundMode::None));
+            assert!(needs_backdrop(material, BackgroundMode::Desktop));
+            assert!(needs_backdrop(material, BackgroundMode::Image));
+        }
+    }
+
+    #[test]
+    fn clear_color_is_transparent_only_for_verified_native_transparency() {
+        let bg = Rgb::new(0x12, 0x34, 0x56);
+        let opaque = design::color(bg).to_normalized_gamma_f32();
+        for material in [Material::Solid, Material::Mica, Material::Acrylic] {
+            assert_eq!(
+                clear_color_for(material, false, bg),
+                opaque,
+                "{material:?} must stay opaque without surface alpha support"
+            );
+        }
+        assert_eq!(
+            clear_color_for(Material::Solid, true, bg),
+            opaque,
+            "Solid never needs a transparent backbuffer"
+        );
+        assert_eq!(clear_color_for(Material::Mica, true, bg), [0.0; 4]);
+        assert_eq!(clear_color_for(Material::Acrylic, true, bg), [0.0; 4]);
+    }
+
+    #[test]
+    fn native_materials_require_verified_surface_transparency() {
+        assert_eq!(
+            material_for_surface(Material::Mica, false),
+            (Material::Solid, true)
+        );
+        assert_eq!(
+            material_for_surface(Material::Acrylic, false),
+            (Material::Solid, true)
+        );
+        assert_eq!(
+            material_for_surface(Material::Solid, false),
+            (Material::Solid, false)
+        );
+        assert_eq!(
+            material_for_surface(Material::Mica, true),
+            (Material::Mica, false)
+        );
+        assert_eq!(
+            material_for_surface(Material::Acrylic, true),
+            (Material::Acrylic, false)
+        );
+        assert_eq!(
+            material_for_surface(Material::Solid, true),
+            (Material::Solid, false)
+        );
     }
 
     #[test]

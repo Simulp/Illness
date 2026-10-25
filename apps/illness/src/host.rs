@@ -102,6 +102,9 @@ struct Host {
     /// Physical size currently applied to the wgpu surface. Buffered `WM_SIZE`
     /// replays must not resize or repaint an unchanged surface.
     last_surface_size: Option<(u32, u32)>,
+    /// Set by a zero-sized (minimized) resize. The first non-zero restore must
+    /// repaint even when Windows reports the same size as before minimizing.
+    restore_pending: bool,
     first_frame: bool,
 }
 
@@ -127,6 +130,7 @@ impl Host {
             close_requested: false,
             closing: false,
             last_surface_size: None,
+            restore_pending: false,
             first_frame: true,
         }
     }
@@ -185,7 +189,7 @@ impl Host {
             event_loop.exit();
             return;
         }
-        log_gpu(&window, &self.painter);
+        let native_transparency = log_gpu(&window, &self.painter);
 
         // `set_window` configured the surface at the window's current size.
         // Record it so a buffered `WM_SIZE` replay of that same size does not
@@ -221,7 +225,12 @@ impl Host {
             input.pixels_per_point = pixels_per_point;
         });
         let render_state = self.painter.render_state();
-        let app = app::IllnessApp::new(&self.ctx, render_state.as_ref(), window.clone());
+        let app = app::IllnessApp::new(
+            &self.ctx,
+            render_state.as_ref(),
+            window.clone(),
+            native_transparency,
+        );
 
         self.state = Some(state);
         self.window = Some(window);
@@ -394,8 +403,22 @@ impl ApplicationHandler<UserEvent> for Host {
                 // buffered `WM_SIZE` for the current size: resizing and
                 // repainting then would multiply paints during a resize storm.
                 let size = window.inner_size();
+                if size.width == 0 || size.height == 0 {
+                    self.restore_pending = true;
+                    log::debug!(
+                        "surface minimized or hidden: {}x{} (surface {:?})",
+                        size.width,
+                        size.height,
+                        self.last_surface_size
+                    );
+                    return;
+                }
+                // A restore after minimize may report the pre-minimize size.
+                // That still needs one resize/repaint pass: otherwise the
+                // dedupe below would swallow the only restore paint.
+                let restored = std::mem::take(&mut self.restore_pending);
                 let Some((width, height)) =
-                    changed_surface_size(self.last_surface_size, size.width, size.height)
+                    changed_surface_size(self.last_surface_size, restored, size.width, size.height)
                 else {
                     log::debug!(
                         "resize event ignored: {}x{} (surface {:?})",
@@ -406,7 +429,7 @@ impl ApplicationHandler<UserEvent> for Host {
                     return;
                 };
                 log::debug!(
-                    "surface resized {:?} -> {}x{}",
+                    "surface resized {:?} -> {}x{} (restore={restored})",
                     self.last_surface_size,
                     width.get(),
                     height.get()
@@ -553,17 +576,19 @@ fn cancel_close_requested(commands: &[ViewportCommand]) -> bool {
             .any(|command| matches!(command, ViewportCommand::CancelClose))
 }
 
-/// Return the surface size only when a non-zero size differs from the one
-/// already applied. Zero is winit's minimize marker; an equal size is a
-/// buffered `WM_SIZE` replay.
+/// Return the surface size when a non-zero size differs from the one already
+/// applied, or when this is the first restore after a minimize/hide. Zero is
+/// winit's minimize marker; an equal size is a buffered `WM_SIZE` replay
+/// except when `restored` demands one repaint at the unchanged size.
 fn changed_surface_size(
     last: Option<(u32, u32)>,
+    restored: bool,
     width: u32,
     height: u32,
 ) -> Option<(NonZeroU32, NonZeroU32)> {
     let width = NonZeroU32::new(width)?;
     let height = NonZeroU32::new(height)?;
-    (last != Some((width.get(), height.get()))).then_some((width, height))
+    (restored || last != Some((width.get(), height.get()))).then_some((width, height))
 }
 
 fn clear_repaint_deadline(deadline: &Mutex<Option<Instant>>) {
@@ -572,31 +597,46 @@ fn clear_repaint_deadline(deadline: &Mutex<Option<Instant>>) {
     }
 }
 
-/// Log the surface alpha capabilities. `egui-wgpu` prefers `PreMultiplied`
-/// when it is available; this makes the choice visible in the startup log.
-fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) {
+/// Log the surface alpha capabilities and report whether a transparent
+/// backbuffer is available. `egui-wgpu` prefers `PreMultiplied` when it is
+/// available; this makes the choice visible in the startup log.
+fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> bool {
     let Some(render_state) = painter.render_state() else {
-        return;
+        return false;
     };
     let info = render_state.adapter.get_info();
     log::info!("wgpu adapter: {} ({:?})", info.name, info.backend);
 
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = window;
+        // Without the Windows DWM paths, native Mica/Acrylic are unavailable
+        // and the app must stay on an opaque Solid surface.
+        false
+    }
+
     // `Painter` does not expose its chosen alpha mode. A throwaway surface
     // reports the same capabilities, and creating it without configuring it
     // does not attach a DirectComposition visual.
+    #[cfg(target_os = "windows")]
     match render_state.instance.create_surface(Arc::clone(window)) {
         Ok(surface) => {
             let modes = surface.get_capabilities(&render_state.adapter).alpha_modes;
-            let chosen = if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied) {
-                "PreMultiplied"
+            let (chosen, transparent) = if modes.contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+            {
+                ("PreMultiplied", true)
             } else if modes.contains(&wgpu::CompositeAlphaMode::PostMultiplied) {
-                "PostMultiplied"
+                ("PostMultiplied", true)
             } else {
-                "Auto (no transparent mode)"
+                ("Auto (no transparent mode)", false)
             };
             log::info!("surface alpha modes {modes:?}; transparent backbuffer: {chosen}");
+            transparent
         }
-        Err(error) => log::warn!("failed to query surface alpha modes: {error}"),
+        Err(error) => {
+            log::warn!("failed to query surface alpha modes: {error}");
+            false
+        }
     }
 }
 
@@ -619,15 +659,32 @@ mod tests {
     #[test]
     fn surface_size_change_dedupes_replays_and_skips_zero() {
         assert_eq!(
-            changed_surface_size(None, 1180, 760).map(|(w, h)| (w.get(), h.get())),
+            changed_surface_size(None, false, 1180, 760).map(|(w, h)| (w.get(), h.get())),
             Some((1180, 760))
         );
-        assert!(changed_surface_size(Some((1180, 760)), 1180, 760).is_none());
-        assert!(changed_surface_size(Some((1180, 760)), 0, 0).is_none());
-        assert!(changed_surface_size(Some((1180, 760)), 0, 400).is_none());
+        assert!(changed_surface_size(Some((1180, 760)), false, 1180, 760).is_none());
+        assert!(changed_surface_size(Some((1180, 760)), false, 0, 0).is_none());
+        assert!(changed_surface_size(Some((1180, 760)), false, 0, 400).is_none());
         assert_eq!(
-            changed_surface_size(Some((1180, 760)), 800, 600).map(|(w, h)| (w.get(), h.get())),
+            changed_surface_size(Some((1180, 760)), false, 800, 600)
+                .map(|(w, h)| (w.get(), h.get())),
             Some((800, 600))
         );
+    }
+
+    #[test]
+    fn restore_after_minimize_repaints_at_an_unchanged_size() {
+        assert_eq!(
+            changed_surface_size(Some((1180, 760)), true, 1180, 760)
+                .map(|(w, h)| (w.get(), h.get())),
+            Some((1180, 760))
+        );
+        assert_eq!(
+            changed_surface_size(Some((1180, 760)), true, 800, 600)
+                .map(|(w, h)| (w.get(), h.get())),
+            Some((800, 600))
+        );
+        // A zero-size marker is still not applicable.
+        assert!(changed_surface_size(Some((1180, 760)), true, 0, 760).is_none());
     }
 }
