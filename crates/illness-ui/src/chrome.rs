@@ -17,12 +17,15 @@ const TAB_GAP: f32 = 2.0;
 const TAB_SCROLL_STEP: f32 = 72.0;
 const DRAG_THRESHOLD: f32 = 4.0;
 const DOUBLE_CLICK_SECS: f64 = 0.4;
-const PLUS_WIDTH: f32 = 36.0;
+const PLUS_WIDTH: f32 = 32.0;
 const CHEVRON_WIDTH: f32 = 32.0;
 const NEW_TAB_HEIGHT: f32 = 30.0;
 const TAB_CLOSE_SIZE: f32 = 20.0;
-const TAB_CLOSE_GLYPH: f32 = 10.0;
-const PLUS_GLYPH: f32 = 22.0;
+const TAB_CLOSE_GLYPH: f32 = 12.0;
+/// Bolder than the shared 16-grid icon pen (1.5 units) so the tab close X
+/// reads clearly inside its larger hit target.
+const TAB_CLOSE_STROKE: f32 = 1.5;
+const PLUS_GLYPH: f32 = 18.0;
 const CHEVRON_GLYPH: f32 = 22.0;
 /// Gap between the tab strip/plus and the chevron/caption cluster.
 const CONTROL_GAP: f32 = 4.0;
@@ -287,7 +290,6 @@ pub fn show(
                 } else {
                     tokens.text_dim
                 },
-                ppp,
             );
         }
 
@@ -643,8 +645,17 @@ fn chrome_layout(bar: Rect, tokens: &Tokens, tab_count: usize) -> ChromeLayout {
     let captions = caption_rects(bar.right(), bar.top(), caption_width, bar_height);
     let captions_left = captions[0].left();
 
+    let tab_height = if tokens.tabbar_h > 0.0 && tokens.tabbar_h <= bar_height {
+        tokens.tabbar_h
+    } else {
+        bar_height
+    };
+    let tab_y = bar.bottom() - tab_height;
+
+    // The new-tab and chevron controls follow the tab strip's vertical centre
+    // (the same centre as the tab close X), not the taller titlebar's centre.
     let control_height = NEW_TAB_HEIGHT.min(bar_height.max(0.0));
-    let control_top = bar.top() + (bar_height - control_height) / 2.0;
+    let control_top = tab_y + (tab_height - control_height) / 2.0;
     let chevron_left = (captions_left - CAPTION_GAP - CHEVRON_WIDTH).max(bar.left());
     let chevron = Rect::from_min_size(
         Pos2::new(chevron_left, control_top),
@@ -663,12 +674,6 @@ fn chrome_layout(bar: Rect, tokens: &Tokens, tab_count: usize) -> ChromeLayout {
     );
     let tabs_right = (plus.left() - CONTROL_GAP).max(tabs_left);
 
-    let tab_height = if tokens.tabbar_h > 0.0 && tokens.tabbar_h <= bar_height {
-        tokens.tabbar_h
-    } else {
-        bar_height
-    };
-    let tab_y = bar.bottom() - tab_height;
     let tab_viewport = Rect::from_min_max(
         Pos2::new(tabs_left, bar.top()),
         Pos2::new(tabs_right, bar.bottom()),
@@ -750,9 +755,12 @@ fn paint_caption_glyph(
 }
 
 /// Tab close X, deliberately larger than the 16-unit icon grid would make it.
-fn paint_tab_close(painter: &egui::Painter, center: Pos2, color: Color32, ppp: f32) {
+/// Tab close X, deliberately larger and bolder than the shared 16-unit icon
+/// grid. Only this glyph gets the heavier stroke; every other icon keeps its
+/// existing weight.
+fn paint_tab_close(painter: &egui::Painter, center: Pos2, color: Color32) {
     let half = TAB_CLOSE_GLYPH / 2.0;
-    let stroke = Stroke::new(physical_stroke(ppp, 1.0), color);
+    let stroke = Stroke::new(TAB_CLOSE_STROKE, color);
     painter.line_segment(
         [center - Vec2::splat(half), center + Vec2::splat(half)],
         stroke,
@@ -1038,6 +1046,39 @@ mod tests {
     }
 
     #[test]
+    fn tab_close_is_bolder_than_the_shared_icons() {
+        let ctx = egui::Context::default();
+        let center = Pos2::new(24.0, 24.0);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paint_tab_close(ui.painter(), center, Color32::WHITE);
+        });
+        output.textures_delta.clear();
+
+        let mut strokes = Vec::new();
+        let mut bounds: Option<Rect> = None;
+        for clipped in &output.shapes {
+            if let egui::Shape::LineSegment { stroke, .. } = &clipped.shape {
+                strokes.push(stroke.width);
+            }
+            let shape_bounds = clipped.shape.visual_bounding_rect();
+            bounds = Some(bounds.map_or(shape_bounds, |rect| rect.union(shape_bounds)));
+        }
+        assert_eq!(strokes.len(), 2, "the X is two line segments");
+        assert!(
+            strokes
+                .iter()
+                .all(|width| (*width - TAB_CLOSE_STROKE).abs() < 0.001),
+            "tab close alone uses the bolder stroke: {strokes:?}"
+        );
+        let bounds = bounds.expect("tab close painted");
+        assert!(bounds.width() >= TAB_CLOSE_GLYPH);
+        assert!(
+            (bounds.center() - center).length() < 0.01,
+            "X stays centered"
+        );
+    }
+
+    #[test]
     fn caption_hit_targets_and_glyphs_are_windows_standard() {
         let tokens = Tokens::default();
         let rects = caption_rects(1180.0, 0.0, tokens.caption_w, tokens.titlebar_h);
@@ -1064,10 +1105,36 @@ mod tests {
     fn controls_have_larger_hit_rects() {
         let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 40.0));
         let layout = chrome_layout(bar, &Tokens::default(), 2);
-        assert!(layout.plus.width() >= 36.0);
+        assert_eq!(layout.plus.width(), PLUS_WIDTH);
         assert!(layout.chevron.width() >= 32.0);
         assert!(layout.plus.height() >= 28.0);
         assert!(layout.chevron.height() >= 28.0);
+    }
+
+    #[test]
+    fn plus_and_chevron_share_the_tab_close_center() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 3);
+        let tab_center = layout.tab_y + layout.tab_height / 2.0;
+        assert!((layout.plus.center().y - tab_center).abs() < 0.001);
+        assert!((layout.chevron.center().y - tab_center).abs() < 0.001);
+        assert!((layout.plus.width() - 32.0).abs() < f32::EPSILON);
+        assert!((layout.plus.height() - NEW_TAB_HEIGHT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn chrome_metrics_scale_to_100_125_and_150_percent() {
+        let bar = Rect::from_min_size(Pos2::ZERO, Vec2::new(1180.0, 40.0));
+        let layout = chrome_layout(bar, &Tokens::default(), 2);
+        for (ppp, caption_px, close_stroke_px) in [
+            (1.0_f32, 48.0_f32, 1.5_f32),
+            (1.25, 60.0, 1.875),
+            (1.5, 72.0, 2.25),
+        ] {
+            assert!((layout.captions[2].width() * ppp - caption_px).abs() < 0.001);
+            assert!((TAB_CLOSE_STROKE * ppp - close_stroke_px).abs() < 0.001);
+            assert!((layout.plus.center().y - layout.chevron.center().y).abs() < 0.001);
+        }
     }
 
     #[test]

@@ -257,4 +257,26 @@ mod tests {
             assert!(painted > 0, "{icon:?} painted nothing");
         }
     }
+
+    #[test]
+    fn plus_glyph_is_symmetric_about_its_rect() {
+        let ctx = egui::Context::default();
+        let rect = Rect::from_center_size(Pos2::new(80.0, 40.0), Vec2::splat(18.0));
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paint_icon(&ui.painter_at(rect), rect, Icon::Plus, Color32::WHITE);
+        });
+        output.textures_delta.clear();
+
+        let mut bounds: Option<Rect> = None;
+        for clipped in &output.shapes {
+            let shape_bounds = clipped.shape.visual_bounding_rect();
+            bounds = Some(bounds.map_or(shape_bounds, |rect| rect.union(shape_bounds)));
+        }
+        let bounds = bounds.expect("plus painted");
+        assert!(
+            (bounds.center() - rect.center()).length() < 0.01,
+            "plus must be symmetric: {bounds:?} vs {rect:?}"
+        );
+        assert!((bounds.width() - bounds.height()).abs() < 0.01);
+    }
 }
