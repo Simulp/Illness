@@ -3,23 +3,23 @@
 //! The CPU [`crate::soft`] pass keeps base/cell backgrounds and
 //! underline/strike decorations. Selection, search, and cursor fills are solid
 //! quads drawn here, before glyph quads, so they never invalidate the CPU
-//! surface. Glyph quads sample a dedicated atlas of subpixel (RGB coverage) and
+//! surface. Glyph quads sample a dedicated atlas of grayscale coverage and
 //! color (premultiplied RGBA) glyphs.
 //!
-//! Mask glyphs use dual-source blending: the fragment shader emits the
-//! foreground color as the first source and per-channel coverage as the
-//! second, and the pipeline blends with `Src1`/`OneMinusSrc1`. That keeps true
-//! per-channel ClearType fringes on light and selected backgrounds. Color
-//! glyphs (emoji) use premultiplied `One`/`OneMinusSrcAlpha`. Both use nearest
-//! sampling and physical-pixel quad positions, so atlas texels map 1:1 to
-//! screen pixels.
+//! Mask glyphs are one coverage byte per pixel and use ordinary premultiplied
+//! alpha blending: `fg * coverage` over the destination, with coverage folded
+//! into alpha. That has no per-channel blending and therefore no ClearType
+//! fringing, and it composites correctly over translucent Mica/Acrylic
+//! surfaces. Color glyphs (emoji) use premultiplied `One`/`OneMinusSrcAlpha`.
+//! Both use nearest sampling and physical-pixel quad positions, so atlas
+//! texels map 1:1 to screen pixels.
 //!
 //! Vertex data is cached by a content fingerprint and uploaded into a
 //! three-slot grow-only buffer ring; unchanged frames rebuild and upload
 //! nothing. wgpu resources are created lazily in `prepare` on the render
-//! thread. If the device lacks dual-source blending, the atlas overflows, or
-//! shared state is poisoned, [`GpuText::build_frame`] returns `None` and the
-//! caller keeps CPU text for the whole frame.
+//! thread. If the atlas overflows or shared state is poisoned,
+//! [`GpuText::build_frame`] returns `None` and the caller keeps CPU text for
+//! the whole frame.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,7 +49,7 @@ const MIN_VERTEX_BYTES: u64 = 4096;
 const SLOT_COUNT: usize = 3;
 /// Solid quads (selection, search, block cursor) are drawn before glyphs.
 const LAYER_FILLS: usize = 0;
-/// Subpixel mask glyphs.
+/// Grayscale mask glyphs.
 const LAYER_MASK: usize = 1;
 /// Color glyphs (emoji).
 const LAYER_COLOR: usize = 2;
@@ -58,8 +58,6 @@ const LAYER_CURSOR: usize = 3;
 const LAYER_COUNT: usize = 4;
 
 const SHADER: &str = r#"
-enable dual_source_blending;
-
 struct VertexInput {
     @location(0) position: vec2<f32>,
     @location(1) uv: vec2<f32>,
@@ -70,11 +68,6 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) color: vec4<f32>,
-};
-
-struct MaskOutput {
-    @location(0) @blend_src(0) color: vec4<f32>,
-    @location(0) @blend_src(1) coverage: vec4<f32>,
 };
 
 @group(0) @binding(0) var atlas: texture_2d<f32>;
@@ -90,15 +83,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_mask(in: VertexOutput) -> MaskOutput {
-    let coverage = textureSample(atlas, atlas_sampler, in.uv).rgb;
-    var out: MaskOutput;
-    // The material alpha is baked into the vertex alpha. The first source is
-    // the foreground; the second is per-channel coverage consumed by
-    // Src1/OneMinusSrc1.
-    out.color = vec4<f32>(in.color.rgb * in.color.a, in.color.a);
-    out.coverage = vec4<f32>(coverage, 1.0);
-    return out;
+fn fs_mask(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Mask glyphs store one coverage byte replicated across RGB with an opaque
+    // alpha, so premultiplied alpha blending applies the same coverage to
+    // every channel.
+    let coverage = textureSample(atlas, atlas_sampler, in.uv).r;
+    let alpha = in.color.a * coverage;
+    return vec4<f32>(in.color.rgb * alpha, alpha);
 }
 
 @fragment
@@ -258,8 +249,11 @@ impl GlyphCache {
             data.extend_from_slice(bytes);
             data.resize(pixel_count * 4, 0);
         } else {
-            for pixel in glyph.data.as_chunks::<3>().0.iter().take(pixel_count) {
-                data.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            // Mask glyphs are one coverage byte per pixel. Replicate it into
+            // RGB so the shader's `.r` sample and the debug dumps both show
+            // neutral (equal-channel) coverage.
+            for &coverage in glyph.data.iter().take(pixel_count) {
+                data.extend_from_slice(&[coverage, coverage, coverage, 255]);
             }
             data.resize(pixel_count * 4, 0);
         }
@@ -693,15 +687,6 @@ struct State {
 impl GpuText {
     /// Wraps the device that eframe created for the window.
     pub fn new(render_state: &egui_wgpu::RenderState) -> Self {
-        let dual_source = render_state
-            .device
-            .features()
-            .contains(wgpu::Features::DUAL_SOURCE_BLENDING);
-        if !dual_source {
-            log::warn!(
-                "GPU text disabled: the device does not support dual-source blending; using CPU text"
-            );
-        }
         Self {
             target_format: render_state.target_format,
             state: Mutex::new(State {
@@ -711,7 +696,7 @@ impl GpuText {
                 uploaded: None,
                 resources: None,
             }),
-            failed: AtomicBool::new(!dual_source),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -989,20 +974,9 @@ fn upload_vertices(
     }
 }
 
-/// Dual-source mask blending: foreground color times per-channel coverage.
+/// Mask blending: premultiplied `fg * coverage` over the destination.
 fn mask_blend_state() -> wgpu::BlendState {
-    wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::Src1,
-            dst_factor: wgpu::BlendFactor::OneMinusSrc1,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-    }
+    wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
 }
 
 struct Resources {
@@ -1334,16 +1308,60 @@ mod tests {
     }
 
     #[test]
-    fn mask_pipeline_uses_dual_source_channel_coverage() {
+    fn mask_pipeline_uses_grayscale_premultiplied_alpha() {
         let blend = mask_blend_state();
-        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::Src1);
-        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrc1);
-        assert_eq!(blend.alpha.src_factor, wgpu::BlendFactor::One);
-        assert_eq!(blend.alpha.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
-        assert!(SHADER.contains("enable dual_source_blending"));
-        assert!(SHADER.contains("@blend_src(0)"));
-        assert!(SHADER.contains("@blend_src(1)"));
-        assert!(!SHADER.contains("OneMinusSrcColor"));
+        assert_eq!(blend, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
+        assert_eq!(blend.color.src_factor, wgpu::BlendFactor::One);
+        assert_eq!(blend.color.dst_factor, wgpu::BlendFactor::OneMinusSrcAlpha);
+        assert!(SHADER.contains("textureSample(atlas, atlas_sampler, in.uv).r"));
+        assert!(!SHADER.contains("dual_source_blending"));
+        assert!(!SHADER.contains("@blend_src"));
+        assert!(!SHADER.contains("Src1"));
+    }
+
+    /// Mask tiles must hit the atlas as neutral coverage with an opaque alpha:
+    /// equal RGB channels for every texel, so the shader's `.r` sample cannot
+    /// reintroduce chroma fringing.
+    #[test]
+    fn mask_uploads_store_equal_channels() {
+        let ctx = egui::Context::default();
+        let mut atlas = GlyphAtlas::new(&ctx, CASCADIA_MONO, 18.0, 1.0);
+        let mut cache = GlyphCache::new();
+        cache.begin_frame(atlas.metrics(), 1.0);
+        let slot = cache
+            .slot(&mut atlas, 'i', GlyphStyle::Regular)
+            .expect("packed i");
+        assert!(!slot.color);
+        let upload = cache.uploads.last().expect("mask upload");
+        assert_eq!(
+            upload.data.len(),
+            slot.width as usize * slot.height as usize * 4
+        );
+        for pixel in upload.data.as_chunks::<4>().0 {
+            assert_eq!(pixel[1], pixel[0], "mask green differs from red");
+            assert_eq!(pixel[2], pixel[0], "mask blue differs from red");
+            assert_eq!(pixel[3], 255, "mask texel alpha must be opaque");
+        }
+    }
+
+    /// The 1-texel gutter between shelf tiles keeps nearest sampling from
+    /// reading a neighbor when a quad is drawn at a rounded edge.
+    #[test]
+    fn shelf_leaves_a_gutter_between_tiles() {
+        let mut shelf = Shelf::default();
+        let (ax, ay) = shelf.allocate(9, 12).expect("first tile");
+        let (bx, by) = shelf.allocate(7, 12).expect("second tile");
+        assert_eq!(ay, 0);
+        assert_eq!(by, 0);
+        assert!(bx > ax + 9, "tiles at {ax} and {bx} touch");
+
+        let mut rows = Shelf::default();
+        let (_, first_y) = rows.allocate(ATLAS_SIZE - 2, 12).expect("wide tile");
+        let (_, second_y) = rows.allocate(8, 9).expect("wrapped tile");
+        assert!(
+            second_y > first_y + 12,
+            "rows at {first_y} and {second_y} touch"
+        );
     }
 
     #[test]

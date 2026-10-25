@@ -1,14 +1,14 @@
-//! Per-channel software compositor for the terminal grid.
+//! Software compositor for the terminal grid.
 //!
 //! The whole terminal surface (backgrounds, selection, search highlights,
 //! text, decorations, and cursor) is composed at physical-pixel resolution
-//! into one premultiplied RGBA image. Mask glyphs contribute three channels
-//! of linear coverage, so each RGB channel is blended independently: true
-//! ClearType-style subpixel antialiasing instead of a grayscale mesh.
+//! into one premultiplied RGBA image. Mask glyphs contribute one grayscale
+//! coverage byte per pixel, so every channel blends by the same amount and
+//! light-on-dark text has no chroma fringing. Color glyphs (emoji) keep their
+//! own premultiplied RGBA.
 //!
 //! After composition the image is premultiplied by a uniform material alpha
-//! (Mica/Acrylic), which keeps the subpixel fringes intact while letting the
-//! window backdrop show through.
+//! (Mica/Acrylic), which lets the window backdrop show through.
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -59,7 +59,7 @@ pub struct SurfaceSpec<'a> {
 ///
 /// The compositor works in whole physical pixels. Painting its texture at a
 /// fractional physical position would resample it even with `NEAREST`, which
-/// softens hinted ClearType glyphs, so snap the destination before layout and
+/// softens hinted glyphs, so snap the destination before layout and
 /// rendering.
 pub fn snap_rect(rect: Rect, ppp: f32) -> Rect {
     if !ppp.is_finite() || ppp <= 0.0 {
@@ -664,24 +664,20 @@ impl Surface {
         else {
             return;
         };
-        let stride = glyph.width as usize * 3;
+        let stride = glyph.width as usize;
         for pixel_y in y0..y1 {
             let source_row = (pixel_y as i32 - y) as usize * stride;
             let destination_row = pixel_y * self.width * 4;
             for pixel_x in x0..x1 {
-                let source = source_row + (pixel_x as i32 - x) as usize * 3;
-                let coverage = [
-                    u32::from(glyph.data[source]),
-                    u32::from(glyph.data[source + 1]),
-                    u32::from(glyph.data[source + 2]),
-                ];
-                if coverage == [0, 0, 0] {
+                let source = source_row + (pixel_x as i32 - x) as usize;
+                let coverage = u32::from(glyph.data[source]);
+                if coverage == 0 {
                     continue;
                 }
+                let inverse = 255 - coverage;
                 let destination = destination_row + pixel_x * 4;
-                for channel in 0..3 {
-                    let inverse = 255 - coverage[channel];
-                    let blended = (u32::from(fg[channel]) * coverage[channel]
+                for (channel, &fg_channel) in fg.iter().enumerate() {
+                    let blended = (u32::from(fg_channel) * coverage
                         + u32::from(self.rgba[destination + channel]) * inverse
                         + 127)
                         / 255;
@@ -947,6 +943,55 @@ mod tests {
         assert_eq!(design::material_alpha(Material::Solid), 255);
         assert_eq!(design::material_alpha(Material::Mica), 210);
         assert_eq!(design::material_alpha(Material::Acrylic), 185);
+    }
+
+    /// A grayscale mask must move all three channels by the same amount, so a
+    /// white glyph on black never produces chroma fringing.
+    #[test]
+    fn mask_blending_is_channel_neutral() {
+        let mut surface = Surface::new(2, 1, [0, 0, 0]);
+        let glyph = SoftGlyph {
+            width: 2,
+            height: 1,
+            left: 0,
+            top: 0,
+            data: vec![255, 128],
+            color: false,
+        };
+        surface.blend_mask(0, 0, &glyph, [255, 255, 255]);
+        assert_eq!(surface.rgba[0..3], [255, 255, 255]);
+        for channel in 0..3 {
+            assert_eq!(
+                surface.rgba[4 + channel],
+                128,
+                "channel {channel} blended differently"
+            );
+        }
+    }
+
+    /// Drawing a glyph partly off-surface must clip, never read or write out of
+    /// bounds. The one visible pixel receives its correct coverage.
+    #[test]
+    fn mask_blending_clips_offscreen_edges() {
+        let mut surface = Surface::new(2, 2, [0, 0, 0]);
+        let glyph = SoftGlyph {
+            width: 2,
+            height: 2,
+            left: -1,
+            top: -1,
+            data: vec![10, 20, 30, 255],
+            color: false,
+        };
+        surface.blend_mask(-1, -1, &glyph, [255, 255, 255]);
+        assert_eq!(surface.rgba[0..3], [255, 255, 255]);
+        for pixel in 1..4 {
+            let i = pixel * 4;
+            assert_eq!(
+                (surface.rgba[i], surface.rgba[i + 1], surface.rgba[i + 2]),
+                (0, 0, 0),
+                "pixel {pixel} must stay untouched"
+            );
+        }
     }
 
     #[test]

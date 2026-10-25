@@ -8,7 +8,8 @@ Alacritty's UI is a war crime.
 Illness keeps the parts of Alacritty that are actually good - the parser, grid, scrollback,
 selection and ConPTY - and replaces the window you have to look at with a clean, dark, tabbed
 shell inspired by Windows Terminal. It renders terminal text through its own physical-pixel
-glyph atlas: hinted, pixel-snapped, nearest-sampled, with ClearType-style subpixel fringing.
+glyph atlas: hinted, pixel-snapped, nearest-sampled, with neutral grayscale
+antialiasing (no ClearType color fringing).
 
 ![Illness](assets/screenshot.png)
 
@@ -32,8 +33,8 @@ glyph atlas: hinted, pixel-snapped, nearest-sampled, with ClearType-style subpix
 - 10,000 lines of scrollback, smooth wheel scrolling, word/line selection and a jump-to-bottom pill.
 - A session that ends stays readable; Restart is one click away.
 - Pixel-snapped, hinted glyphs on a nearest-sampled physical-pixel atlas. Glyphs are drawn on
-  the GPU from a subpixel atlas, while backgrounds, selection, search hits and the cursor stay
-  pixel-exact; the CPU ClearType compositor remains as a fallback.
+  the GPU from a grayscale mask atlas (plus color emoji), while backgrounds, selection, search
+  hits and the cursor stay pixel-exact; the CPU grayscale compositor remains as a fallback.
 
 ## Dosage
 

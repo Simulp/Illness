@@ -5,9 +5,7 @@ mod backdrop;
 mod platform;
 
 use eframe::egui;
-use eframe::egui_wgpu::{WgpuConfiguration, WgpuSetup};
-use eframe::wgpu;
-use std::sync::Arc;
+use eframe::egui_wgpu::WgpuConfiguration;
 
 /// Initialise stderr logging in debug builds and a file log in release builds,
 /// where no console exists. Logging failures must never block startup.
@@ -134,25 +132,10 @@ fn run() -> eframe::Result<()> {
         viewport = viewport.with_icon(icon);
     }
 
-    // Terminal mask glyphs need dual-source blending for true per-channel
-    // ClearType coverage. Request it when the adapter offers it; the GPU text
-    // compositor checks the resulting device feature and falls back to CPU
-    // text otherwise.
-    let mut wgpu_options = WgpuConfiguration::default()
+    // Low-latency surface; terminal glyph masks are grayscale and need no
+    // optional device features.
+    let wgpu_options = WgpuConfiguration::default()
         .with_surface_config(eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY);
-    if let WgpuSetup::CreateNew(setup) = &mut wgpu_options.wgpu_setup {
-        let base = Arc::clone(&setup.device_descriptor);
-        setup.device_descriptor = Arc::new(move |adapter| {
-            let mut descriptor = base(adapter);
-            if adapter
-                .features()
-                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
-            {
-                descriptor.required_features |= wgpu::Features::DUAL_SOURCE_BLENDING;
-            }
-            descriptor
-        });
-    }
 
     let options = eframe::NativeOptions {
         viewport,
