@@ -26,6 +26,124 @@ const DWMWA_USE_IMMERSIVE_DARK_MODE_OLD: u32 = 19;
 #[cfg(target_os = "windows")]
 const DWMWCP_ROUND: i32 = 2;
 
+/// Read WSL distributions from the per-user registry.
+///
+/// This never executes `wsl.exe`: on a machine without WSL that command can
+/// open the Microsoft Store installer or a console window. An absent `Lxss`
+/// key means there is nothing to offer.
+///
+/// # Safety
+///
+/// The registry key handle is opened and closed in this function. Every buffer
+/// passed to Win32 is stack-owned, correctly sized in WCHARs, and its length is
+/// passed in the units the API documents.
+#[cfg(target_os = "windows")]
+pub fn wsl_profiles() -> Vec<illness_core::Profile> {
+    use std::path::PathBuf;
+    use windows_sys::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ, RegCloseKey, RegEnumKeyExW, RegGetValueW,
+        RegOpenKeyExW,
+    };
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    let key_path = wide(r"Software\Microsoft\Windows\CurrentVersion\Lxss");
+    let value_name = wide("DistributionName");
+    let mut key: HKEY = std::ptr::null_mut();
+
+    // Safety: key_path is null-terminated, key is a valid out-pointer, and the
+    // handle is closed below before returning.
+    let opened =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, key_path.as_ptr(), 0, KEY_READ, &mut key) };
+    if opened != ERROR_SUCCESS {
+        return Vec::new();
+    }
+
+    let Some(wsl) = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| root.join("System32").join("wsl.exe"))
+        .filter(|path| path.is_file())
+    else {
+        // Safety: key was opened successfully above.
+        unsafe { RegCloseKey(key) };
+        return Vec::new();
+    };
+    let wsl = wsl.to_string_lossy().into_owned();
+    let mut profiles = Vec::new();
+    let mut index = 0;
+
+    loop {
+        let mut name = [0u16; 256];
+        let mut name_len = (name.len() - 1) as u32;
+        // Safety: name is a 256-WCHAR stack buffer, name_len carries its
+        // capacity in WCHARs, and all optional out-parameters are null.
+        let status = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut name_len,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if status == ERROR_NO_MORE_ITEMS {
+            break;
+        }
+        if status != ERROR_SUCCESS {
+            break;
+        }
+        index += 1;
+
+        let mut data = [0u16; 256];
+        let mut data_len = u32::try_from(data.len() * 2).unwrap_or(u32::MAX);
+        // Safety: name is a null-terminated subkey name from the same key,
+        // data is a stack buffer, and data_len is its size in bytes.
+        let status = unsafe {
+            RegGetValueW(
+                key,
+                name.as_ptr(),
+                value_name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                data.as_mut_ptr().cast(),
+                &mut data_len,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            continue;
+        }
+
+        let chars = usize::try_from(data_len / 2)
+            .unwrap_or(0)
+            .saturating_sub(1)
+            .min(data.len());
+        let distro = String::from_utf16_lossy(&data[..chars]);
+        if distro.is_empty()
+            || profiles
+                .iter()
+                .any(|profile: &illness_core::Profile| profile.name == format!("WSL: {distro}"))
+        {
+            continue;
+        }
+        profiles.push(illness_core::Profile {
+            name: format!("WSL: {distro}"),
+            program: wsl.clone(),
+            args: vec!["-d".to_string(), distro],
+            accent: illness_core::Rgb::new(0xe9, 0x54, 0x20),
+        });
+    }
+
+    // Safety: key was opened successfully above and is not used afterwards.
+    unsafe { RegCloseKey(key) };
+    profiles
+}
+
 /// Apply the requested backdrop to `window`.
 ///
 /// Mica failing on Windows 10 is expected; the caller falls back to [`Material::Solid`] and

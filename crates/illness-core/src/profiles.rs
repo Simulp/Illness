@@ -26,7 +26,8 @@ impl Default for Profile {
 
 /// Detect installed shells without executing anything.
 ///
-/// Order is preference order: PowerShell 7, Windows PowerShell, Command Prompt, WSL.
+/// Order is preference order: PowerShell 7, Windows PowerShell, Command Prompt.
+/// WSL distros are discovered by the Windows host from the registry, not here.
 pub fn detect_profiles() -> Vec<Profile> {
     let mut profiles = Vec::new();
 
@@ -77,27 +78,6 @@ pub fn detect_profiles() -> Vec<Profile> {
         },
     );
 
-    if let Some(wsl) = find_on_path("wsl.exe") {
-        let has_distro = std::process::Command::new(&wsl)
-            .args(["--list", "--quiet"])
-            .output()
-            .is_ok_and(|output| {
-                output.status.success()
-                    && !String::from_utf8_lossy(&output.stdout).trim().is_empty()
-            });
-        if has_distro {
-            push_unique(
-                &mut profiles,
-                Profile {
-                    name: "WSL".to_string(),
-                    program: path_string(&wsl),
-                    args: Vec::new(),
-                    accent: Rgb::new(0xe9, 0x54, 0x20),
-                },
-            );
-        }
-    }
-
     profiles
 }
 
@@ -130,13 +110,6 @@ fn command_prompt_program() -> String {
     }
 
     "cmd.exe".to_string()
-}
-
-fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|directory| directory.join(program))
-        .find(|candidate| candidate.is_file())
 }
 
 fn path_string(path: &Path) -> String {
@@ -179,7 +152,7 @@ mod tests {
 
     #[test]
     fn profile_names_are_known() {
-        let known = ["PowerShell", "Windows PowerShell", "Command Prompt", "WSL"];
+        let known = ["PowerShell", "Windows PowerShell", "Command Prompt"];
         for profile in detect_profiles() {
             assert!(
                 known.contains(&profile.name.as_str()),

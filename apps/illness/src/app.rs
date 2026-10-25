@@ -70,6 +70,8 @@ impl IllnessApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut config = Config::load();
         config.profiles = detect_profiles();
+        #[cfg(target_os = "windows")]
+        config.profiles.extend(platform::wsl_profiles());
         if !config
             .profiles
             .iter()
