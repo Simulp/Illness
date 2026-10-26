@@ -1,9 +1,14 @@
 Illness
-Copyright (c) 2026
+Copyright (c) 2026 Simulp
 
 This product includes software developed by the Alacritty project
 (https://github.com/alacritty/alacritty), licensed under the Apache License 2.0.
 The terminal emulation core is the `alacritty_terminal` crate, version 0.26.0.
+
+Portions of the ConPTY host handling, window material handling and terminal input
+encoding are derived from Windows Terminal
+(https://github.com/microsoft/terminal), Copyright (c) Microsoft Corporation,
+licensed under the MIT License.
 
 This product includes software developed by the egui project
 (https://github.com/emilk/egui), licensed under MIT OR Apache-2.0.
@@ -14,3 +19,7 @@ See assets/fonts/LICENSE-Cascadia.txt.
 
 This product bundles Inter (https://github.com/rsms/inter), Copyright (c) Rasmus Andersson,
 licensed under the SIL Open Font License 1.1. See assets/fonts/LICENSE-Inter.txt.
+
+Every Rust dependency, its license and its license text are listed in
+THIRD-PARTY-LICENSES.md. Regenerate that file after dependency changes with
+scripts/generate-third-party-licenses.ps1.

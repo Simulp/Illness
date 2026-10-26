@@ -2814,7 +2814,7 @@ mod tests {
     #[test]
     fn shortcut_launch_uses_the_user_profile_not_the_executable_folder() {
         let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
-        let home = PathBuf::from(r"C:\Users\Simulp");
+        let home = PathBuf::from(r"C:\Users\me");
 
         let picked = pick_startup_dir(
             Some(Path::new(r"C:\Program Files\Illness")),
@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn console_launch_folder_is_kept() {
         let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
-        let home = PathBuf::from(r"C:\Users\Simulp");
+        let home = PathBuf::from(r"C:\Users\me");
         let console = PathBuf::from(r"C:\work\project");
 
         let picked = pick_startup_dir(Some(&console), Some(exe), Some(&home));
@@ -2851,7 +2851,7 @@ mod tests {
     #[test]
     fn a_missing_process_directory_still_prefers_the_profile() {
         let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
-        let home = PathBuf::from(r"C:\Users\Simulp");
+        let home = PathBuf::from(r"C:\Users\me");
 
         assert_eq!(
             pick_startup_dir(None, Some(exe), Some(&home)).as_deref(),
@@ -3552,8 +3552,8 @@ mod tests {
         assert_eq!(plausible_process_path(r"garbage"), None);
         assert_eq!(plausible_process_path("C:\\bad\ttab"), None);
         assert_eq!(
-            plausible_process_path(r"\??\C:\Users\Simulp\folder"),
-            Some(PathBuf::from(r"C:\Users\Simulp\folder"))
+            plausible_process_path(r"\??\C:\Users\me\folder"),
+            Some(PathBuf::from(r"C:\Users\me\folder"))
         );
         assert_eq!(
             plausible_process_path(r"\??\UNC\server\share"),

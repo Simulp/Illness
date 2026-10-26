@@ -5,8 +5,8 @@
 # or run apps/illness/build-installer.ps1 from anywhere.
 #
 # Keep `version` in sync with [workspace.package] in the root Cargo.toml.
-# The app embeds its fonts and window icon, so no runtime resources are
-# packaged; user settings live in %APPDATA%\illness.
+# The app embeds its fonts and window icon, so the only packaged resources are
+# the license and attribution files below; user settings live in %APPDATA%\illness.
 
 name = "illness"
 product-name = "Illness"
@@ -17,6 +17,10 @@ description = "A Windows-first terminal emulator built on Alacritty's VT core an
 copyright = "Copyright (c) 2026 Simulp"
 license-file = "installer-license.txt"
 formats = ["nsis"]
+
+# License and attribution files installed next to the executable. Apache-2.0,
+# MIT, MPL-2.0 and BSL-1.0 all require the text to travel with the binary.
+resources = { "../../LICENSE-APACHE" = "LICENSE-APACHE", "../../LICENSE-MIT" = "LICENSE-MIT", "../../NOTICE" = "NOTICE", "../../THIRD-PARTY-LICENSES.md" = "THIRD-PARTY-LICENSES.md" }
 
 # cargo builds into the workspace target directory; installers go to dist/.
 out-dir = "../../dist"

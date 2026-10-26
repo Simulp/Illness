@@ -4274,7 +4274,15 @@ fn pressed_shortcuts(events: &[Event]) -> Vec<Shortcut> {
 ///
 /// Plain Ctrl+C is intentionally absent: the terminal owns it (interrupt), so it
 /// must always reach the shell even when a mouse selection is lingering.
+///
+/// `Ctrl+Insert` and `Shift+Insert` are the legacy Windows console aliases for
+/// copy and paste. `Shift+Insert` carries no Ctrl, so it is handled before the
+/// Ctrl requirement below.
 fn shortcut_for(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
+    if key == Key::Insert && modifiers.shift_only() {
+        return Some(Shortcut::Paste);
+    }
+
     let ctrl = modifiers.ctrl || modifiers.command;
     if !ctrl || modifiers.alt {
         return None;
@@ -4288,6 +4296,7 @@ fn shortcut_for(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
         Key::F if shift => Some(Shortcut::Search),
         Key::C if shift => Some(Shortcut::Copy),
         Key::V if shift => Some(Shortcut::Paste),
+        Key::Insert if !shift => Some(Shortcut::Copy),
         Key::Tab if shift => Some(Shortcut::PrevTab),
         Key::Tab => Some(Shortcut::NextTab),
         Key::Comma if !shift => Some(Shortcut::Settings),
@@ -4325,6 +4334,13 @@ mod tests {
         Modifiers {
             shift: true,
             ..ctrl()
+        }
+    }
+
+    fn shift() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
         }
     }
 
@@ -4566,6 +4582,12 @@ mod tests {
         assert_eq!(shortcut_for(Key::Num0, ctrl()), Some(Shortcut::ZoomReset));
         assert_eq!(shortcut_for(Key::C, ctrl_shift()), Some(Shortcut::Copy));
         assert_eq!(shortcut_for(Key::V, ctrl_shift()), Some(Shortcut::Paste));
+        // Legacy Windows console aliases: Ctrl+Insert copies, Shift+Insert
+        // pastes, and Shift+Insert needs no Ctrl.
+        assert_eq!(shortcut_for(Key::Insert, ctrl()), Some(Shortcut::Copy));
+        assert_eq!(shortcut_for(Key::Insert, shift()), Some(Shortcut::Paste));
+        assert_eq!(shortcut_for(Key::Insert, Modifiers::default()), None);
+        assert_eq!(shortcut_for(Key::Insert, ctrl_shift()), None);
     }
 
     #[test]

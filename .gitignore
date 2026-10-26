@@ -9,6 +9,7 @@
 Thumbs.db
 .idea/
 *.swp
+*.kate-swp
 
 # cargo-packager output
 /dist
