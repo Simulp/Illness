@@ -775,6 +775,11 @@ pub fn show(
                         {
                             chosen = Some(Action::OpenPalette);
                         }
+                        if menu_item(ui, tokens, "Find", Icon::Search, Some("Ctrl+Shift+F"))
+                            .clicked()
+                        {
+                            chosen = Some(Action::OpenSearch);
+                        }
                         chosen
                     });
 

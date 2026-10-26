@@ -2653,7 +2653,13 @@ impl IllnessApp {
             }
             Action::OpenSearch => {
                 self.chrome.dropdown_open = false;
-                self.overlays.kind = OverlayKind::Search;
+                // The Find chord is gated by `settings_active`; the menu item
+                // bypasses that gate, so apply the same rule here. Searching a
+                // non-terminal tab would show 0/0 and steal focus from its
+                // inputs.
+                if self.active_terminal().is_some() {
+                    self.overlays.kind = OverlayKind::Search;
+                }
             }
             Action::OpenSettings => {
                 self.open_settings();
@@ -2880,36 +2886,15 @@ impl IllnessApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) -> bool {
-        let candidates: Vec<(Key, Modifiers)> = ctx.input(|input| {
-            input
-                .events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Key {
-                        key,
-                        pressed: true,
-                        modifiers,
-                        ..
-                    } => Some((*key, *modifiers)),
-                    _ => None,
-                })
-                .collect()
-        });
-        // Only the unshifted Ctrl+C shortcut depends on selection, so avoid
-        // copying the selection string on every frame for every other key.
-        let needs_selection = candidates.iter().any(|(key, modifiers)| {
-            *key == Key::C && !modifiers.shift && (modifiers.ctrl || modifiers.command)
-        });
-        let has_selection = needs_selection && self.selection_text().is_some();
-
-        let mut shortcuts: Vec<Shortcut> = candidates
-            .iter()
-            .filter_map(|(key, modifiers)| shortcut_for(*key, *modifiers, has_selection))
-            .collect();
+        // Repeats are ignored so holding a chord cannot fire it once per OS
+        // key-repeat (for example spawning or closing a tab ~30 times a second).
+        let shortcuts = ctx.input(|input| pressed_shortcuts(&input.events));
         if shortcuts.is_empty() {
             return false;
         }
 
+        // Consume every matching press, repeats included: a held shortcut must
+        // not fall through and reach the shell as a control key.
         ctx.input_mut(|input| {
             input.events.retain(|event| match event {
                 Event::Key {
@@ -2917,12 +2902,12 @@ impl IllnessApp {
                     pressed: true,
                     modifiers,
                     ..
-                } => shortcut_for(*key, *modifiers, has_selection).is_none(),
+                } => shortcut_for(*key, *modifiers).is_none(),
                 _ => true,
             });
         });
 
-        for shortcut in shortcuts.drain(..) {
+        for shortcut in shortcuts {
             self.execute_shortcut(shortcut);
         }
         true
@@ -3067,12 +3052,19 @@ impl IllnessApp {
             surface_material,
         );
 
-        let overlay_open = !matches!(self.overlays.kind, OverlayKind::None);
+        // The profile dropdown is mouse-driven chrome, not an egui overlay, so
+        // it must join the gate explicitly: shortcuts must not fire behind it.
+        let overlay_kind_open = !matches!(self.overlays.kind, OverlayKind::None);
+        let overlay_open = chrome_owns_keyboard(overlay_kind_open, self.chrome.dropdown_open);
         let settings_active = matches!(self.tabs.get(self.active), Some(TabEntry::Settings));
-        let keyboard_input = ctx.egui_wants_keyboard_input();
+        // Shortcuts yield to real text entry only. `egui_wants_keyboard_input()`
+        // is true whenever *any* widget holds focus — including the terminal
+        // grid, which focuses itself on click — so it would disable every
+        // shortcut for the rest of the session. See `shortcuts_allowed`.
+        let text_edit_focused = ctx.text_edit_focused();
         route_clipboard_to_text_fields(&ctx);
         let mut shortcut_used = false;
-        if shortcuts_allowed(overlay_open, settings_active, keyboard_input) {
+        if shortcuts_gate(&ctx, overlay_open, settings_active) {
             shortcut_used = self.handle_shortcuts(&ctx);
             self.handle_zoom_wheel(&ctx);
         }
@@ -3081,17 +3073,18 @@ impl IllnessApp {
         // to the PTY here, before this frame builds a snapshot or composites
         // anything, so a keystroke never waits on paint work. Because the grid
         // panel below reads the same frame's events, they must not be encoded
-        // a second time per frame; `TerminalView::show` must not encode input.
-        // The gate is `terminal_input_allowed`, which ignores egui focus: the
-        // grid requests focus when clicked, so focus is not "someone else owns
-        // the keyboard" here.
+        // a second time per frame; `TerminalView::show` must not encode input
+        // again.
+        // The gate is `terminal_input_allowed`, which blocks only a real text
+        // edit: the grid requests focus when clicked, so widget focus is not
+        // "someone else owns the keyboard" here.
         if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active)
             && let Some(session) = &tab.session
             && terminal_input_allowed(
                 overlay_open,
                 shortcut_used,
                 session.is_exited(),
-                keyboard_input,
+                text_edit_focused,
             )
         {
             // Idle frames (no key/text/IME/paste event) must not clone the
@@ -4107,44 +4100,60 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
 
 /// Gate for global shortcuts only. **Never** gate terminal bytes on this.
 ///
-/// `keyboard_input` is `Context::egui_wants_keyboard_input()`, which egui
-/// implements as "some widget holds keyboard focus" — not "a text field is
-/// focused". Shortcuts must yield to any focused widget (a text field, a
-/// slider, the search box), so that is the right question here.
+/// `text_edit_focused` is `Context::text_edit_focused()`, which egui
+/// implements as "the focused widget is an actual `TextEdit`". Shortcuts must
+/// yield to real typing (the search field, the palette query, Settings inputs)
+/// so that is the right question here.
 ///
-/// It is the wrong question for terminal input: `TerminalView::show` calls
-/// `request_focus()` on the grid as soon as the user clicks it, so this gate
-/// stays closed forever and every later keystroke is dropped. Terminal bytes
-/// therefore use [`terminal_input_allowed`], which ignores focus on purpose.
-/// The two gates are intentionally separate; do not merge them.
-fn shortcuts_allowed(overlay_open: bool, settings_active: bool, keyboard_input: bool) -> bool {
-    !overlay_open && !settings_active && !keyboard_input
+/// Do **not** substitute `Context::egui_wants_keyboard_input()`: it is true for
+/// any focused widget. `TerminalView::show` calls `request_focus()` on the grid
+/// as soon as the user clicks it, and egui keeps that focus across frames, so
+/// that signal would leave this gate closed for the rest of the session and
+/// kill every shortcut (Ctrl+Shift+T/W/P, Ctrl+, and Ctrl+Shift+F).
+///
+/// Terminal bytes use [`terminal_input_allowed`], which blocks only real text
+/// entry. The two gates are intentionally separate; do not merge them.
+fn shortcuts_allowed(overlay_open: bool, settings_active: bool, text_edit_focused: bool) -> bool {
+    !overlay_open && !settings_active && !text_edit_focused
+}
+
+/// Whether chrome currently owns the keyboard: an egui overlay or the profile
+/// dropdown. The dropdown is not an `OverlayKind`, so it needs this explicit
+/// union; keeping it pure lets the gate test pin that without an app instance.
+fn chrome_owns_keyboard(overlay_open: bool, dropdown_open: bool) -> bool {
+    overlay_open || dropdown_open
+}
+
+/// Runtime form of [`shortcuts_allowed`], shared by `ui()` and the focus tests.
+///
+/// Reading `Context::text_edit_focused()` here is deliberate: it keeps every
+/// caller on the narrow "an actual `TextEdit` owns the keyboard" signal. A
+/// call-site substitution with `egui_wants_keyboard_input()` would make the
+/// focus tests fail instead of silently disabling shortcuts after the first
+/// grid click.
+fn shortcuts_gate(ctx: &egui::Context, overlay_open: bool, settings_active: bool) -> bool {
+    shortcuts_allowed(overlay_open, settings_active, ctx.text_edit_focused())
 }
 
 /// Gate for writing encoded bytes to the active shell's PTY.
 ///
-/// Deliberately focus-blind: no `egui_wants_keyboard_input()` here. Clicking the
-/// grid focuses it (see [`shortcuts_allowed`]), and the grid *is* the terminal,
-/// so focus on it must never suppress input. Only an open overlay, a shortcut
-/// that already consumed this frame's key, or a dead PTY block the bytes.
+/// Blocks only an open overlay/menu, a shortcut that already consumed this
+/// frame's key, a dead PTY, or a genuinely focused `TextEdit`. Widget focus
+/// alone must not block: `TerminalView::show` focuses the grid when clicked and
+/// the grid *is* the terminal. That is why this takes `text_edit_focused`
+/// rather than `egui_wants_keyboard_input()`; the latter is true for any focused
+/// widget and would silence the shell after the first click.
 ///
 /// `settings_active` is not a parameter because a Settings tab and a terminal
 /// tab cannot occupy the active tab at the same time; Settings never reaches
 /// this gate.
-///
-/// `keyboard_input` is accepted and deliberately ignored. Passing the frame's
-/// `egui_wants_keyboard_input()` keeps this gate's call site identical in shape
-/// to [`shortcuts_allowed`], so the focus state cannot silently reappear in the
-/// comparison; `clicking_the_grid_does_not_block_terminal_input` fails if it
-/// does.
 fn terminal_input_allowed(
     overlay_open: bool,
     shortcut_used: bool,
     exited: bool,
-    keyboard_input: bool,
+    text_edit_focused: bool,
 ) -> bool {
-    let _ = keyboard_input;
-    !overlay_open && !shortcut_used && !exited
+    !overlay_open && !shortcut_used && !exited && !text_edit_focused
 }
 
 /// Whether an event carries bytes for the active shell.
@@ -4239,9 +4248,33 @@ enum Shortcut {
     Paste,
 }
 
+/// Shortcuts to execute for this frame's events.
+///
+/// Key repeats are skipped so holding a chord performs its action once. The
+/// repeat events are still consumed by `handle_shortcuts` and never reach the
+/// shell as text or control keys.
+fn pressed_shortcuts(events: &[Event]) -> Vec<Shortcut> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Key {
+                key,
+                pressed: true,
+                repeat: false,
+                modifiers,
+                ..
+            } => shortcut_for(*key, *modifiers),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Map a key press to an app shortcut. Exact modifier matching keeps Ctrl+Shift
 /// shortcuts from being swallowed by their Ctrl-only relatives.
-fn shortcut_for(key: Key, modifiers: Modifiers, has_selection: bool) -> Option<Shortcut> {
+///
+/// Plain Ctrl+C is intentionally absent: the terminal owns it (interrupt), so it
+/// must always reach the shell even when a mouse selection is lingering.
+fn shortcut_for(key: Key, modifiers: Modifiers) -> Option<Shortcut> {
     let ctrl = modifiers.ctrl || modifiers.command;
     if !ctrl || modifiers.alt {
         return None;
@@ -4257,7 +4290,6 @@ fn shortcut_for(key: Key, modifiers: Modifiers, has_selection: bool) -> Option<S
         Key::V if shift => Some(Shortcut::Paste),
         Key::Tab if shift => Some(Shortcut::PrevTab),
         Key::Tab => Some(Shortcut::NextTab),
-        Key::C if !shift && has_selection => Some(Shortcut::Copy),
         Key::Comma if !shift => Some(Shortcut::Settings),
         Key::Equals | Key::Plus => Some(Shortcut::ZoomIn),
         Key::Minus => Some(Shortcut::ZoomOut),
@@ -4496,84 +4528,80 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_table_matches_the_spec() {
-        assert_eq!(
-            shortcut_for(Key::T, ctrl_shift(), false),
-            Some(Shortcut::NewTab)
-        );
-        assert_eq!(
-            shortcut_for(Key::W, ctrl_shift(), false),
-            Some(Shortcut::CloseTab)
-        );
-        assert_eq!(
-            shortcut_for(Key::Tab, ctrl(), false),
-            Some(Shortcut::NextTab)
-        );
-        assert_eq!(
-            shortcut_for(Key::Tab, ctrl_shift(), false),
-            Some(Shortcut::PrevTab)
-        );
-        assert_eq!(
-            shortcut_for(Key::Num1, ctrl(), false),
-            Some(Shortcut::SelectTab(0))
-        );
-        assert_eq!(
-            shortcut_for(Key::Num9, ctrl(), false),
-            Some(Shortcut::SelectTab(8))
-        );
-        assert_eq!(
-            shortcut_for(Key::P, ctrl_shift(), false),
-            Some(Shortcut::Palette)
-        );
-        assert_eq!(
-            shortcut_for(Key::F, ctrl_shift(), false),
-            Some(Shortcut::Search)
-        );
-        assert_eq!(
-            shortcut_for(Key::Comma, ctrl(), false),
-            Some(Shortcut::Settings)
-        );
-        assert_eq!(
-            shortcut_for(Key::Equals, ctrl(), false),
-            Some(Shortcut::ZoomIn)
-        );
-        assert_eq!(
-            shortcut_for(Key::Plus, ctrl_shift(), false),
-            Some(Shortcut::ZoomIn)
-        );
-        assert_eq!(
-            shortcut_for(Key::Minus, ctrl(), false),
-            Some(Shortcut::ZoomOut)
-        );
-        assert_eq!(
-            shortcut_for(Key::Num0, ctrl(), false),
-            Some(Shortcut::ZoomReset)
-        );
-        assert_eq!(
-            shortcut_for(Key::C, ctrl_shift(), false),
-            Some(Shortcut::Copy)
-        );
-        assert_eq!(
-            shortcut_for(Key::V, ctrl_shift(), false),
-            Some(Shortcut::Paste)
+    fn an_open_dropdown_is_part_of_the_shortcut_gate() {
+        assert!(!chrome_owns_keyboard(false, false));
+        assert!(chrome_owns_keyboard(true, false));
+        assert!(
+            chrome_owns_keyboard(false, true),
+            "the profile dropdown must block shortcuts like an overlay"
         );
     }
 
     #[test]
-    fn ctrl_c_is_only_a_shortcut_when_text_is_selected() {
-        assert_eq!(shortcut_for(Key::C, ctrl(), false), None);
-        assert_eq!(shortcut_for(Key::C, ctrl(), true), Some(Shortcut::Copy));
-        assert_eq!(shortcut_for(Key::T, ctrl(), false), None);
+    fn shortcut_table_matches_the_spec() {
+        assert_eq!(shortcut_for(Key::T, ctrl_shift()), Some(Shortcut::NewTab));
+        assert_eq!(shortcut_for(Key::W, ctrl_shift()), Some(Shortcut::CloseTab));
+        assert_eq!(shortcut_for(Key::Tab, ctrl()), Some(Shortcut::NextTab));
+        assert_eq!(
+            shortcut_for(Key::Tab, ctrl_shift()),
+            Some(Shortcut::PrevTab)
+        );
+        assert_eq!(
+            shortcut_for(Key::Num1, ctrl()),
+            Some(Shortcut::SelectTab(0))
+        );
+        assert_eq!(
+            shortcut_for(Key::Num9, ctrl()),
+            Some(Shortcut::SelectTab(8))
+        );
+        assert_eq!(shortcut_for(Key::P, ctrl_shift()), Some(Shortcut::Palette));
+        assert_eq!(shortcut_for(Key::F, ctrl_shift()), Some(Shortcut::Search));
+        assert_eq!(shortcut_for(Key::Comma, ctrl()), Some(Shortcut::Settings));
+        assert_eq!(shortcut_for(Key::Equals, ctrl()), Some(Shortcut::ZoomIn));
+        assert_eq!(
+            shortcut_for(Key::Plus, ctrl_shift()),
+            Some(Shortcut::ZoomIn)
+        );
+        assert_eq!(shortcut_for(Key::Minus, ctrl()), Some(Shortcut::ZoomOut));
+        assert_eq!(shortcut_for(Key::Num0, ctrl()), Some(Shortcut::ZoomReset));
+        assert_eq!(shortcut_for(Key::C, ctrl_shift()), Some(Shortcut::Copy));
+        assert_eq!(shortcut_for(Key::V, ctrl_shift()), Some(Shortcut::Paste));
+    }
+
+    #[test]
+    fn ctrl_c_always_reaches_the_shell() {
+        // Even with a lingering mouse selection, Ctrl+C is the terminal's
+        // interrupt, not a copy. Ctrl+Shift+C remains the copy chord.
+        assert_eq!(shortcut_for(Key::C, ctrl()), None);
+        assert_eq!(shortcut_for(Key::C, ctrl_shift()), Some(Shortcut::Copy));
+        assert_eq!(shortcut_for(Key::T, ctrl()), None);
         assert_eq!(
             shortcut_for(
                 Key::T,
                 Modifiers {
                     alt: true,
                     ..ctrl_shift()
-                },
-                false
+                }
             ),
             None
+        );
+    }
+
+    #[test]
+    fn held_shortcuts_execute_once() {
+        let key = |repeat| Event::Key {
+            key: Key::T,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers: ctrl_shift(),
+        };
+        let events = [key(false), key(true)];
+
+        assert_eq!(
+            pressed_shortcuts(&events),
+            vec![Shortcut::NewTab],
+            "only the initial press executes; the repeat is ignored"
         );
     }
 
@@ -5521,13 +5549,18 @@ mod tests {
             !terminal_input_allowed(false, false, true, false),
             "exited shell has no PTY"
         );
-        assert!(!terminal_input_allowed(true, true, true, false));
+        assert!(
+            !terminal_input_allowed(false, false, false, true),
+            "a real text edit owns the keyboard"
+        );
+        assert!(!terminal_input_allowed(true, true, true, true));
     }
 
-    /// Regression: the grid takes egui focus when clicked, and terminal input
-    /// used to be gated on `egui_wants_keyboard_input()`, so one click in the
-    /// terminal killed all later keystrokes. This runs a real `egui::Context`
-    /// so `request_focus()` produces the same memory state the app sees.
+    /// Regression: the grid takes egui focus when clicked, and both gates once
+    /// keyed off `egui_wants_keyboard_input()`, so one click in the terminal
+    /// killed all later keystrokes *and* every shortcut. This runs a real
+    /// `egui::Context` so `request_focus()` produces the same memory state the
+    /// app sees.
     #[test]
     fn clicking_the_grid_does_not_block_terminal_input() {
         let ctx = egui::Context::default();
@@ -5549,12 +5582,41 @@ mod tests {
             "the grid-like widget really holds egui focus"
         );
         assert!(
-            terminal_input_allowed(false, false, false, ctx.egui_wants_keyboard_input()),
+            !ctx.text_edit_focused(),
+            "a non-text widget is not a focused text edit"
+        );
+        assert!(
+            terminal_input_allowed(false, false, false, ctx.text_edit_focused()),
             "a focused grid must never suppress terminal bytes"
         );
         assert!(
-            !shortcuts_allowed(false, false, ctx.egui_wants_keyboard_input()),
-            "shortcuts still yield to a focused widget"
+            shortcuts_gate(&ctx, false, false),
+            "a focused grid must not disable global shortcuts"
+        );
+    }
+
+    /// Companion to the test above: a real `TextEdit` still owns the keyboard,
+    /// so shortcuts must stay out of the way while the user is typing.
+    #[test]
+    fn a_focused_text_edit_blocks_shortcuts() {
+        let ctx = egui::Context::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let mut text = String::new();
+                let response = ui.text_edit_singleline(&mut text);
+                response.request_focus();
+            });
+            output.textures_delta.clear();
+        }
+
+        assert!(ctx.text_edit_focused(), "the text edit holds the keyboard");
+        assert!(
+            !shortcuts_gate(&ctx, false, false),
+            "shortcuts must yield to a focused text field"
+        );
+        assert!(
+            !terminal_input_allowed(false, false, false, ctx.text_edit_focused()),
+            "terminal bytes must also yield to a real text field"
         );
     }
 

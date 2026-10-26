@@ -3,19 +3,64 @@
 ### The Terminal Emulator for the Terminally Ill.
 
 A Windows-first terminal emulator built on Alacritty's VT core and egui, for people who think
-Alacritty's UI is a war crime.
+Alacritty's UI is too basic.
 
-Illness keeps the parts of Alacritty that are actually good - the parser, grid, scrollback,
-selection and ConPTY - and replaces the window you have to look at with a clean, dark, tabbed
+Illness keeps the parts of Alacritty that are actually good: the parser, grid, scrollback,
+selection and ConPTY -- and replaces the window you have to look at with a clean, dark, tabbed
 shell inspired by Windows Terminal. It renders terminal text through its own physical-pixel
 glyph atlas: hinted, pixel-snapped, nearest-sampled, with neutral grayscale
 antialiasing (no ClearType color fringing).
 
-![Illness](assets/screenshot.png)
+<p align="center"><img src="assets/illness.png" width="96" alt="Illness logo"></p>
 
-![Illness command palette](assets/palette.png)
+![Illness terminal under Acrylic](assets/ls_acrylic.jpg)
 
-![Illness settings tab](assets/settings.png)
+![Command palette](assets/palette.jpg)
+
+![Settings - appearance and terminal](assets/settings_1.jpg)
+
+![Settings - behavior, profiles and about](assets/settings_2.jpg)
+
+Every view under the three window materials:
+
+| | Solid | Mica | Acrylic |
+| --- | --- | --- | --- |
+| Directory listing | ![Solid](assets/ls_solid.jpg) | ![Mica](assets/ls_mica.jpg) | ![Acrylic](assets/ls_acrylic.jpg) |
+| Coding agent | ![Solid](assets/oc_solid.jpg) | ![Mica](assets/oc_mica.jpg) | ![Acrylic](assets/oc_acrylic.jpg) |
+| Close confirmation | ![Solid](assets/exit_solid.jpg) | ![Mica](assets/exit_mica.jpg) | ![Acrylic](assets/exit_acrylic.jpg) |
+
+![New-tab dropdown with detected profiles](assets/dropdown.jpg)
+
+## Why?
+
+To solve a personal problem: There's nothing good in the Windows terminal scene. During my search, it was either bloated Electron or barebones as hell. There's also a long-standing [issue](https://github.com/microsoft/terminal/issues/11916) where Windows Terminal bogs down the moment any CPU-intensive task such as software compilation is done.
+
+## AI Disclosure
+
+DeepSeek v4.1 Flash 1017 used extensively for development.
+
+### Latency workarounds
+
+Illness pins the pseudoconsole API to the inbox `conhost.exe`. `alacritty_terminal` loads
+`conpty.dll` by bare name, and a Windows Terminal or WezTerm install can put its own
+`conpty.dll` on `PATH`; that host, `OpenConsole.exe`, echoes keystrokes far more slowly. The DLL
+search is restricted to `System32` so the load falls back to kernel32's `CreatePseudoConsole`.
+The restriction is process-global: a `conpty.dll` shipped next to `illness.exe` is ignored.
+Set `ILLNESS_CONPTY=auto` to leave the DLL search alone.
+
+Illness raises the shell's own threads and its console host to above-normal priority so a saturated
+machine still echoes at a usable latency (about 302 ms unboosted versus 30 ms under 8/8 CPU
+saturation). The shell is boosted per thread, not per process: thread priority is not inherited,
+so long builds started inside Illness keep running at normal priority. `ILLNESS_NO_PRIORITY_BOOST=1`
+(unset, empty, `0`, `false`, `no` or `off` keeps the boost) disables it.
+
+Echo latency is measured with `crates/illness-term/examples/latency_probe.rs`.
+
+Known limitations in this dose: no split panes, no sixel/kitty graphics, no vi mode, and no
+tested Unix build. Mica is the Windows 11 system backdrop. Acrylic uses the legacy native
+behind-window accent blur where Windows 10 and 11 expose it; either material falls back to
+Solid if its API is unavailable. The VT core is Alacritty's, so the usual escape-sequence
+coverage applies.
 
 ## Symptoms
 
@@ -24,7 +69,7 @@ antialiasing (no ClearType color fringing).
   landing slot, autoscrolls an overflowing strip, and activates when dropped. Escape cancels;
   dropping outside the titlebar restores the original order.
 - Settings opens as its own tab, with right-aligned dropdowns, an editable shell profile list,
-  an installed-font picker (Nerd Fonts included), and background controls.
+  an installed-font picker, and background controls.
 - Solid by default; Mica or Acrylic in Settings. Mica is the Windows 11 system backdrop and
   falls back to Solid when unavailable. Acrylic uses the legacy native behind-window accent
   blur where Windows 10/11 expose it, and also falls back to Solid. Acrylic's Desktop mode is
@@ -160,29 +205,6 @@ launch while the complete HKLM menu is authoritative.
 Configuration lives at `%APPDATA%\illness\config.toml` and is written on exit. Profiles are
 detected from the shells installed on the machine: PowerShell 7, Windows PowerShell, Command
 Prompt and WSL.
-
-### Latency workarounds
-
-Illness pins the pseudoconsole API to the inbox `conhost.exe`. `alacritty_terminal` loads
-`conpty.dll` by bare name, and a Windows Terminal or WezTerm install can put its own
-`conpty.dll` on `PATH`; that host, `OpenConsole.exe`, echoes keystrokes far more slowly. The DLL
-search is restricted to `System32` so the load falls back to kernel32's `CreatePseudoConsole`.
-The restriction is process-global: a `conpty.dll` shipped next to `illness.exe` is ignored.
-Set `ILLNESS_CONPTY=auto` to leave the DLL search alone.
-
-Illness raises the shell's own threads and its console host to above-normal priority so a saturated
-machine still echoes at a usable latency (about 302 ms unboosted versus 30 ms under 8/8 CPU
-saturation). The shell is boosted per thread, not per process: thread priority is not inherited,
-so long builds started inside Illness keep running at normal priority. `ILLNESS_NO_PRIORITY_BOOST=1`
-(unset, empty, `0`, `false`, `no` or `off` keeps the boost) disables it.
-
-Echo latency is measured with `crates/illness-term/examples/latency_probe.rs`.
-
-Known limitations in this dose: no split panes, no sixel/kitty graphics, no vi mode, and no
-tested Unix build. Mica is the Windows 11 system backdrop. Acrylic uses the legacy native
-behind-window accent blur where Windows 10 and 11 expose it; either material falls back to
-Solid if its API is unavailable. The VT core is Alacritty's, so the usual escape-sequence
-coverage applies.
 
 ## Prognosis
 
