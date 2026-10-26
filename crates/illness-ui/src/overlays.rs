@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Area, Color32, ComboBox, Context, CornerRadius, FontId, Frame, Id, Key, Layout,
-    Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Slider, Stroke,
-    StrokeKind, TextEdit, Ui, Vec2,
+    Align, Align2, Area, Color32, ComboBox, Context, CornerRadius, FontId, Frame, Id, Key, Label,
+    Layout, Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Slider,
+    Stroke, StrokeKind, TextEdit, Ui, Vec2,
 };
 use illness_core::config::BackgroundMode;
 use illness_core::{Config, CursorKind, Material, Profile, Rgb, Theme};
@@ -46,6 +46,8 @@ pub enum OverlayKind {
     Palette,
     Search,
     ContextMenu(Pos2),
+    /// Ask before closing the window while more than one tab is open.
+    ConfirmClose,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +125,10 @@ pub struct SettingsOutcome {
 }
 
 /// Show whichever overlay is active. At most one overlay is drawn, so only it captures the keyboard.
+///
+/// `terminal_tabs` is the number of tabs that own a shell; the Settings tab is
+/// not counted. It is passed on every frame so the confirmation card's message
+/// and its guard still agree when a background shell exits.
 #[allow(clippy::too_many_arguments)]
 pub fn show(
     ctx: &Context,
@@ -131,6 +137,7 @@ pub fn show(
     config: &mut Config,
     profiles: &[Profile],
     tabs: &[TabInfo],
+    terminal_tabs: usize,
 ) -> Vec<Action> {
     show_toast(ctx, state, tokens);
 
@@ -145,8 +152,17 @@ pub fn show(
         return actions;
     }
 
+    // Escape cancels every overlay. The confirmation card also accepts Enter
+    // as an explicit confirm; Escape is consumed first, so it wins when both
+    // keys arrive in the same frame.
     let escape = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Escape));
-    if handle_escape(state, escape) {
+    if matches!(state.kind, OverlayKind::ConfirmClose) {
+        let enter = ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
+        if let Some(confirm) = close_confirmation_choice(escape, enter) {
+            state.close();
+            return vec![close_confirmation_action(confirm)];
+        }
+    } else if handle_escape(state, escape) {
         return actions;
     }
 
@@ -155,6 +171,7 @@ pub fn show(
         OverlayKind::Palette => show_palette(ctx, state, tokens, config, profiles, tabs),
         OverlayKind::Search => show_search(ctx, state, tokens),
         OverlayKind::ContextMenu(pos) => show_context_menu(ctx, state, tokens, config, pos),
+        OverlayKind::ConfirmClose => show_confirm_close(ctx, state, tokens, terminal_tabs),
     };
     actions
 }
@@ -1662,6 +1679,14 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
         |ui| toggle(ui, tokens, &mut config.copy_on_select),
     );
 
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Confirm on Close",
+        Some("Ask before closing the window while multiple tabs are open"),
+        |ui| toggle(ui, tokens, &mut config.confirm_close_with_tabs),
+    );
+
     changed
 }
 
@@ -1905,6 +1930,37 @@ fn app_logo(ctx: &Context) -> Option<egui::TextureHandle> {
     handle
 }
 
+/// Edge length of the About card logo. It shrinks with the card width so the
+/// text column always keeps room, but never grows past the compact cap.
+const ABOUT_LOGO_MAX: f32 = 44.0;
+const ABOUT_LOGO_MIN: f32 = 28.0;
+/// Shared action-strip metrics: every About button is the same height, and the
+/// link rows share the same copy glyph so the strip reads as one row.
+const ABOUT_BUTTON_HEIGHT: f32 = 26.0;
+const ABOUT_BUTTON_MIN_WIDTH: f32 = 96.0;
+const ABOUT_BUTTON_PAD: f32 = 12.0;
+const ABOUT_ICON_SIZE: f32 = 12.0;
+const ABOUT_ICON_GAP: f32 = 6.0;
+
+fn about_logo_size(available_width: f32) -> f32 {
+    (available_width * 0.22).clamp(ABOUT_LOGO_MIN, ABOUT_LOGO_MAX)
+}
+
+/// Widest label plus symmetric padding, floored at the historic button width
+/// so the strip keeps its weight even when every label is short.
+fn about_button_width(content_widths: &[f32]) -> f32 {
+    let widest = content_widths.iter().copied().fold(0.0_f32, f32::max);
+    (widest + 2.0 * ABOUT_BUTTON_PAD).max(ABOUT_BUTTON_MIN_WIDTH)
+}
+
+/// Width of `text` in the card's proportional face, without laying out a widget.
+fn about_text_width(ui: &Ui, text: &str, size: f32) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_owned(), FontId::proportional(size), Color32::WHITE)
+        .size()
+        .x
+}
+
 fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut OverlayState) {
     section_title(ui, tokens, "About");
 
@@ -1912,16 +1968,24 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
         .fill(tokens.bg_elev)
         .stroke(Stroke::new(1.0, tokens.border))
         .corner_radius(tokens.radius_md)
-        .inner_margin(Margin::same(18))
+        .inner_margin(Margin::symmetric(16, 14))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
-            // Header Banner: App Icon + Name + Tagline
+            // Header: App Icon + Name + Version + Tagline
+            let logo_size = about_logo_size(ui.available_width());
+            let version = concat!("v", env!("CARGO_PKG_VERSION"));
+            let version_font = FontId::proportional(10.5);
+            let v_galley =
+                ui.painter()
+                    .layout_no_wrap(version.to_owned(), version_font.clone(), tokens.text);
+            let badge_size = v_galley.size() + Vec2::new(10.0, 4.0);
+
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 14.0;
+                ui.spacing_mut().item_spacing.x = 12.0;
 
                 // Real app logo, decoded once and cached for the panel's lifetime.
-                let (icon_box, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                let (icon_box, _) = ui.allocate_exact_size(Vec2::splat(logo_size), Sense::hover());
                 if let Some(logo) = app_logo(ui.ctx()) {
                     ui.painter().image(
                         logo.id(),
@@ -1940,7 +2004,7 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
                     );
                     icons::paint_icon(
                         ui.painter(),
-                        Rect::from_center_size(icon_box.center(), Vec2::splat(22.0)),
+                        Rect::from_center_size(icon_box.center(), Vec2::splat(logo_size * 0.5)),
                         Icon::Terminal,
                         tokens.accent,
                     );
@@ -1948,21 +2012,26 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
 
                 ui.vertical(|ui| {
                     ui.horizontal_centered(|ui| {
-                        ui.label(
-                            RichText::new("Illness Terminal")
-                                .size(16.0)
-                                .strong()
-                                .color(tokens.text),
-                        );
+                        ui.spacing_mut().item_spacing.x = ABOUT_ICON_GAP;
 
-                        // Version Pill Badge
-                        let version_font = FontId::proportional(10.5);
-                        let v_galley = ui.painter().layout_no_wrap(
-                            "v0.1.0".to_owned(),
-                            version_font.clone(),
-                            tokens.text,
-                        );
-                        let badge_size = v_galley.size() + Vec2::new(10.0, 4.0);
+                        // Truncate the name instead of wrapping when a long
+                        // version string or a narrow card squeezes the row.
+                        ui.scope(|ui| {
+                            let reserved = badge_size.x + ABOUT_ICON_GAP;
+                            ui.set_max_width((ui.available_width() - reserved).max(24.0));
+                            ui.add(
+                                Label::new(
+                                    RichText::new("Illness Terminal")
+                                        .size(15.0)
+                                        .strong()
+                                        .color(tokens.text),
+                                )
+                                .truncate(),
+                            );
+                        });
+
+                        // Version Pill Badge: sized from the galley so a longer
+                        // version grows the pill without reflowing the row.
                         let (badge_rect, _) = ui.allocate_exact_size(badge_size, Sense::hover());
                         ui.painter().rect_filled(badge_rect, 4.0, tokens.bg_sunken);
                         ui.painter().rect_stroke(
@@ -1974,7 +2043,7 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
                         ui.painter().text(
                             badge_rect.center(),
                             Align2::CENTER_CENTER,
-                            "v0.1.0",
+                            version,
                             version_font,
                             tokens.text,
                         );
@@ -1987,52 +2056,269 @@ fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut Overla
                 });
             });
 
-            ui.add_space(14.0);
+            ui.add_space(10.0);
             let (divider, _) =
                 ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
             ui.painter().rect_filled(divider, 0.0, tokens.border);
-            ui.add_space(12.0);
+            ui.add_space(10.0);
 
             // Information Grid
             ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
                 ui.label(
-                    RichText::new("Active Theme: ")
-                        .size(12.0)
+                    RichText::new("Active Theme:")
+                        .size(11.5)
                         .color(tokens.text_dim),
                 );
-                ui.label(RichText::new(theme.name).size(12.0).color(tokens.text));
-                ui.add_space(16.0);
-                ui.label(RichText::new("License: ").size(12.0).color(tokens.text_dim));
+                ui.label(RichText::new(theme.name).size(11.5).color(tokens.text));
+                ui.add_space(10.0);
+                ui.label(RichText::new("License:").size(11.5).color(tokens.text_dim));
                 ui.label(
                     RichText::new("MIT OR Apache-2.0")
-                        .size(12.0)
+                        .size(11.5)
                         .color(tokens.text),
                 );
             });
 
-            ui.add_space(14.0);
+            ui.add_space(10.0);
 
-            // Action Buttons Strip
+            // Action strip: equal widths, all copy the value to the clipboard.
+            let label_size = 11.5;
+            let alacritty_width =
+                ABOUT_ICON_SIZE + ABOUT_ICON_GAP + about_text_width(ui, "Alacritty", label_size);
+            let egui_width =
+                ABOUT_ICON_SIZE + ABOUT_ICON_GAP + about_text_width(ui, "egui", label_size);
+            let license_width = about_text_width(ui, "Copy License", label_size);
+            let button_size = Vec2::new(
+                about_button_width(&[alacritty_width, egui_width, license_width]),
+                ABOUT_BUTTON_HEIGHT,
+            );
+
             ui.horizontal_centered(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.spacing_mut().item_spacing.x = tokens.gap_sm;
 
                 if link_row(
                     ui,
                     tokens,
-                    "Alacritty ↗",
+                    "Alacritty",
                     "https://github.com/alacritty/alacritty",
+                    button_size,
                 ) {
                     state.set_toast("Copied Alacritty link");
                 }
-                if link_row(ui, tokens, "egui ↗", "https://github.com/emilk/egui") {
+                if link_row(
+                    ui,
+                    tokens,
+                    "egui",
+                    "https://github.com/emilk/egui",
+                    button_size,
+                ) {
                     state.set_toast("Copied egui link");
                 }
-                if text_button(ui, tokens, "Copy License", false, Vec2::new(96.0, 26.0)).clicked() {
+                if text_button(ui, tokens, "Copy License", false, button_size).clicked() {
                     ui.ctx().copy_text("MIT OR Apache-2.0".to_string());
                     state.set_toast("Copied license to clipboard");
                 }
             });
         });
+}
+
+/// Map the confirmation card's choice to the app's close handling.
+fn close_confirmation_action(confirm: bool) -> Action {
+    if confirm {
+        Action::ConfirmCloseWindow
+    } else {
+        Action::CancelCloseWindow
+    }
+}
+
+/// Keyboard choice for the confirmation card.
+///
+/// Escape cancels and Enter confirms. Escape wins when both keys arrive in the
+/// same frame. `None` leaves the card open; no button is focused, so a keypress
+/// is an explicit choice rather than a default.
+fn close_confirmation_choice(escape: bool, enter: bool) -> Option<bool> {
+    if escape {
+        Some(false)
+    } else if enter {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Message for the confirmation card, pluralized from the terminal-tab count
+/// measured for this frame. A shell can exit while the card is open, so the
+/// text is rebuilt every frame instead of being captured when it opened.
+fn close_confirmation_message(tab_count: usize) -> String {
+    if tab_count == 1 {
+        "1 tab is open. Closing the window ends the session.".to_string()
+    } else {
+        format!("{tab_count} tabs are open. Closing the window ends every session.")
+    }
+}
+
+/// Layout constants for the close-confirmation card. They are shared by
+/// [`confirm_close_card_height`] and [`show_confirm_close`], so the height
+/// computed for the card always matches the content laid out inside it.
+const CONFIRM_CARD_WIDTH: f32 = 480.0;
+const CONFIRM_MARGIN: f32 = 26.0;
+const CONFIRM_BUTTON_HEIGHT: f32 = 34.0;
+
+fn confirm_close_card_height(title_height: f32, message_height: f32) -> f32 {
+    CONFIRM_MARGIN * 2.0 + title_height + 10.0 + message_height + 24.0 + CONFIRM_BUTTON_HEIGHT
+}
+
+/// Confirmation card shown when the window close is held back for more than
+/// one open terminal tab. Escape cancels; only the primary button (or Enter)
+/// reports a confirmed close.
+fn show_confirm_close(
+    ctx: &Context,
+    state: &mut OverlayState,
+    tokens: &Tokens,
+    tab_count: usize,
+) -> Vec<Action> {
+    let screen = ctx.content_rect();
+    let (entry, slide) = entry_progress(ctx, state);
+    let width = CONFIRM_CARD_WIDTH.min((screen.width() - 32.0).max(300.0));
+    let content_width = width - CONFIRM_MARGIN * 2.0;
+    let message = close_confirmation_message(tab_count);
+
+    let title_height = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout(
+                "Close window?".to_owned(),
+                FontId::proportional(tokens.font_title + 2.0),
+                tokens.text,
+                content_width,
+            )
+            .size()
+            .y
+    });
+    let message_height = ctx.fonts_mut(|fonts| {
+        fonts
+            .layout(
+                message.clone(),
+                FontId::proportional(tokens.font_body),
+                tokens.text_dim,
+                content_width,
+            )
+            .size()
+            .y
+    });
+
+    let height = confirm_close_card_height(title_height, message_height).ceil();
+    let card = Rect::from_center_size(
+        Pos2::new(screen.center().x, screen.center().y - slide),
+        Vec2::new(width, height),
+    );
+
+    let mut choice = None;
+    let mut backdrop_clicked = false;
+
+    Area::new(Id::unique("illness_confirm_close_modal"))
+        .order(Order::Foreground)
+        .fixed_pos(Pos2::ZERO)
+        .interactable(true)
+        .fade_in(false)
+        .show(ctx, |ui| {
+            let (bg_rect, bg_response) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let backdrop_alpha = (f32::from(BACKDROP_ALPHA) * entry).round() as u8;
+            ui.painter()
+                .rect_filled(bg_rect, 0.0, Color32::from_black_alpha(backdrop_alpha));
+            backdrop_clicked = bg_response.clicked();
+
+            ui.scope_builder(egui::UiBuilder::new().max_rect(card), |ui| {
+                ui.set_width(width);
+                ui.set_opacity(entry);
+
+                ui.painter().rect_filled(card, 14.0, tokens.bg_elev);
+                ui.painter().rect_stroke(
+                    card,
+                    14.0,
+                    Stroke::new(1.0, tokens.border),
+                    StrokeKind::Inside,
+                );
+
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(card.shrink(CONFIRM_MARGIN))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                {
+                    let ui = &mut content;
+                    ui.set_width(content_width);
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        let (dot_rect, _) =
+                            ui.allocate_exact_size(Vec2::splat(16.0), Sense::hover());
+                        ui.painter()
+                            .circle_filled(dot_rect.center(), 5.5, tokens.danger);
+
+                        ui.label(
+                            RichText::new("Close window?")
+                                .size(tokens.font_title + 2.0)
+                                .strong()
+                                .color(tokens.text),
+                        );
+                    });
+
+                    ui.add_space(8.0);
+
+                    ui.label(
+                        RichText::new(message)
+                            .size(tokens.font_body)
+                            .color(tokens.text_dim),
+                    );
+
+                    ui.add_space(24.0);
+
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if danger_button(
+                            ui,
+                            tokens,
+                            "Close Window",
+                            Vec2::new(124.0, CONFIRM_BUTTON_HEIGHT),
+                        )
+                        .clicked()
+                        {
+                            choice = Some(true);
+                        }
+
+                        ui.add_space(tokens.gap_sm);
+
+                        if text_button(
+                            ui,
+                            tokens,
+                            "Cancel",
+                            false,
+                            Vec2::new(84.0, CONFIRM_BUTTON_HEIGHT),
+                        )
+                        .clicked()
+                        {
+                            choice = Some(false);
+                        }
+                    });
+                }
+            });
+        });
+
+    if let Some(confirm) = choice {
+        state.close();
+        return vec![close_confirmation_action(confirm)];
+    }
+
+    let outside = ctx
+        .input(|input| input.pointer.interact_pos())
+        .is_none_or(|pos| !card.contains(pos));
+    if backdrop_clicked && outside {
+        state.close();
+    }
+
+    Vec::new()
 }
 
 fn show_context_menu(
@@ -2528,6 +2814,32 @@ fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: 
     response
 }
 
+fn danger_button(ui: &mut Ui, tokens: &Tokens, label: &str, size: Vec2) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+
+    let fill = design::fade(tokens.danger, 0.88 + 0.12 * hover);
+    ui.painter().rect_filled(rect, tokens.radius_sm, fill);
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.5),
+        Color32::WHITE,
+    );
+
+    response
+}
+
 fn toggle(ui: &mut Ui, tokens: &Tokens, value: &mut bool) -> bool {
     let (rect, response) = ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
     let radius = rect.height() * 0.5;
@@ -2612,8 +2924,13 @@ fn chevron_button(ui: &mut Ui, tokens: &Tokens, up: bool) -> Response {
     response
 }
 
-fn link_row(ui: &mut Ui, tokens: &Tokens, label: &str, url: &str) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(80.0, 24.0), Sense::click());
+/// Copy-to-clipboard row. The copy glyph (not a `↗`) tells the truth about
+/// what the click does; the URL itself is handled by the caller's toast.
+fn link_row(ui: &mut Ui, tokens: &Tokens, label: &str, url: &str, size: Vec2) -> bool {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Copy link");
     let hover = ui
         .ctx()
         .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
@@ -2627,13 +2944,29 @@ fn link_row(ui: &mut Ui, tokens: &Tokens, label: &str, url: &str) -> bool {
         Stroke::new(1.0, tokens.border),
         StrokeKind::Inside,
     );
-    ui.painter().text(
-        rect.center(),
-        Align2::CENTER_CENTER,
-        label,
-        FontId::proportional(11.5),
-        design::mix(tokens.text, tokens.accent, hover),
+
+    let font = FontId::proportional(11.5);
+    let text_width = about_text_width(ui, label, 11.5);
+    let content = ABOUT_ICON_SIZE + ABOUT_ICON_GAP + text_width;
+    let left = rect.center().x - content * 0.5;
+    let color = design::mix(tokens.text, tokens.accent, hover);
+    icons::paint_icon(
+        ui.painter(),
+        Rect::from_center_size(
+            Pos2::new(left + ABOUT_ICON_SIZE * 0.5, rect.center().y),
+            Vec2::splat(ABOUT_ICON_SIZE),
+        ),
+        Icon::Copy,
+        color,
     );
+    ui.painter().text(
+        Pos2::new(left + ABOUT_ICON_SIZE + ABOUT_ICON_GAP, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        font,
+        color,
+    );
+
     if response.clicked() {
         ui.ctx().copy_text(url.to_string());
         true
@@ -2843,6 +3176,73 @@ mod tests {
     }
 
     #[test]
+    fn escape_dismisses_close_confirmation() {
+        let mut state = OverlayState {
+            kind: OverlayKind::ConfirmClose,
+            ..Default::default()
+        };
+        let generation = state.palette_generation;
+
+        assert!(
+            handle_escape(&mut state, true),
+            "Escape must consume the key"
+        );
+        assert_eq!(state.kind, OverlayKind::None);
+        assert_eq!(state.palette_generation, generation + 1);
+    }
+
+    #[test]
+    fn close_confirmation_maps_buttons_to_close_or_cancel() {
+        assert_eq!(close_confirmation_action(true), Action::ConfirmCloseWindow);
+        assert_eq!(close_confirmation_action(false), Action::CancelCloseWindow);
+    }
+
+    #[test]
+    fn close_confirmation_accepts_enter_and_prefers_escape() {
+        assert_eq!(close_confirmation_choice(false, false), None);
+        assert_eq!(
+            close_confirmation_choice(false, true),
+            Some(true),
+            "Enter confirms the destructive choice"
+        );
+        assert_eq!(close_confirmation_choice(true, false), Some(false));
+        assert_eq!(
+            close_confirmation_choice(true, true),
+            Some(false),
+            "Escape cancels when both keys arrive in one frame"
+        );
+    }
+
+    #[test]
+    fn close_confirmation_message_is_pluralized() {
+        assert_eq!(
+            close_confirmation_message(1),
+            "1 tab is open. Closing the window ends the session."
+        );
+        assert_eq!(
+            close_confirmation_message(2),
+            "2 tabs are open. Closing the window ends every session."
+        );
+        assert!(
+            close_confirmation_message(1).contains("1 tab "),
+            "a lone tab must not read 1 tabs"
+        );
+    }
+
+    #[test]
+    fn close_card_height_follows_the_laid_out_text() {
+        let small = confirm_close_card_height(18.0, 14.0);
+        let zoomed = confirm_close_card_height(27.0, 21.0);
+        assert_eq!(small, 52.0 + 18.0 + 10.0 + 14.0 + 24.0 + 34.0);
+        assert!(
+            zoomed > small,
+            "the card must grow with the measured text, not stay 176 px"
+        );
+        let wrapped = confirm_close_card_height(18.0, 28.0);
+        assert!(wrapped > small);
+    }
+
+    #[test]
     fn enter_uses_the_query_edited_in_the_same_frame() {
         // The pre-edit list used for sizing starts with New Tab.
         let mut items = palette_items("", &[], &[]);
@@ -2872,6 +3272,31 @@ mod tests {
         assert_eq!(
             state.toast_deadline, None,
             "a replacement must not inherit the old expiry"
+        );
+    }
+
+    #[test]
+    fn about_card_metrics_stay_compact_and_keep_the_text_column() {
+        // Logo: capped at 44px on wide cards, still shrinking on narrow ones.
+        assert_eq!(about_logo_size(420.0), ABOUT_LOGO_MAX);
+        assert!((about_logo_size(200.0) - 44.0).abs() < 0.01);
+        assert!((about_logo_size(100.0) - 28.0).abs() < 0.01);
+        assert_eq!(about_logo_size(0.0), ABOUT_LOGO_MIN);
+        for width in [0.0, 40.0, 120.0, 240.0, 720.0] {
+            let logo = about_logo_size(width);
+            assert!(
+                (ABOUT_LOGO_MIN..=ABOUT_LOGO_MAX).contains(&logo),
+                "logo {logo} out of range at {width}"
+            );
+        }
+
+        // Action strip: one shared width, floored at the historic 96px.
+        assert_eq!(about_button_width(&[]), ABOUT_BUTTON_MIN_WIDTH);
+        assert_eq!(about_button_width(&[20.0, 30.0]), 96.0);
+        assert!((about_button_width(&[90.0, 40.0]) - 114.0).abs() < 0.01);
+        assert_eq!(
+            about_button_width(&[40.0, 90.0]),
+            about_button_width(&[90.0, 40.0])
         );
     }
 

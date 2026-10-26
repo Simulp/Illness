@@ -8,6 +8,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -117,6 +118,10 @@ struct Host {
     /// repaint even when Windows reports the same size as before minimizing.
     restore_pending: bool,
     first_frame: bool,
+    /// Shared with the app: whether a close request would currently show the
+    /// confirmation card. Kept in an atomic so a close arriving for a window
+    /// that cannot paint still knows the app would guard it.
+    close_guarded: Arc<AtomicBool>,
 }
 
 impl Host {
@@ -146,6 +151,7 @@ impl Host {
             surface_alpha: false,
             restore_pending: false,
             first_frame: true,
+            close_guarded: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -247,6 +253,7 @@ impl Host {
             window.clone(),
             native_transparency,
             self.startup_folder.clone(),
+            Arc::clone(&self.close_guarded),
         );
 
         self.state = Some(state);
@@ -517,19 +524,35 @@ impl ApplicationHandler<UserEvent> for Host {
                 if let Some(state) = self.state.as_mut() {
                     let _ = state.on_window_event(&window, &event);
                 }
-                // Give the app one last pass so it can save and honor a
-                // CancelClose. Windows withholds `RedrawRequested` for a
-                // minimized or hidden window, so run the pass synchronously.
-                self.info.events.push(ViewportEvent::Close);
-                self.close_requested = true;
+                // Windows withholds `RedrawRequested` for a minimized or hidden
+                // window, so a close in that state cannot run the app's veto
+                // pass. The app publishes whether it would confirm; when it
+                // would, restore and show the window, queue the Close viewport
+                // event for the next paint, and return without closing. That
+                // paint runs the ordinary pass: the app cancels the close and
+                // the confirmation card appears. Unguarded closes still save
+                // and exit immediately.
                 let can_paint = self.state.is_some()
                     && self.app.is_some()
                     && !window.is_minimized().unwrap_or(false)
                     && window.is_visible().unwrap_or(true);
-                if can_paint {
-                    self.redraw(event_loop);
-                } else {
-                    self.finish_close(event_loop);
+                match close_decision(can_paint, self.close_guarded.load(Ordering::Relaxed)) {
+                    CloseDecision::Paint => {
+                        self.info.events.push(ViewportEvent::Close);
+                        self.close_requested = true;
+                        self.redraw(event_loop);
+                    }
+                    CloseDecision::RestoreThenPrompt => {
+                        log::debug!(
+                            "guarded close requested while the window cannot paint; restoring it"
+                        );
+                        window.set_minimized(false);
+                        window.set_visible(true);
+                        window.request_redraw();
+                        self.info.events.push(ViewportEvent::Close);
+                        self.close_requested = true;
+                    }
+                    CloseDecision::Finish => self.finish_close(event_loop),
                 }
             }
             WindowEvent::Occluded(occluded) => {
@@ -674,6 +697,34 @@ fn cancel_close_requested(commands: &[ViewportCommand]) -> bool {
             .any(|command| matches!(command, ViewportCommand::CancelClose))
 }
 
+/// What a `CloseRequested` event should do to the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseDecision {
+    /// Run the app's pass synchronously; it may cancel the close.
+    Paint,
+    /// The app would confirm, but this window cannot paint. Restore it and
+    /// queue the close event so the confirmation appears on the next frame.
+    RestoreThenPrompt,
+    /// Nothing guards the close; save and stop immediately.
+    Finish,
+}
+
+/// Decide how to handle a window close.
+///
+/// A minimized or hidden window gets no `RedrawRequested`, so the confirmation
+/// card could never be shown. Without the guard hint the host must fall back to
+/// closing directly (single tab or the setting disabled); with it, the window
+/// is restored instead of losing its sessions unasked.
+fn close_decision(can_paint: bool, guarded: bool) -> CloseDecision {
+    if can_paint {
+        CloseDecision::Paint
+    } else if guarded {
+        CloseDecision::RestoreThenPrompt
+    } else {
+        CloseDecision::Finish
+    }
+}
+
 /// What a `Resized` event should do to the swapchain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SurfaceResize {
@@ -775,7 +826,10 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> (bool, 
 
 #[cfg(test)]
 mod tests {
-    use super::{SurfaceResize, cancel_close_requested, event_needs_redraw, surface_resize};
+    use super::{
+        CloseDecision, SurfaceResize, cancel_close_requested, close_decision, event_needs_redraw,
+        surface_resize,
+    };
     use egui::ViewportCommand;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
     use winit::event::{DeviceId, WindowEvent};
@@ -813,6 +867,21 @@ mod tests {
             ViewportCommand::Close,
         ]));
         assert!(!cancel_close_requested(&[]));
+    }
+
+    #[test]
+    fn hidden_or_minimized_guarded_close_restores_before_prompting() {
+        // A window that can paint always runs the app pass, which decides
+        // whether to prompt.
+        assert_eq!(close_decision(true, false), CloseDecision::Paint);
+        assert_eq!(close_decision(true, true), CloseDecision::Paint);
+        // Cannot paint and the app would confirm: restore, do not close.
+        assert_eq!(
+            close_decision(false, true),
+            CloseDecision::RestoreThenPrompt
+        );
+        // Cannot paint and nothing guards the close: the old fast path.
+        assert_eq!(close_decision(false, false), CloseDecision::Finish);
     }
 
     #[test]

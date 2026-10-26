@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use egui::{
     Color32, ColorImage, CursorIcon, Event, ImeEvent, Key as EguiKey, Modifiers, MouseWheelUnit,
-    PointerButton, Pos2, Rect, Sense, Stroke, TextureHandle, TextureOptions, Ui, ViewportCommand,
-    pos2, vec2,
+    PointerButton, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, ViewportCommand, pos2,
+    vec2,
 };
 use illness_core::{Config, CursorKind, Material, Theme};
 use illness_term::snapshot::CellFlags;
@@ -122,6 +122,321 @@ pub(crate) fn coalesce_delay(elapsed: f64, frame_dt: f64) -> Option<f64> {
     }
 }
 
+/// Width of the scrollbar hit strip, in logical points.
+const SCROLLBAR_WIDTH: f32 = 10.0;
+
+/// Gap kept between the last cell and the strip. egui's `Rect::intersects`
+/// counts touching edges as overlapping, so the strip starts strictly right
+/// of the grid's cell area.
+const SCROLLBAR_GAP: f32 = 1.0;
+
+/// Smallest grabbable thumb, so a million lines of scrollback still drags.
+const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// Width of the fallback overlay strip used when the padding gutter is too
+/// narrow for the full strip. It lives just inside the last column and only
+/// paints (and takes input) while the pointer is on it.
+const SCROLLBAR_OVERLAY_WIDTH: f32 = 4.0;
+
+/// Vertical scrollbar layout overlaid on the padding gutter right of the grid.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Scrollbar {
+    track: Rect,
+    thumb: Rect,
+    /// True for the narrow fallback that sits inside the grid's right edge.
+    /// It is invisible until hovered, so it never permanently covers cells.
+    overlay: bool,
+}
+
+impl Scrollbar {
+    /// `None` when there is no scrollback, there is no gutter to live in, or
+    /// the grid has no usable height. The alternate screen and short
+    /// sessions therefore keep the old hit-testing exactly.
+    fn for_grid(
+        content_rect: Rect,
+        grid_rect: Rect,
+        viewport: usize,
+        history: usize,
+        display_offset: usize,
+    ) -> Option<Self> {
+        if history == 0 {
+            return None;
+        }
+        // A gutter that can hold the full strip always wins. A narrower one
+        // (including padding 0/1, where no gutter exists) falls back to a
+        // narrow overlay inside the last column instead of losing the
+        // scroll affordance entirely.
+        let right = content_rect.right();
+        let left = (grid_rect.right() + SCROLLBAR_GAP).max(content_rect.left());
+        let gutter = right - left;
+        let overlay = gutter < SCROLLBAR_WIDTH;
+        let track = if overlay {
+            let width = SCROLLBAR_OVERLAY_WIDTH.min(grid_rect.width()).max(0.0);
+            if width <= 0.0 {
+                return None;
+            }
+            Rect::from_min_max(
+                pos2(grid_rect.right() - width, grid_rect.top()),
+                pos2(grid_rect.right(), grid_rect.bottom()),
+            )
+        } else {
+            Rect::from_min_max(
+                pos2(right - SCROLLBAR_WIDTH, grid_rect.top()),
+                pos2(right, grid_rect.bottom()),
+            )
+        };
+        if track.height() <= 0.0 {
+            return None;
+        }
+        Some(Self::with_thumb_height(
+            track,
+            scrollbar_thumb_length(track.height(), viewport, history),
+            history,
+            display_offset,
+            overlay,
+        ))
+    }
+
+    /// Layout for an already-established gutter track rectangle.
+    #[cfg(test)]
+    fn new(track: Rect, viewport: usize, history: usize, display_offset: usize) -> Self {
+        let thumb_height = scrollbar_thumb_length(track.height(), viewport, history);
+        Self::with_thumb_height(track, thumb_height, history, display_offset, false)
+    }
+
+    /// Layout with an explicit thumb length, used while a drag paints the
+    /// offset it just applied instead of the stale snapshot's.
+    fn with_thumb_height(
+        track: Rect,
+        thumb_height: f32,
+        history: usize,
+        display_offset: usize,
+        overlay: bool,
+    ) -> Self {
+        let thumb_height = thumb_height.clamp(0.0, track.height());
+        let travel = (track.height() - thumb_height).max(0.0);
+        let fraction = if history == 0 {
+            0.0
+        } else {
+            (display_offset.min(history) as f32 / history as f32).clamp(0.0, 1.0)
+        };
+        // Offset 0 is the live bottom, so the thumb starts at the far end.
+        let top = track.top() + travel * (1.0 - fraction);
+        let thumb = Rect::from_min_size(pos2(track.left(), top), vec2(track.width(), thumb_height));
+        Self {
+            track,
+            thumb,
+            overlay,
+        }
+    }
+
+    /// Whether the strip is visible while nobody is pointing at it. Only the
+    /// gutter strip is; the overlay stays hidden so it does not permanently
+    /// cover the last column.
+    fn paints_when_idle(&self) -> bool {
+        !self.overlay
+    }
+}
+
+/// Scrollbar geometry captured when the thumb is pressed.
+///
+/// The history, thumb height, and track origin are frozen for the whole drag:
+/// recomputing them from the live layout would shift the view under a
+/// stationary pointer every time a line arrives or the window resizes.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScrollbarGrab {
+    /// Pointer offset inside the thumb at press time.
+    grab: f32,
+    track_top: f32,
+    track_height: f32,
+    thumb_height: f32,
+    history: usize,
+}
+
+/// Which side of the widget delivered the press that owns the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressOwner {
+    Grid,
+    Scrollbar,
+}
+
+/// Where a fresh press landed, independent of whether a bar currently exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PressTarget {
+    Grid,
+    Track,
+    Thumb,
+}
+
+/// Hit-test a press against the bar, if any.
+///
+/// Every press gets an owner even with no bar (`history_size == 0`), so a
+/// scrollback that appears mid-drag cannot steal a press that began on the
+/// cells and silently drop copy-on-select or the child's mouse-up.
+fn press_target(bar: Option<&Scrollbar>, pos: Pos2, primary_pressed: bool) -> PressTarget {
+    let Some(bar) = bar.filter(|_| primary_pressed) else {
+        return PressTarget::Grid;
+    };
+    if !bar.track.contains(pos) {
+        PressTarget::Grid
+    } else if bar.thumb.contains(pos) {
+        PressTarget::Thumb
+    } else {
+        PressTarget::Track
+    }
+}
+
+/// Whether this view owes the grid a mouse release this frame.
+///
+/// Only a press this view delivered may produce a release: a release that
+/// lands on the cells after a scrollbar drag (or after the tab was hidden
+/// during the press) must not reach a mouse-reporting child, or it would see
+/// a mouse-up with no matching down.
+fn owes_grid_release(owner: Option<PressOwner>, any_pressed: bool) -> bool {
+    owner == Some(PressOwner::Grid) || any_pressed
+}
+
+/// One drag frame: the offset requested by the pointer and the single delta to
+/// hand to `Session::scroll`.
+///
+/// The end condition is checked first. A grab whose button, pointer, or focus
+/// is gone returns `None` before any pointer-derived offset is computed, so a
+/// release that happened while this tab was hidden cannot make the view jump
+/// when the tab is shown again.
+fn scrollbar_drag_frame(
+    grab: &ScrollbarGrab,
+    current: i32,
+    pointer_y: Option<f32>,
+    ended: bool,
+) -> Option<ScrollbarDragFrame> {
+    if ended {
+        return None;
+    }
+    let (target, delta) = apply_scrollbar_drag(grab, current, pointer_y?);
+    Some(ScrollbarDragFrame { target, delta })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ScrollbarDragFrame {
+    target: i32,
+    delta: i32,
+}
+
+/// One drag frame against the frozen track origin.
+///
+/// The caller applies `delta` exactly once and skips the easing path while a
+/// drag frame was painted, so a drag can never double-apply through both.
+fn apply_scrollbar_drag(grab: &ScrollbarGrab, current: i32, pointer_y: f32) -> (i32, i32) {
+    let offset = drag_offset(
+        grab.track_height,
+        grab.thumb_height,
+        grab.history,
+        pointer_y - grab.track_top,
+        grab.grab,
+    );
+    (offset, offset - current)
+}
+
+/// Track rectangle frozen at press time. Only the horizontal extent comes from
+/// the live bar, since it does not affect the vertical mapping.
+fn frozen_track_rect(grab: &ScrollbarGrab, live: Rect) -> Rect {
+    Rect::from_min_max(
+        pos2(live.left(), grab.track_top),
+        pos2(live.right(), grab.track_top + grab.track_height),
+    )
+}
+
+/// Whether the scrollbar, rather than the grid, owns the pointer this frame.
+///
+/// A press that began on the grid keeps ownership until release, so a
+/// drag-select or mouse-report drag that crosses the strip still ends in the
+/// grid and its mouse-up is delivered there.
+fn scrollbar_owns_pointer(grab_active: bool, grid_press: bool, on_track: bool) -> bool {
+    grab_active || (!grid_press && on_track)
+}
+
+/// Whether a scrollbar drag must end because its button or pointer is gone,
+/// or the viewport lost focus.
+///
+/// winit has no mouse capture and egui keeps `primary_down` set after
+/// `PointerGone`; without this the grab would latch and the bar would keep
+/// owning the pointer until the next click.
+fn scrollbar_drag_ended(any_down: bool, pointer_pos: Option<Pos2>, focused: bool) -> bool {
+    !any_down || pointer_pos.is_none() || !focused
+}
+
+/// Whether a track click may page the scrollback. Clicking below the thumb
+/// while already at the live bottom has nothing to reveal.
+fn track_click_pages(step: i32, display_offset: i32) -> bool {
+    step > 0 || display_offset > 0
+}
+
+/// Thumb length for `viewport` visible rows above `history` rows of scrollback.
+fn scrollbar_thumb_length(track_height: f32, viewport: usize, history: usize) -> f32 {
+    if !track_height.is_finite() || track_height <= 0.0 {
+        return 0.0;
+    }
+    if history == 0 {
+        return track_height;
+    }
+    let visible = viewport.max(1) as f32;
+    let total = visible + history as f32;
+    (track_height * visible / total).clamp(SCROLLBAR_MIN_THUMB.min(track_height), track_height)
+}
+
+/// Display offset (0 = live bottom) for a thumb whose top sits `pointer_y`
+/// points below the track top, grabbed `grab` points from its own top.
+/// Always clamped to both ends, so dragging past them stops there.
+fn drag_offset(
+    track_height: f32,
+    thumb_height: f32,
+    history: usize,
+    pointer_y: f32,
+    grab: f32,
+) -> i32 {
+    if history == 0 || !track_height.is_finite() || !pointer_y.is_finite() || !grab.is_finite() {
+        return 0;
+    }
+    let max = i32::try_from(history).unwrap_or(i32::MAX);
+    let travel = (track_height - thumb_height.max(0.0)).max(0.0);
+    if travel <= 0.0 {
+        return 0;
+    }
+    let local = (pointer_y - grab).clamp(0.0, travel);
+    let fraction = (1.0 - local / travel).clamp(0.0, 1.0);
+    let offset = (fraction * history as f32).round() as i64;
+    offset.clamp(0, i64::from(max)) as i32
+}
+
+fn paint_scrollbar(
+    painter: &egui::Painter,
+    bar: &Scrollbar,
+    tokens: &Tokens,
+    ppp: f32,
+    active: bool,
+) {
+    if bar.thumb.height() <= 0.0 || bar.track.width() <= 0.0 {
+        return;
+    }
+    // The overlay fallback is invisible while idle so it never permanently
+    // covers the last column; hover or an active drag reveals it.
+    if !active && !bar.paints_when_idle() {
+        return;
+    }
+    let radius = bar.track.width() * 0.5;
+    if active {
+        // The track only shows while the pointer is on the strip, so text
+        // under it is not permanently boxed in.
+        painter.rect_filled(bar.track, radius, design::fade(tokens.border, 0.55));
+    }
+    let opacity = if active { 0.85 } else { 0.35 };
+    painter.rect_filled(
+        snap_rect(bar.thumb, ppp),
+        radius,
+        design::fade(tokens.text_dim, opacity),
+    );
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalAction {
     Copy(String),
@@ -162,6 +477,12 @@ pub struct TerminalView {
     blink_epoch: f64,
     wheel_accum: f32,
     selecting: bool,
+    /// Scrollbar drag state; freezes the thumb/track geometry for the drag.
+    scrollbar_grab: Option<ScrollbarGrab>,
+    /// Which side delivered the press that owns the pointer. A press that
+    /// began on the grid keeps ownership until release, even if the pointer
+    /// crosses the scrollbar strip or a bar appears mid-drag.
+    press_owner: Option<PressOwner>,
     /// CPU-composited surface and its GPU texture, reused until the grid changes.
     soft_texture: SoftTexture,
     soft_image: SoftImage,
@@ -410,14 +731,150 @@ impl TerminalView {
             response.request_focus();
         }
 
-        let pill = if snapshot.display_offset > 0 {
-            Some(self.jump_to_bottom(ui, &painter, rect, tokens, session, &snapshot))
+        // Vertical scrollbar laid out in the padding gutter right of the grid,
+        // falling back to a narrow overlay on the grid's right edge when the
+        // gutter is too narrow. It only exists when the session has
+        // scrollback, so the alternate screen and short histories keep the old
+        // hit-testing exactly.
+        let scrollbar = Scrollbar::for_grid(
+            content_rect,
+            grid_rect,
+            rows,
+            snapshot.history_size,
+            snapshot.display_offset,
+        );
+        let history = i32::try_from(snapshot.history_size).unwrap_or(i32::MAX);
+        let display_offset = i32::try_from(snapshot.display_offset).unwrap_or(i32::MAX);
+        let primary_pressed =
+            ui.input(|input| input.pointer.button_pressed(PointerButton::Primary));
+        let primary_released =
+            ui.input(|input| input.pointer.button_released(PointerButton::Primary));
+        let any_pressed = ui.input(|input| input.pointer.any_pressed());
+        let pointer_present = ui.input(|input| input.pointer.latest_pos());
+        let any_down = ui.input(|input| input.pointer.any_down());
+        let focused = ui.ctx().input(|input| input.focused);
+
+        // A grab is only valid while its button is down, and that is checked
+        // before any delta is computed. A release that lands while another tab
+        // is shown is never observed there, so the stale grab must expire
+        // instead of applying this tab's pointer position on return. The
+        // release frame itself keeps ownership so its mouse-up is delivered.
+        let drag_lost = scrollbar_drag_ended(any_down, pointer_present, focused) && !released;
+        if drag_lost {
+            self.scrollbar_grab = None;
+            self.press_owner = None;
+            self.selecting = false;
+        }
+
+        // Every fresh press records its owner before hit testing, even with no
+        // bar: scrollback can appear mid-drag, and the bar must not steal a
+        // press that began on the cells (copy-on-select / mouse-up would be
+        // lost).
+        if any_pressed && let Some(pos) = pointer {
+            match (
+                press_target(scrollbar.as_ref(), pos, primary_pressed),
+                scrollbar,
+            ) {
+                (PressTarget::Thumb, Some(bar)) => {
+                    // Freeze the geometry for the duration of the drag,
+                    // including the track origin so a relayout cannot shift
+                    // the inverse mapping under the pointer.
+                    self.press_owner = Some(PressOwner::Scrollbar);
+                    self.scrollbar_grab = Some(ScrollbarGrab {
+                        grab: pos.y - bar.thumb.top(),
+                        track_top: bar.track.top(),
+                        track_height: bar.track.height(),
+                        thumb_height: bar.thumb.height(),
+                        history: snapshot.history_size,
+                    });
+                }
+                (PressTarget::Track, Some(bar)) => {
+                    // A track click pages toward the pointer, one viewport at
+                    // a time. Clicking below the thumb at the live bottom has
+                    // nothing to reveal.
+                    self.press_owner = Some(PressOwner::Scrollbar);
+                    let page = i32::try_from(rows).unwrap_or(i32::MAX);
+                    let step = if pos.y < bar.thumb.center().y {
+                        page
+                    } else {
+                        -page
+                    };
+                    if track_click_pages(step, display_offset) {
+                        self.scroll_target =
+                            self.scroll_target.saturating_add(step).clamp(0, history);
+                    }
+                }
+                _ => {
+                    // Sticky: the grid owns this press until release, so a
+                    // selection crossing the strip does not lose the pointer.
+                    self.press_owner = Some(PressOwner::Grid);
+                }
+            }
+        }
+
+        let on_track =
+            scrollbar.is_some_and(|bar| pointer.is_some_and(|pos| bar.track.contains(pos)));
+        let mut bar_hovered = false;
+        let mut bar_dragging = false;
+        // Offset the drag applied this frame; the thumb is painted from it
+        // instead of the stale frame-start snapshot.
+        let mut painted_offset = None;
+        let mut painted_grab = None;
+        if scrollbar.is_some() {
+            bar_hovered = on_track;
+            if let Some(grab) = self.scrollbar_grab {
+                let ended =
+                    primary_released || scrollbar_drag_ended(any_down, pointer_present, focused);
+                match scrollbar_drag_frame(&grab, display_offset, pointer.map(|pos| pos.y), ended) {
+                    Some(frame) => {
+                        bar_dragging = true;
+                        self.scroll_target = frame.target;
+                        painted_offset = Some(frame.target);
+                        painted_grab = Some(grab);
+                        // Apply the full delta exactly once here; the easing
+                        // path is skipped for a drag frame.
+                        if frame.delta != 0 {
+                            session.scroll(frame.delta);
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                    // Released outside the window, focus lost, or the button
+                    // came up: drop the grab before any delta is applied.
+                    None => self.scrollbar_grab = None,
+                }
+            }
+            if bar_hovered || bar_dragging {
+                ui.ctx().set_cursor_icon(if bar_dragging {
+                    CursorIcon::Grabbing
+                } else {
+                    CursorIcon::Grab
+                });
+            }
         } else {
-            None
-        };
+            self.scrollbar_grab = None;
+        }
+        // The strip claims pointer input only inside its own track, plus the
+        // rest of a drag that began there. A press that began on the grid keeps
+        // ownership until release.
+        let grid_press = self.press_owner == Some(PressOwner::Grid);
+        let bar_owns_pointer =
+            scrollbar_owns_pointer(self.scrollbar_grab.is_some(), grid_press, on_track);
+        if let Some(bar) = scrollbar {
+            let painted = match (painted_offset, painted_grab) {
+                (Some(offset), Some(grab)) => Scrollbar::with_thumb_height(
+                    frozen_track_rect(&grab, bar.track),
+                    grab.thumb_height,
+                    grab.history,
+                    usize::try_from(offset.max(0)).unwrap_or(0),
+                    bar.overlay,
+                ),
+                _ => bar,
+            };
+            paint_scrollbar(&painter, &painted, tokens, ppp, bar_hovered || bar_dragging);
+        }
 
         if let Some(pos) = pointer
-            && !pill.is_some_and(|pill_rect| pill_rect.contains(pos))
+            && !bar_owns_pointer
         {
             let hover_cell = Self::cell_at(pos, grid_rect, &metrics, (cols, rows));
             let hover_link = if ctrl {
@@ -484,8 +941,7 @@ impl TerminalView {
         }
 
         if let Some(pos) = pointer {
-            let in_pill = pill.is_some_and(|pill_rect| pill_rect.contains(pos));
-            if !in_pill {
+            if !bar_owns_pointer && owes_grid_release(self.press_owner, any_pressed) {
                 input_sent |= self.handle_mouse(
                     ui,
                     &response,
@@ -518,7 +974,18 @@ impl TerminalView {
                 .request_repaint_after(Duration::from_secs_f64(f64::from(frame_interval(ui))));
         }
 
-        self.animate_scroll(ui, session, &snapshot);
+        // Release ends the press's sticky ownership, whether it arrived inside
+        // the window or was lost outside it. It stays set until after
+        // `handle_mouse` above, which is what delivers the matching mouse-up.
+        if released || scrollbar_drag_ended(any_down, pointer_present, focused) {
+            self.press_owner = None;
+        }
+
+        // A scrollbar drag applies its own full delta above; easing it again in
+        // the same frame would move twice and oscillate against the pointer.
+        if self.scrollbar_grab.is_none() && painted_offset.is_none() {
+            self.animate_scroll(ui, session, &snapshot);
+        }
         self.record_frame();
 
         TerminalResponse {
@@ -556,56 +1023,6 @@ impl TerminalView {
             }
         }
         self.frame_last = Some(now);
-    }
-
-    fn jump_to_bottom(
-        &mut self,
-        ui: &mut Ui,
-        painter: &egui::Painter,
-        rect: Rect,
-        tokens: &Tokens,
-        session: &Session,
-        snapshot: &Snapshot,
-    ) -> Rect {
-        let pill = Rect::from_min_size(
-            pos2(rect.right() - 12.0 - 28.0, rect.bottom() - 12.0 - 28.0),
-            vec2(28.0, 28.0),
-        );
-        let pill_response = ui.interact(pill, ui.scope_id().with("jump-to-bottom"), Sense::click());
-        let fill = if pill_response.hovered() {
-            tokens.bg_hover
-        } else {
-            tokens.bg_elevated
-        };
-        painter.rect_filled(pill, 14.0, fill);
-        painter.rect_stroke(
-            pill,
-            14.0,
-            Stroke::new(1.0, tokens.border),
-            egui::StrokeKind::Inside,
-        );
-        let center = pill.center();
-        let color = tokens.fg;
-        painter.line_segment(
-            [
-                pos2(center.x - 4.0, center.y - 2.0),
-                pos2(center.x, center.y + 2.0),
-            ],
-            Stroke::new(1.5, color),
-        );
-        painter.line_segment(
-            [
-                pos2(center.x, center.y + 2.0),
-                pos2(center.x + 4.0, center.y - 2.0),
-            ],
-            Stroke::new(1.5, color),
-        );
-        if pill_response.clicked() {
-            self.scroll_target = 0;
-            let offset = i32::try_from(snapshot.display_offset).unwrap_or(i32::MAX);
-            session.scroll(-offset);
-        }
-        pill
     }
 
     fn animate_scroll(&mut self, ui: &Ui, session: &Session, snapshot: &Snapshot) {
@@ -1922,6 +2339,265 @@ mod tests {
         assert_eq!(apply_wheel(0, 3), 9);
         assert_eq!(apply_wheel(9, -2), 3);
         assert_eq!(apply_wheel(1, -1), 0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_length_tracks_the_viewport_ratio() {
+        // No scrollback: the thumb fills the track (and the bar is hidden).
+        assert_eq!(scrollbar_thumb_length(200.0, 24, 0), 200.0);
+        // Half the document visible: half the track.
+        assert_eq!(scrollbar_thumb_length(200.0, 24, 24), 100.0);
+        // A huge scrollback keeps a grabbable minimum.
+        assert_eq!(
+            scrollbar_thumb_length(200.0, 24, 1_000_000),
+            SCROLLBAR_MIN_THUMB
+        );
+        // A track shorter than the minimum clamps to the track itself.
+        assert_eq!(scrollbar_thumb_length(10.0, 24, 1_000), 10.0);
+        // Degenerate geometry is zero, never negative or NaN.
+        assert_eq!(scrollbar_thumb_length(0.0, 24, 100), 0.0);
+        assert_eq!(scrollbar_thumb_length(-5.0, 24, 100), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_thumb_top_tracks_display_offset() {
+        let track = Rect::from_min_max(pos2(0.0, 0.0), pos2(10.0, 200.0));
+        // display_offset 0 is the live bottom.
+        assert_eq!(Scrollbar::new(track, 24, 24, 0).thumb.top(), 100.0);
+        assert_eq!(Scrollbar::new(track, 24, 24, 12).thumb.top(), 50.0);
+        assert_eq!(Scrollbar::new(track, 24, 24, 24).thumb.top(), 0.0);
+        // Offsets past the ends still clamp onto the track.
+        assert_eq!(Scrollbar::new(track, 24, 24, 99).thumb.top(), 0.0);
+    }
+
+    #[test]
+    fn scrollbar_is_hidden_without_scrollback() {
+        let content = Rect::from_min_size(pos2(0.0, 0.0), vec2(400.0, 200.0));
+        let grid = Rect::from_min_size(pos2(8.0, 8.0), vec2(380.0, 184.0));
+        assert_eq!(Scrollbar::for_grid(content, grid, 24, 0, 0), None);
+        let bar =
+            Scrollbar::for_grid(content, grid, 24, 100, 0).expect("scrollback shows a scrollbar");
+        assert_eq!(bar.track.right(), content.right());
+        assert_eq!(bar.track.width(), SCROLLBAR_WIDTH);
+        assert!(bar.track.top() >= grid.top() && bar.track.bottom() <= grid.bottom());
+        // Zero-height grids and zero-height tracks are ignored.
+        let flat = Rect::from_min_size(pos2(8.0, 8.0), vec2(384.0, 0.0));
+        assert_eq!(Scrollbar::for_grid(content, flat, 24, 100, 0), None);
+    }
+
+    #[test]
+    fn scrollbar_track_never_overlaps_the_cell_area() {
+        let content = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 480.0));
+        let metrics = metrics();
+        for padding in [0.0, 1.0, 2.0, 4.0, 8.0, 12.0] {
+            let (cols, rows) = TerminalView::grid_size(content, &metrics, padding);
+            let cell_area = Rect::from_min_size(
+                pos2(content.min.x + padding, content.min.y + padding),
+                vec2(metrics.width * cols as f32, metrics.height * rows as f32),
+            );
+            let bar = Scrollbar::for_grid(content, cell_area, rows, 100, 0)
+                .unwrap_or_else(|| panic!("padding {padding} lost its scroll affordance"));
+            assert!(bar.track.width() > 0.0);
+            assert!(bar.track.right() <= content.right());
+            assert!(bar.track.height() > 0.0);
+            if bar.overlay {
+                // No usable gutter: the fallback lives inside the grid's right
+                // edge, hidden until hovered, so it does not permanently cover
+                // the last column.
+                assert!(
+                    !bar.paints_when_idle(),
+                    "fallback must not paint idle at padding {padding}"
+                );
+                assert!(bar.track.left() >= cell_area.right() - SCROLLBAR_OVERLAY_WIDTH);
+                assert!(bar.track.right() <= cell_area.right());
+                assert!(bar.track.width() <= SCROLLBAR_OVERLAY_WIDTH);
+            } else {
+                assert!(
+                    !bar.track.intersects(cell_area),
+                    "the strip overlaps cells at padding {padding}"
+                );
+                assert!(bar.track.left() >= cell_area.right());
+                assert_eq!(bar.track.width(), SCROLLBAR_WIDTH);
+            }
+        }
+        // Padding 0 and 1 have no gutter at all: the fallback must be in
+        // effect rather than silently dropping the scrollbar.
+        for padding in [0.0, 1.0] {
+            let (cols, rows) = TerminalView::grid_size(content, &metrics, padding);
+            let cell_area = Rect::from_min_size(
+                pos2(padding, padding),
+                vec2(metrics.width * cols as f32, metrics.height * rows as f32),
+            );
+            let bar = Scrollbar::for_grid(content, cell_area, rows, 100, 0).unwrap();
+            assert!(
+                bar.overlay,
+                "padding {padding} must use the overlay fallback"
+            );
+            assert!(!bar.paints_when_idle());
+        }
+        // A gutter wide enough still gets the full comfortable strip.
+        let (cols, rows) = TerminalView::grid_size(content, &metrics, 12.0);
+        let cell_area = Rect::from_min_size(
+            pos2(12.0, 12.0),
+            vec2(metrics.width * cols as f32, metrics.height * rows as f32),
+        );
+        let bar = Scrollbar::for_grid(content, cell_area, rows, 100, 0).unwrap();
+        assert!(!bar.overlay);
+        assert_eq!(bar.track.width(), SCROLLBAR_WIDTH);
+    }
+
+    #[test]
+    fn scrollbar_ownership_is_sticky_to_the_grid() {
+        // Hovering the strip owns the pointer when no press began on the grid.
+        assert!(scrollbar_owns_pointer(false, false, true));
+        // A press that began on the grid keeps ownership across the strip.
+        assert!(!scrollbar_owns_pointer(false, true, true));
+        // An active drag owns the pointer even outside the track.
+        assert!(scrollbar_owns_pointer(true, true, false));
+    }
+
+    #[test]
+    fn scrollbar_drag_ends_when_button_pointer_or_focus_is_gone() {
+        let pos = pos2(4.0, 4.0);
+        assert!(!scrollbar_drag_ended(true, Some(pos), true));
+        assert!(scrollbar_drag_ended(false, Some(pos), true));
+        assert!(scrollbar_drag_ended(true, None, true));
+        assert!(scrollbar_drag_ended(true, Some(pos), false));
+    }
+
+    #[test]
+    fn drag_frame_applies_its_delta_once() {
+        // 200 pt track, 40 pt thumb, 80 lines: dragging to the top asks for 80.
+        let grab = ScrollbarGrab {
+            grab: 0.0,
+            track_top: 0.0,
+            track_height: 200.0,
+            thumb_height: 40.0,
+            history: 80,
+        };
+        // Exercise the real per-frame path used by `show`, not just the
+        // formula. The first frame reports the delta exactly once.
+        let first = scrollbar_drag_frame(&grab, 0, Some(0.0), false).expect("active drag");
+        assert_eq!((first.target, first.delta), (80, 80));
+        // `show` applies `delta` once to the session and paints the thumb from
+        // `target`, skipping easing. Replaying the same pointer against the
+        // updated offset must therefore be a no-op; re-introducing a second
+        // application would make this 80 again.
+        let replay =
+            scrollbar_drag_frame(&grab, first.target, Some(0.0), false).expect("active drag");
+        assert_eq!((replay.target, replay.delta), (80, 0));
+        // The end condition is evaluated before any delta: a stale grab on
+        // return to a hidden tab reports nothing at all.
+        assert_eq!(scrollbar_drag_frame(&grab, 0, Some(0.0), true), None);
+        assert_eq!(scrollbar_drag_frame(&grab, 0, None, false), None);
+    }
+
+    #[test]
+    fn drag_geometry_is_frozen_at_press_time() {
+        // Offsets come from the grab's history, not the live one, so lines
+        // arriving during a drag cannot shift the view under the pointer.
+        let frozen = ScrollbarGrab {
+            grab: 0.0,
+            track_top: 0.0,
+            track_height: 200.0,
+            thumb_height: 40.0,
+            history: 80,
+        };
+        let grown = ScrollbarGrab {
+            history: 800,
+            ..frozen
+        };
+        assert_eq!(apply_scrollbar_drag(&frozen, 0, 80.0).0, 40);
+        assert_eq!(apply_scrollbar_drag(&grown, 0, 80.0).0, 400);
+    }
+
+    #[test]
+    fn drag_geometry_freezes_the_track_origin_too() {
+        let grab = ScrollbarGrab {
+            grab: 10.0,
+            track_top: 40.0,
+            track_height: 200.0,
+            thumb_height: 40.0,
+            history: 80,
+        };
+        // A resize moved the live track down by 50 pt; the inverse mapping and
+        // the painted thumb must both keep using the press-time origin.
+        let moved = Rect::from_min_max(pos2(390.0, 90.0), pos2(400.0, 290.0));
+        let frozen = frozen_track_rect(&grab, moved);
+        assert_eq!(frozen.top(), 40.0);
+        assert_eq!(frozen.bottom(), 240.0);
+        assert_eq!(frozen.left(), moved.left());
+        // Pointer 60 pt below the *frozen* top maps to 55 lines into history,
+        // regardless of where the live track now starts.
+        assert_eq!(apply_scrollbar_drag(&grab, 0, 100.0).0, 55);
+        let frame = scrollbar_drag_frame(&grab, 0, Some(100.0), false).unwrap();
+        let painted = Scrollbar::with_thumb_height(
+            frozen,
+            grab.thumb_height,
+            grab.history,
+            usize::try_from(frame.target.max(0)).unwrap_or(0),
+            false,
+        );
+        assert_eq!(painted.thumb.top(), 90.0);
+    }
+
+    #[test]
+    fn grid_press_survives_scrollback_appearing_mid_drag() {
+        // No scrollback: there is no bar, but a press still belongs to the
+        // grid so copy-on-select and mouse-up keep working.
+        let pos = pos2(395.0, 100.0);
+        assert_eq!(press_target(None, pos, true), PressTarget::Grid);
+        // Scrollback arrives and the pointer now happens to be over the bar.
+        let content = Rect::from_min_size(Pos2::ZERO, vec2(400.0, 200.0));
+        let grid = Rect::from_min_size(pos2(8.0, 8.0), vec2(380.0, 184.0));
+        let bar = Scrollbar::for_grid(content, grid, 24, 100, 0).expect("bar exists");
+        assert!(bar.track.contains(pos));
+        // The existing grid press keeps ownership; the bar cannot steal it.
+        assert!(!scrollbar_owns_pointer(false, true, true));
+        // The press itself was never re-hit-tested, so the target is still the
+        // grid and the release will be delivered there.
+        assert_eq!(press_target(Some(&bar), pos, false), PressTarget::Grid);
+        assert!(owes_grid_release(Some(PressOwner::Grid), false));
+    }
+
+    #[test]
+    fn release_is_only_delivered_for_a_press_this_view_saw() {
+        // A grid press owns and owes its release.
+        assert!(owes_grid_release(Some(PressOwner::Grid), false));
+        // A thumb drag that ends over the cells owes the grid nothing.
+        assert!(!owes_grid_release(Some(PressOwner::Scrollbar), false));
+        // A release whose press landed while another tab was shown is not
+        // delivered either: mouse-reporting apps must not see a bare mouse-up.
+        assert!(!owes_grid_release(None, false));
+        // A same-frame click still reaches the grid.
+        assert!(owes_grid_release(None, true));
+    }
+
+    #[test]
+    fn track_click_does_not_page_past_the_live_bottom() {
+        // Downward paging at offset 0 has nothing above to reveal.
+        assert!(!track_click_pages(-24, 0));
+        // Upward paging and paging back down from history are both allowed.
+        assert!(track_click_pages(24, 0));
+        assert!(track_click_pages(-24, 10));
+    }
+
+    #[test]
+    fn scrollbar_drag_maps_position_to_offset_and_clamps() {
+        // 40 px thumb on a 200 px track, 80 lines of history: 160 px travel.
+        assert_eq!(drag_offset(200.0, 40.0, 80, 160.0, 0.0), 0);
+        assert_eq!(drag_offset(200.0, 40.0, 80, 80.0, 0.0), 40);
+        assert_eq!(drag_offset(200.0, 40.0, 80, 0.0, 0.0), 80);
+        // Dragging past either end clamps instead of overshooting.
+        assert_eq!(drag_offset(200.0, 40.0, 80, 500.0, 0.0), 0);
+        assert_eq!(drag_offset(200.0, 40.0, 80, -500.0, 0.0), 80);
+        // The grab offset keeps the thumb under the pointer.
+        assert_eq!(drag_offset(200.0, 40.0, 80, 100.0, 20.0), 40);
+        // Degenerate geometry never panics.
+        assert_eq!(drag_offset(0.0, 0.0, 1_000, 50.0, 10.0), 0);
+        assert_eq!(drag_offset(20.0, 40.0, 1_000, 5.0, 0.0), 0);
+        assert_eq!(drag_offset(200.0, 40.0, 0, 50.0, 10.0), 0);
+        assert_eq!(drag_offset(f32::NAN, 40.0, 80, 50.0, 10.0), 0);
     }
 
     #[test]

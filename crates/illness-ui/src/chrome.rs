@@ -75,6 +75,10 @@ pub enum Action {
     Minimize,
     Maximize,
     CloseWindow,
+    /// The user confirmed closing while the confirmation card was up.
+    ConfirmCloseWindow,
+    /// The user dismissed the confirmation card; the window stays open.
+    CancelCloseWindow,
     ConfigChanged,
     ToggleMaterial,
     Copy,

@@ -570,6 +570,22 @@ pub struct IllnessApp {
     pending_material: bool,
     save_debounce: SaveDebounce,
     saved: bool,
+    /// Set when the user confirmed closing through the confirmation card.
+    ///
+    /// Invariant: this is only true for the close that follows the
+    /// confirmation. It is cleared by [`Self::dismiss_close_confirmation`] on
+    /// cancel or dismissal, and by [`Self::reapply_config`] when
+    /// `confirm_close_with_tabs` is turned off. A sent
+    /// `ViewportCommand::Close` normally beats a `CancelClose`, so leaving it
+    /// set looked harmless, but any future veto (a host-side cancel, a modal,
+    /// a shutdown failure) would then close the window without asking again.
+    close_confirmed: bool,
+    /// Shared with the host: whether a window close would currently show the
+    /// confirmation card. The host reads it when a close arrives for a window
+    /// that cannot paint (minimized/hidden) and restores the window instead of
+    /// exiting. Refreshed from the setting plus the terminal-tab count every
+    /// frame.
+    close_guarded: Arc<AtomicBool>,
 }
 
 impl IllnessApp {
@@ -579,6 +595,7 @@ impl IllnessApp {
         window: Arc<Window>,
         native_transparency: bool,
         startup_folder: Option<PathBuf>,
+        close_guarded: Arc<AtomicBool>,
     ) -> Self {
         let mut config = Config::load();
         let mut detected = detect_profiles();
@@ -689,6 +706,8 @@ impl IllnessApp {
             pending_material: false,
             save_debounce: SaveDebounce::default(),
             saved: false,
+            close_confirmed: false,
+            close_guarded,
         };
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
@@ -1983,6 +2002,11 @@ impl IllnessApp {
 
     fn reapply_config(&mut self) {
         self.config = self.config.clone().sanitized();
+        if !self.config.confirm_close_with_tabs {
+            // The guard is off, so a stale confirmation must not survive a
+            // later re-enable and close the window without asking.
+            self.close_confirmed = false;
+        }
         if self.config.profiles != self.profiles {
             self.profiles = self.config.profiles.clone();
         }
@@ -2157,6 +2181,78 @@ impl IllnessApp {
             self.overlays
                 .set_toast(format!("Could not save config: {error}"));
         }
+    }
+
+    /// Hold back an OS close request when the setting asks for confirmation.
+    ///
+    /// One terminal tab, a disabled setting, or an already-confirmed close
+    /// falls through to the host, which saves and exits as before. Otherwise
+    /// the request is cancelled and the confirmation card is shown.
+    fn handle_close_request(&mut self, ctx: &egui::Context) {
+        if !ctx.input(|input| input.viewport().close_requested()) {
+            return;
+        }
+
+        // A second press while the card is up must not stack another prompt.
+        // It still re-checks the count: a background shell may have exited, so
+        // the card's number and the veto must not disagree.
+        if matches!(self.overlays.kind, OverlayKind::ConfirmClose) {
+            if self.would_confirm_close() {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+            } else {
+                // Only one terminal is left, so the guard no longer applies:
+                // dismiss the stale card and let this close proceed unguarded.
+                self.dismiss_close_confirmation();
+            }
+            return;
+        }
+
+        if !self.would_confirm_close() {
+            return;
+        }
+
+        self.open_close_confirmation();
+        ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+        ctx.request_repaint();
+    }
+
+    /// Every terminal tab, whether or not its shell attached.
+    ///
+    /// The Settings tab owns no session, so counting it would turn one shell
+    /// into a "2 tabs are open" prompt. A pending or failed spawn *is* counted:
+    /// the card covers the tabs the user can see, and such a tab is still one
+    /// of them.
+    fn terminal_tab_count(&self) -> usize {
+        terminal_tab_count(&self.tabs)
+    }
+
+    /// Whether a close request would currently show the confirmation card.
+    fn would_confirm_close(&self) -> bool {
+        should_confirm_close(
+            self.terminal_tab_count(),
+            self.config.confirm_close_with_tabs,
+            self.close_confirmed,
+        )
+    }
+
+    /// Dismiss the close card without closing, forgetting the confirmation.
+    ///
+    /// Clearing `close_confirmed` keeps the invariant that a confirmation
+    /// covers only the close request it answered.
+    fn dismiss_close_confirmation(&mut self) {
+        self.close_confirmed = false;
+        self.overlays.close();
+    }
+
+    /// Replace whatever overlay is open with the close confirmation.
+    ///
+    /// The previous overlay is dismissed rather than restored: a palette
+    /// query or search field typed before the prompt is not kept hidden behind
+    /// a modal, and cancelling therefore leaves no stale overlay state.
+    fn open_close_confirmation(&mut self) {
+        self.overlays.close();
+        self.overlays.kind = OverlayKind::ConfirmClose;
+        self.ctx.request_repaint();
     }
 
     pub fn shutdown_and_save(&mut self) {
@@ -2572,9 +2668,25 @@ impl IllnessApp {
             }
             Action::CloseWindow => {
                 log::debug!("close-window action");
-                // Let the host run the pass, collect the Close command and
-                // save/exit afterwards so a CancelClose can still win.
+                // The titlebar button must ask the same question as the OS
+                // close frame instead of bypassing it.
+                if self.would_confirm_close() {
+                    self.open_close_confirmation();
+                } else {
+                    // Let the host run the pass, collect the Close command and
+                    // save/exit afterwards so a CancelClose can still win.
+                    self.ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+            Action::ConfirmCloseWindow => {
+                log::debug!("close-window confirmed");
+                self.close_confirmed = true;
+                self.overlays.close();
                 self.ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+            Action::CancelCloseWindow => {
+                log::debug!("close-window cancelled");
+                self.dismiss_close_confirmation();
             }
             Action::ConfigChanged => self.reapply_config(),
             Action::ToggleMaterial => {
@@ -2937,6 +3049,14 @@ impl IllnessApp {
         self.update_window_title(&ctx);
 
         let tab_infos = self.tab_infos();
+        // Publish the guard decision for the host before handling this frame's
+        // close request. The host reads it when the window is minimized or
+        // hidden and therefore cannot present the card itself.
+        self.close_guarded
+            .store(self.would_confirm_close(), Ordering::Relaxed);
+        // Runs before the overlay pass so the card paints this same frame and
+        // `overlay_open` already sees it.
+        self.handle_close_request(&ctx);
         let mut actions = chrome::show(
             &ctx,
             &mut self.chrome,
@@ -3165,6 +3285,7 @@ impl IllnessApp {
             self.resize_edges(ui);
         }
 
+        let terminal_tabs = self.terminal_tab_count();
         actions.extend(overlays::show(
             &ctx,
             &mut self.overlays,
@@ -3172,6 +3293,7 @@ impl IllnessApp {
             &mut self.config,
             &self.profiles,
             &tab_infos,
+            terminal_tabs,
         ));
 
         for action in actions {
@@ -3783,6 +3905,26 @@ fn removal_closes_window(remaining: usize) -> bool {
     remaining == 0
 }
 
+/// Count terminal tabs, ignoring the Settings tab.
+///
+/// Settings is a real slot in the tab strip but has no session to lose, so it
+/// must not decide whether closing the window needs confirmation. Every
+/// [`TabEntry::Terminal`] counts, including one whose spawn is pending or has
+/// failed: it is still a tab the user sees.
+fn terminal_tab_count(tabs: &[TabEntry]) -> usize {
+    tabs.iter()
+        .filter(|entry| matches!(entry, TabEntry::Terminal(_)))
+        .count()
+}
+
+/// Whether a window close request must be confirmed first.
+///
+/// One tab closes straight away. A disabled setting keeps today's behaviour,
+/// and a close the user already confirmed must never prompt twice.
+fn should_confirm_close(tab_count: usize, setting_enabled: bool, already_confirmed: bool) -> bool {
+    setting_enabled && !already_confirmed && tab_count > 1
+}
+
 /// Opaque, themed frame shared by the recovery card and tests.
 fn recovery_frame(tokens: &Tokens) -> egui::Frame {
     egui::Frame::new()
@@ -4170,6 +4312,52 @@ mod tests {
             len: Some(16),
             digest: Some(digest),
         }
+    }
+
+    #[test]
+    fn settings_tab_does_not_count_toward_close_confirmation() {
+        let terminal = || TabEntry::Terminal(Box::new(Tab::pending(1, &Profile::default(), None)));
+        let tabs = vec![
+            terminal(),
+            TabEntry::Settings,
+            TabEntry::Terminal(Box::new(Tab::pending(2, &Profile::default(), None))),
+        ];
+        assert_eq!(terminal_tab_count(&tabs), 2);
+        assert!(
+            should_confirm_close(terminal_tab_count(&tabs), true, false),
+            "two shells plus Settings is two sessions, so it prompts"
+        );
+
+        // One shell plus Settings must take the single-tab fast path.
+        let one_terminal = vec![terminal(), TabEntry::Settings];
+        assert_eq!(terminal_tab_count(&one_terminal), 1);
+        assert!(
+            !should_confirm_close(terminal_tab_count(&one_terminal), true, false),
+            "Settings alone must not turn one shell into a close prompt"
+        );
+        // Settings alone is not a terminal tab at all.
+        assert_eq!(terminal_tab_count(&[TabEntry::Settings]), 0);
+        assert!(!should_confirm_close(0, true, false));
+    }
+
+    #[test]
+    fn close_confirmation_needs_tabs_setting_and_no_confirmation() {
+        assert!(
+            !should_confirm_close(1, true, false),
+            "a single tab closes immediately"
+        );
+        assert!(
+            should_confirm_close(2, true, false),
+            "two tabs ask before closing"
+        );
+        assert!(
+            !should_confirm_close(2, false, false),
+            "the disabled setting keeps the old close path"
+        );
+        assert!(
+            !should_confirm_close(2, true, true),
+            "an already confirmed close must not prompt again"
+        );
     }
 
     #[test]

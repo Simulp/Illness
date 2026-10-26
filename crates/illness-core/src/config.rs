@@ -75,6 +75,10 @@ pub struct Config {
     /// Draw terminal glyphs with the GPU compositor when a wgpu device is
     /// available. `false` always uses the CPU grayscale compositor.
     pub gpu_text: bool,
+    /// Ask before closing the window while more than one tab is open.
+    /// Missing in older configs means enabled.
+    #[serde(default = "enabled_by_default")]
+    pub confirm_close_with_tabs: bool,
 }
 
 impl Default for Config {
@@ -98,6 +102,7 @@ impl Default for Config {
             profiles: Vec::new(),
             hidden_profiles: Vec::new(),
             gpu_text: true,
+            confirm_close_with_tabs: true,
         }
         .sanitized()
     }
@@ -106,7 +111,8 @@ impl Default for Config {
 impl Config {
     /// Load configuration from `%APPDATA%\illness\config.toml`.
     ///
-    /// Missing or malformed files never fail; they log and yield defaults.
+    /// Missing, unreadable, or malformed files never fail; they log and yield
+    /// defaults.
     pub fn load() -> Self {
         Self::load_from(&Self::path())
     }
@@ -119,16 +125,25 @@ impl Config {
                 // every settings edit would delete a profile mid-rename.
                 Ok(config) => config.sanitized().deduplicated(),
                 Err(error) => {
-                    log::warn!(
-                        "failed to parse {}: {error}; using defaults",
-                        path.display()
+                    // Parsing is all-or-nothing: one hand-edited bad value
+                    // (e.g. `confirm_close_with_tabs = "yes"`) drops every
+                    // setting back to defaults, and the next save would
+                    // overwrite the user's file.
+                    keep_unreadable_config(
+                        path,
+                        format!("failed to parse {}: {error}", path.display()),
                     );
                     Self::default()
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::default(),
             Err(error) => {
-                log::warn!("failed to read {}: {error}; using defaults", path.display());
+                // A sharing violation (virus scanner, OneDrive, an editor
+                // holding the file) or a non-UTF-8 file leaves a perfectly
+                // valid config unread. This is not the user's mistake, and the
+                // next save renames over the file, so preserve it exactly as a
+                // parse failure would.
+                keep_unreadable_config(path, format!("failed to read {}: {error}", path.display()));
                 Self::default()
             }
         }
@@ -276,6 +291,53 @@ impl Config {
     }
 }
 
+/// What happened to the backup copy of a config file that cannot be loaded.
+enum Backup {
+    /// This call copied the unreadable file.
+    Copied,
+    /// A backup from an earlier failure was already there and was left alone.
+    AlreadyPresent,
+    /// The copy itself failed.
+    Failed(std::io::Error),
+}
+
+/// Preserve a config file that could not be read or parsed.
+///
+/// The next [`Config::save_to`] renames over `config.toml`, so anything not
+/// copied here is lost. The original is kept as `config.toml.bak` for manual
+/// recovery; an existing backup is never replaced, so a later failure cannot
+/// destroy the copy made for an earlier one. Trade-off: the running session
+/// still uses defaults; only the file contents are preserved. This is
+/// deliberately not a per-field fallback parser.
+fn keep_unreadable_config(path: &Path, problem: String) {
+    let backup = path.with_extension("toml.bak");
+    let outcome = if backup.exists() {
+        Backup::AlreadyPresent
+    } else {
+        match std::fs::copy(path, &backup) {
+            Ok(_) => Backup::Copied,
+            Err(error) => Backup::Failed(error),
+        }
+    };
+
+    match outcome {
+        Backup::Copied => log::error!(
+            "{problem}; kept the unreadable file as {} and using defaults",
+            backup.display()
+        ),
+        // Say exactly what happened: this file is gone after the next save,
+        // and a message claiming it was kept would hide that.
+        Backup::AlreadyPresent => log::error!(
+            "{problem}; the earlier backup at {} was kept, but this file could not be preserved; using defaults",
+            backup.display()
+        ),
+        Backup::Failed(error) => log::error!(
+            "{problem}; could not back it up to {}: {error}; using defaults",
+            backup.display()
+        ),
+    }
+}
+
 /// Collapse case-insensitive duplicate profile names, keeping the first.
 pub fn dedupe_profiles(profiles: &mut Vec<Profile>) {
     let mut seen: Vec<String> = Vec::new();
@@ -345,6 +407,7 @@ mod tests {
         assert!(config.profiles.is_empty());
         assert!(config.hidden_profiles.is_empty());
         assert!(config.gpu_text);
+        assert!(config.confirm_close_with_tabs);
     }
 
     #[test]
@@ -399,6 +462,19 @@ mod tests {
     }
 
     #[test]
+    fn missing_confirm_close_defaults_to_enabled() {
+        let parsed: Config = toml::from_str("theme = \"Nord\"\n").expect("parse config");
+        assert!(
+            parsed.confirm_close_with_tabs,
+            "older configs confirm before closing with tabs"
+        );
+
+        let disabled: Config =
+            toml::from_str("confirm_close_with_tabs = false\n").expect("parse explicit value");
+        assert!(!disabled.confirm_close_with_tabs);
+    }
+
+    #[test]
     fn missing_file_returns_defaults() {
         let dir = temp_dir();
         let loaded = Config::load_from(&dir.join("absent.toml"));
@@ -413,6 +489,69 @@ mod tests {
         std::fs::write(&path, "font_size = [\n").expect("write bad toml");
         let loaded = Config::load_from(&path);
         assert_eq!(loaded, Config::default());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unreadable_config_is_backed_up_once_before_defaults_can_overwrite_it() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        // A valid key with a wrong type: the kind of hand edit that makes the
+        // whole parse fail and used to let the next save wipe every setting.
+        let original = "theme = \"Nord\"\nconfirm_close_with_tabs = \"yes\"\n";
+        std::fs::write(&path, original).expect("write bad config");
+
+        assert_eq!(Config::load_from(&path), Config::default());
+
+        let backup = path.with_extension("toml.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup written"),
+            original,
+            "the unreadable file must survive as config.toml.bak"
+        );
+
+        // A second failure keeps the first backup instead of replacing it.
+        std::fs::write(&path, "font_size = [\n").expect("write second bad config");
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(
+            std::fs::read_to_string(&backup).expect("backup kept"),
+            original,
+            "an existing backup is never clobbered"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_error_is_backed_up_before_defaults_can_overwrite_it() {
+        let dir = temp_dir();
+        let path = dir.join("config.toml");
+        // Valid UTF-8 is required by `read_to_string`, so non-UTF-8 bytes make
+        // reading fail without making the file unparseable. That reaches the
+        // same branch as a sharing violation or permission error, but unlike
+        // those it can be produced deterministically in a test.
+        let original: &[u8] = b"theme = \"Nord\"\n# caf\xe9\n";
+        std::fs::write(&path, original).expect("write non-utf8 config");
+
+        assert_eq!(Config::load_from(&path), Config::default());
+
+        let backup = path.with_extension("toml.bak");
+        assert_eq!(
+            std::fs::read(&backup).expect("backup written"),
+            original,
+            "a read error must preserve the file byte for byte"
+        );
+
+        // A second unreadable file keeps the first backup instead of replacing
+        // it; the message says so rather than claiming this file was kept.
+        std::fs::write(&path, b"theme = \"Nord\"\n# other\n\xff").expect("write second config");
+        assert_eq!(Config::load_from(&path), Config::default());
+        assert_eq!(
+            std::fs::read(&backup).expect("backup kept"),
+            original,
+            "an existing backup is never clobbered"
+        );
+
         let _ = std::fs::remove_dir_all(dir);
     }
 
