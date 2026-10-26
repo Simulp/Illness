@@ -1,30 +1,81 @@
+<div align="center">
+
 # ILLNESS
 
 ### The Terminal Emulator for the Terminally Ill.
 
-<p align="center"><img src="assets/illness.png" width="96" alt="Illness logo"></p>
+<img src="assets/illness.png" width="128" alt="Illness logo">
 
 A Windows-first terminal built on Alacritty's VT core with its own egui shell: the same parser,
 grid, scrollback and ConPTY plumbing, plus tabs, a command palette, real settings, and a window
 that does not look like it was shipped in 1995.
 
-![Illness terminal under Acrylic](assets/ls_acrylic.jpg)
+</div>
 
-![Command palette](assets/palette.jpg)
+## Screenshots
 
-![Settings - appearance and terminal](assets/settings_1.jpg)
+<div align="center">
+  <img src="assets/ls_acrylic.jpg" width="850" alt="Illness terminal with Acrylic background">
+  
+   <sub>Illness running with Acrylic window material</sub>
+</div>
 
-![Settings - behavior, profiles and about](assets/settings_2.jpg)
+<br>
 
-Every view under the three window materials:
+<table>
+  <tr>
+    <td width="50%">
+      <img src="assets/palette.jpg" alt="Command palette">
+      <p align="center"><sub>Command palette</sub></p>
+    </td>
+    <td width="50%">
+      <img src="assets/settings_1.jpg" alt="Settings">
+      <p align="center"><sub>Appearance and terminal settings</sub></p>
+    </td>
+  </tr>
+</table>
 
-| | Solid | Mica | Acrylic |
-| --- | --- | --- | --- |
-| Directory listing | ![Solid](assets/ls_solid.jpg) | ![Mica](assets/ls_mica.jpg) | ![Acrylic](assets/ls_acrylic.jpg) |
-| Coding agent | ![Solid](assets/oc_solid.jpg) | ![Mica](assets/oc_mica.jpg) | ![Acrylic](assets/oc_acrylic.jpg) |
-| Close confirmation | ![Solid](assets/exit_solid.jpg) | ![Mica](assets/exit_mica.jpg) | ![Acrylic](assets/exit_acrylic.jpg) |
+<details>
+<summary><b>More screenshots</b> — Profiles, settings & tabs</summary>
 
-![New-tab dropdown with detected profiles](assets/dropdown.jpg)
+<br>
+
+### Settings
+
+![Behavior, profiles and about](assets/settings_2.jpg)
+
+### New-tab dropdown
+
+![Detected shell profiles](assets/dropdown.jpg)
+
+</details>
+
+<details>
+<summary><b>Window materials</b> — Solid vs Mica vs Acrylic</summary>
+
+<br>
+
+Illness supports three window materials. Compare how each looks across different views.
+
+### Directory listing
+
+| Solid | Mica | Acrylic |
+|:---:|:---:|:---:|
+| ![Solid](assets/ls_solid.jpg) | ![Mica](assets/ls_mica.jpg) | ![Acrylic](assets/ls_acrylic.jpg) |
+
+### Coding agent
+
+| Solid | Mica | Acrylic |
+|:---:|:---:|:---:|
+| ![Solid](assets/oc_solid.jpg) | ![Mica](assets/oc_mica.jpg) | ![Acrylic](assets/oc_acrylic.jpg) |
+
+### Close confirmation
+
+| Solid | Mica | Acrylic |
+|:---:|:---:|:---:|
+| ![Solid](assets/exit_solid.jpg) | ![Mica](assets/exit_mica.jpg) | ![Acrylic](assets/exit_acrylic.jpg) |
+
+</details>
 
 ## Why?
 
@@ -33,6 +84,8 @@ no window worth looking at. And because of a long-standing [Windows Terminal
 issue](https://github.com/microsoft/terminal/issues/11916): typing turns to molasses the moment
 anything CPU-heavy runs on the machine. See [latency workarounds](#latency-workarounds) for what
 this one does about it.
+
+And yes, it's personal.
 
 ## Take one now
 
@@ -216,7 +269,3 @@ Rust dependency and its license text, and `assets/fonts/` for Cascadia Code and 
 ## AI Disclosure
 
 DeepSeek v4.1 Flash 1017 was used extensively for development.
-
----
-
-Next: `cargo run -p illness`, then press `Ctrl+Shift+P`.
