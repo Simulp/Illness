@@ -20,10 +20,12 @@ antialiasing (no ClearType color fringing).
 ## Symptoms
 
 - Custom winit/egui window host with a frameless window, a real tab strip, profile accents and
-  native caption buttons.
+  native caption buttons. Drag tabs to reorder them: the tab follows the pointer, leaves a
+  landing slot, autoscrolls an overflowing strip, and activates when dropped. Escape cancels;
+  dropping outside the titlebar restores the original order.
 - Settings opens as its own tab, with right-aligned dropdowns, an editable shell profile list,
   an installed-font picker (Nerd Fonts included), and background controls.
-- Mica by default; Acrylic or Solid in Settings. Mica is the Windows 11 system backdrop and
+- Solid by default; Mica or Acrylic in Settings. Mica is the Windows 11 system backdrop and
   falls back to Solid when unavailable. Acrylic uses the legacy native behind-window accent
   blur where Windows 10/11 expose it, and also falls back to Solid. Acrylic's Desktop mode is
   native behind-window blur; Mica's Desktop mode paints a decoded, blurred snapshot of the
@@ -78,6 +80,11 @@ The positional folder is the launch folder. With **New tabs inherit current fold
 (the default, `inherit_cwd = true` in `%APPDATA%\illness\config.toml`), a new tab starts in the
 active shell's current directory; otherwise it uses the launch folder. The setting is captured
 when a tab is spawned: enabling it later does not retrofit already-open tabs.
+
+Launched without a folder — a Start Menu entry, a desktop shortcut, or the installed executable —
+Illness starts in `%USERPROFILE%` (`C:\Users\<you>`). Explorer and shortcuts set the process
+directory to the executable's own folder, which says nothing about where you were working, so that
+value is ignored there. A real console launch from another folder is honoured.
 
 PowerShell 7 syncs its cwd through `LocationChangedAction` without touching `prompt`. Windows
 PowerShell 5.1 has no equivalent hook, so Illness only wraps the built-in/default prompt there.
@@ -153,6 +160,23 @@ launch while the complete HKLM menu is authoritative.
 Configuration lives at `%APPDATA%\illness\config.toml` and is written on exit. Profiles are
 detected from the shells installed on the machine: PowerShell 7, Windows PowerShell, Command
 Prompt and WSL.
+
+### Latency workarounds
+
+Illness pins the pseudoconsole API to the inbox `conhost.exe`. `alacritty_terminal` loads
+`conpty.dll` by bare name, and a Windows Terminal or WezTerm install can put its own
+`conpty.dll` on `PATH`; that host, `OpenConsole.exe`, echoes keystrokes far more slowly. The DLL
+search is restricted to `System32` so the load falls back to kernel32's `CreatePseudoConsole`.
+The restriction is process-global: a `conpty.dll` shipped next to `illness.exe` is ignored.
+Set `ILLNESS_CONPTY=auto` to leave the DLL search alone.
+
+Illness raises the shell's own threads and its console host to above-normal priority so a saturated
+machine still echoes at a usable latency (about 302 ms unboosted versus 30 ms under 8/8 CPU
+saturation). The shell is boosted per thread, not per process: thread priority is not inherited,
+so long builds started inside Illness keep running at normal priority. `ILLNESS_NO_PRIORITY_BOOST=1`
+(unset, empty, `0`, `false`, `no` or `off` keeps the boost) disables it.
+
+Echo latency is measured with `crates/illness-term/examples/latency_probe.rs`.
 
 Known limitations in this dose: no split panes, no sixel/kitty graphics, no vi mode, and no
 tested Unix build. Mica is the Windows 11 system backdrop. Acrylic uses the legacy native

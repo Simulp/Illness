@@ -154,7 +154,9 @@ pub struct TerminalView {
     pub search: Option<SearchState>,
     pub last_click: Option<(f64, Pos2, u8)>,
     pub ime_pos: Option<Pos2>,
-    /// Snapshot modes cached for `take_input`, which has no session argument.
+    /// Modes from the last painted snapshot, used for mouse reporting and
+    /// wheel encoding between frames. Keyboard/paste encoding takes the live
+    /// modes from the session instead.
     modes: TermModes,
     last_layout: Option<(usize, usize, u32, u32)>,
     blink_epoch: f64,
@@ -929,24 +931,25 @@ impl TerminalView {
         self.modes.mouse_reporting
     }
 
-    /// Encode keyboard, text, IME, and paste events into PTY bytes. The app
-    /// should filter its global shortcuts first and call this only when no
-    /// overlay wants the keyboard.
-    pub fn take_input(&mut self, ui: &mut Ui) -> Option<Vec<u8>> {
-        let (events, modifiers) = ui.input(|input| (input.events.clone(), input.modifiers));
-        self.encode_input(&events, modifiers)
-    }
-
-    /// Encode already captured input events with the current terminal modes.
-    /// The app uses this to attach keys typed while a shell was still starting;
-    /// those events are no longer in the next frame's input queue.
-    pub fn encode_input(&self, events: &[Event], modifiers: Modifiers) -> Option<Vec<u8>> {
+    /// Encode keyboard, text, IME, and paste events into PTY bytes.
+    ///
+    /// `modes` must be read from the live session in the same frame
+    /// ([`Session::term_modes`]): the app encodes input before it builds the
+    /// snapshot, so a mode change in this frame is already visible here. The app
+    /// filters its global shortcuts first and calls this only when no overlay
+    /// wants the keyboard.
+    pub fn encode_input(
+        &self,
+        events: &[Event],
+        modifiers: Modifiers,
+        modes: TermModes,
+    ) -> Option<Vec<u8>> {
         let has_text = events
             .iter()
             .any(|event| matches!(event, Event::Text(_) | Event::Ime(ImeEvent::Commit(_))));
         let modes = KeyModes {
-            app_cursor: self.modes.app_cursor,
-            bracketed_paste: self.modes.bracketed_paste,
+            app_cursor: modes.app_cursor,
+            bracketed_paste: modes.bracketed_paste,
         };
         let mut bytes = Vec::new();
 
@@ -2011,7 +2014,7 @@ mod tests {
     #[test]
     fn ctrl_c_without_selection_sends_etx() {
         assert_eq!(
-            take_input_with(vec![key_event(EguiKey::C, ctrl_mods())]),
+            encode_input_with(vec![key_event(EguiKey::C, ctrl_mods())]),
             Some(vec![0x03])
         );
     }
@@ -2023,7 +2026,7 @@ mod tests {
             ..ctrl_mods()
         };
         assert_eq!(
-            take_input_with(vec![key_event(EguiKey::C, alt)]),
+            encode_input_with(vec![key_event(EguiKey::C, alt)]),
             Some(vec![0x1b, 0x03])
         );
     }
@@ -2035,12 +2038,37 @@ mod tests {
             ..ctrl_mods()
         };
         assert_eq!(
-            take_input_with(vec![
+            encode_input_with(vec![
                 key_event(EguiKey::Q, altgr),
                 Event::Text("@".to_string())
             ]),
             Some(b"@".to_vec())
         );
+    }
+
+    #[test]
+    fn explicit_modes_drive_cursor_keys_and_bracketed_paste() {
+        let modes = TermModes {
+            app_cursor: true,
+            bracketed_paste: true,
+            ..TermModes::default()
+        };
+        let view = TerminalView::default();
+
+        let cursor = view.encode_input(
+            &[key_event(EguiKey::ArrowUp, Modifiers::default())],
+            Modifiers::default(),
+            modes,
+        );
+        assert_eq!(cursor, Some(b"\x1bOA".to_vec()));
+        assert_ne!(cursor, Some(b"\x1b[A".to_vec()));
+
+        let pasted = view.encode_input(
+            &[Event::Paste("hello".to_string())],
+            Modifiers::default(),
+            modes,
+        );
+        assert_eq!(pasted, Some(b"\x1b[200~hello\x1b[201~".to_vec()));
     }
 
     fn ctrl_mods() -> Modifiers {
@@ -2061,21 +2089,8 @@ mod tests {
         }
     }
 
-    fn take_input_with(events: Vec<Event>) -> Option<Vec<u8>> {
-        let ctx = egui::Context::default();
-        let mut view = TerminalView::default();
-        let mut bytes = None;
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                events,
-                ..egui::RawInput::default()
-            },
-            |ui| {
-                bytes = view.take_input(ui);
-            },
-        );
-        output.textures_delta.clear();
-        bytes
+    fn encode_input_with(events: Vec<Event>) -> Option<Vec<u8>> {
+        TerminalView::default().encode_input(&events, Modifiers::default(), TermModes::default())
     }
 
     #[test]

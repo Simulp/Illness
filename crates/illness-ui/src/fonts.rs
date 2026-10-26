@@ -81,10 +81,11 @@ pub fn install(ctx: &egui::Context) {
 ///
 /// Monospace families come first (they are the useful terminal choices) but
 /// proportional families are still listed. The list is loaded once per process
-/// because enumerating system fonts is comparatively expensive.
-pub fn installed_families() -> Vec<String> {
+/// because enumerating system fonts is comparatively expensive, and the cached
+/// slice is shared so per-frame callers never clone it.
+pub fn installed_families() -> &'static [String] {
     static FAMILIES: OnceLock<Vec<String>> = OnceLock::new();
-    FAMILIES.get_or_init(load_installed_families).clone()
+    FAMILIES.get_or_init(load_installed_families).as_slice()
 }
 
 /// One system font database shared by enumeration and face loading.
@@ -277,6 +278,17 @@ mod tests {
     }
 
     #[test]
+    fn installed_families_reuses_cached_storage() {
+        let first = installed_families();
+        let second = installed_families();
+        assert!(
+            std::ptr::eq(first, second),
+            "installed_families must return the cached slice, not a clone"
+        );
+        assert_eq!(first.len(), second.len());
+    }
+
+    #[test]
     fn test_install_text_options() {
         let ctx = egui::Context::default();
         install(&ctx);
@@ -307,7 +319,7 @@ mod tests {
 
         let mut previous: Option<(bool, String)> = None;
         let mut seen_proportional = false;
-        for family in &families {
+        for family in families {
             let monospace = is_monospace(family);
             assert!(
                 !monospace || !seen_proportional,
@@ -354,9 +366,10 @@ mod tests {
     #[test]
     fn test_load_terminal_font() {
         let family = installed_families()
-            .into_iter()
-            .find(|family| family == "Cascadia Mono")
-            .or_else(|| installed_families().into_iter().next());
+            .iter()
+            .find(|family| family.as_str() == "Cascadia Mono")
+            .or_else(|| installed_families().first())
+            .cloned();
         let Some(family) = family else {
             eprintln!("skipping load assertion: no system fonts");
             return;

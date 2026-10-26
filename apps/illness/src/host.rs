@@ -559,10 +559,14 @@ impl ApplicationHandler<UserEvent> for Host {
             }
             WindowEvent::Destroyed => self.finish_close(event_loop),
             _ => {
-                if let Some(state) = self.state.as_mut()
-                    && state.on_window_event(&window, &event).repaint
-                {
-                    window.request_redraw();
+                if let Some(state) = self.state.as_mut() {
+                    let response = state.on_window_event(&window, &event);
+                    // A move only changes the window position; client-relative
+                    // content is unchanged. Hover/focus bookkeeping above still
+                    // runs, but a repaint here would duplicate the last frame.
+                    if response.repaint && event_needs_redraw(&event) {
+                        window.request_redraw();
+                    }
                 }
             }
         }
@@ -645,6 +649,17 @@ fn take_repaint_deadline(deadline: &Mutex<Option<Instant>>) -> Option<Instant> {
         .lock()
         .ok()
         .and_then(|mut deadline| deadline.take())
+}
+
+/// Whether an event handled by the generic window-event arm needs a paint.
+///
+/// `Moved` is the only event in that arm that cannot change client-relative
+/// content: Windows emits it for every step of a modal window move, and the
+/// compositor already shifts the existing frame. Cursor, resize, scale-factor,
+/// focus and theme events must still repaint (the latter two also have their
+/// own arms).
+fn event_needs_redraw(event: &WindowEvent) -> bool {
+    !matches!(event, WindowEvent::Moved(_))
 }
 
 /// Interpret a pass's viewport commands. A `Close` always wins, so an app that
@@ -760,14 +775,33 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> (bool, 
 
 #[cfg(test)]
 mod tests {
-    use super::{SurfaceResize, cancel_close_requested, surface_resize};
+    use super::{SurfaceResize, cancel_close_requested, event_needs_redraw, surface_resize};
     use egui::ViewportCommand;
+    use winit::dpi::{PhysicalPosition, PhysicalSize};
+    use winit::event::{DeviceId, WindowEvent};
 
     fn resized(width: u32, height: u32) -> SurfaceResize {
         SurfaceResize::Resize(
             std::num::NonZeroU32::new(width).expect("width"),
             std::num::NonZeroU32::new(height).expect("height"),
         )
+    }
+
+    #[test]
+    fn window_moves_do_not_request_a_paint() {
+        assert!(!event_needs_redraw(&WindowEvent::Moved(
+            PhysicalPosition::new(10, 20)
+        )));
+        assert!(event_needs_redraw(&WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(10.0, 20.0),
+        }));
+        assert!(event_needs_redraw(&WindowEvent::Resized(
+            PhysicalSize::new(800, 600)
+        )));
+        // ScaleFactorChanged cannot be constructed outside winit (its
+        // InnerSizeWriter is private), but it shares this default-true branch.
+        assert!(event_needs_redraw(&WindowEvent::Focused(false)));
     }
 
     #[test]

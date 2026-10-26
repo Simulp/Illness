@@ -19,7 +19,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use raw_window_handle::RawWindowHandle;
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM,
+};
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DwmExtendFrameIntoClientArea,
@@ -27,6 +29,15 @@ use windows_sys::Win32::Graphics::Dwm::{
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::Shell::{
+    DefSubclassProc, RemoveWindowSubclass, SUBCLASSPROC, SetWindowSubclass,
+};
+#[cfg(target_os = "windows")]
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    HTCAPTION, SC_MOVE, SC_SIZE, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_NCDESTROY, WM_NCLBUTTONDOWN,
+    WM_SYSCOMMAND,
+};
 
 /// Fallback attribute used by Windows 10 builds that predate the documented dark-mode id.
 #[cfg(target_os = "windows")]
@@ -42,9 +53,19 @@ const WCA_ACCENT_POLICY: u32 = 0x13;
 /// Windows 10/11 for behind-window blur.
 #[cfg(target_os = "windows")]
 const ACCENT_ENABLE_ACRYLICBLURBEHIND: u32 = 4;
+/// `ACCENT_ENABLE_BLURBEHIND`: a cheap Gaussian blur. Windows 1903+ recomputes
+/// legacy acrylic on every window move; using this state only for the duration
+/// of `WM_ENTERSIZEMOVE` avoids that DWM per-move cost while preserving the
+/// same tint. It is restored to acrylic as soon as the move loop ends.
+#[cfg(target_os = "windows")]
+const ACCENT_ENABLE_BLURBEHIND: u32 = 3;
 /// `ACCENT_DISABLED`: clears any previously applied accent policy.
 #[cfg(target_os = "windows")]
 const ACCENT_DISABLED: u32 = 0;
+
+/// Unique id for the window subclass that observes the modal move loop.
+#[cfg(target_os = "windows")]
+const ACRYLIC_MOVE_SUBCLASS_ID: usize = 0x494C_4E53;
 
 /// Alpha at 100% background opacity. The legacy acrylic blur needs a
 /// translucent tint to show through; a low alpha keeps the verified strength.
@@ -1151,7 +1172,7 @@ fn machine_is_wow64(process_machine: u16) -> bool {
     windows_sys::Win32::System::SystemInformation::IMAGE_FILE_MACHINE_I386 == process_machine
 }
 
-/// Owned process handle used by [`process_cwd`].
+/// Owned process handle used by [`process_cwd`] and the priority boost.
 #[cfg(target_os = "windows")]
 struct ProcessHandle(windows_sys::Win32::Foundation::HANDLE);
 
@@ -1481,6 +1502,694 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// Whether `ILLNESS_CONPTY` asks for the inbox pseudoconsole.
+///
+/// `inbox` (the default when unset or empty) pins the inbox host; `auto` leaves
+/// the process DLL search order alone. Any other value warns and falls back to
+/// `inbox` instead of silently picking a host.
+fn conpty_pin_inbox(value: Option<&str>) -> bool {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return true;
+    };
+    if value.eq_ignore_ascii_case("inbox") {
+        return true;
+    }
+    if value.eq_ignore_ascii_case("auto") {
+        return false;
+    }
+    log::warn!(
+        "ILLNESS_CONPTY={value:?} is not recognized; expected inbox (default) or auto, using inbox"
+    );
+    true
+}
+
+/// Whether `ILLNESS_NO_PRIORITY_BOOST` disables the boost.
+///
+/// Only an affirmative value (`1`, `true`, `yes`, `on`) disables it. `0`,
+/// `false`, `no`, `off`, and an empty or unset value keep boosting, so a bare
+/// `ILLNESS_NO_PRIORITY_BOOST=1` still works.
+#[cfg(target_os = "windows")]
+fn priority_boost_disabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Pin the pseudoconsole API to the inbox kernel32 `CreatePseudoConsole`.
+///
+/// `alacritty_terminal` loads the pseudoconsole API with a bare
+/// `LoadLibraryW("conpty.dll")`. There is no `conpty.dll` in `System32`, so that
+/// load fails and the terminal falls back to kernel32's `CreatePseudoConsole`,
+/// which spawns the inbox `conhost.exe`. A bare name also searches every `PATH`
+/// entry first, so an installed Windows Terminal or WezTerm can supply its own
+/// `conpty.dll`; that host is `OpenConsole.exe`, whose keystroke-to-echo floor
+/// is roughly two orders of magnitude worse. Restricting the default search to
+/// `System32` makes the bare-name load fail predictably instead of depending on
+/// `PATH`.
+///
+/// `SetDefaultDllDirectories` is process-global: it changes the default search
+/// for every later bare-name `LoadLibraryW` in this process. A `conpty.dll`
+/// shipped next to our executable is therefore deliberately ignored.
+///
+/// `ILLNESS_CONPTY=auto` leaves the DLL search alone. Idempotent and never
+/// panics: the Win32 call runs once and later calls return immediately. Call it
+/// at startup, before the first PTY is created.
+pub fn pin_inbox_conpty() {
+    static PINNED: OnceLock<bool> = OnceLock::new();
+    PINNED.get_or_init(|| {
+        if !conpty_pin_inbox(std::env::var("ILLNESS_CONPTY").ok().as_deref()) {
+            log::info!(
+                "ConPTY host: auto (DLL search order unchanged; a PATH conpty.dll may choose OpenConsole.exe)"
+            );
+            return false;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use windows_sys::Win32::System::LibraryLoader::{
+                LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+            };
+
+            // Safety: the call takes a plain flag bitfield and no pointers.
+            let pinned = unsafe { SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32) } != 0;
+            if pinned {
+                log::info!(
+                    "ConPTY pinned to the inbox conhost.exe (ILLNESS_CONPTY=inbox, the default)"
+                );
+            } else {
+                log::info!(
+                    "could not pin the DLL search to System32 ({}); a PATH conpty.dll may be used",
+                    std::io::Error::last_os_error()
+                );
+            }
+            pinned
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            false
+        }
+    });
+}
+
+/// Scans for the freshly created ConPTY host before giving up.
+#[cfg(target_os = "windows")]
+const CONSOLE_PRIORITY_ATTEMPTS: usize = 8;
+/// Attempts that retry almost immediately, while the user may already be typing.
+#[cfg(target_os = "windows")]
+const CONSOLE_PRIORITY_FAST_ATTEMPTS: usize = 3;
+/// Attempt at which the retry worker refreshes the shell's own threads.
+#[cfg(target_os = "windows")]
+const CONSOLE_PRIORITY_THREAD_REFRESH_ATTEMPT: usize = 1;
+/// Delay between the opening scans.
+#[cfg(target_os = "windows")]
+const CONSOLE_PRIORITY_FAST_RETRY: Duration = Duration::from_millis(15);
+/// Delay between the later scans, for a 525 ms ceiling in total.
+#[cfg(target_os = "windows")]
+const CONSOLE_PRIORITY_RETRY: Duration = Duration::from_millis(120);
+
+/// Delay before the next host scan, or `None` once the schedule is exhausted.
+///
+/// Front-loaded on purpose: the host may appear only after the user has already
+/// started typing, so the first scans are 15 ms apart. The tail uses 120 ms and
+/// keeps the whole schedule (`15 ms × 3 + 120 ms × 4`) at roughly 525 ms for a
+/// heavily loaded machine.
+#[cfg(target_os = "windows")]
+fn console_priority_delay(attempt: usize) -> Option<Duration> {
+    if attempt + 1 >= CONSOLE_PRIORITY_ATTEMPTS {
+        return None;
+    }
+    Some(if attempt < CONSOLE_PRIORITY_FAST_ATTEMPTS {
+        CONSOLE_PRIORITY_FAST_RETRY
+    } else {
+        CONSOLE_PRIORITY_RETRY
+    })
+}
+
+/// Whether a process still sits below the target priority class.
+///
+/// `SetPriorityClass` succeeds on a process that is already above normal, so the
+/// current class must be read first: otherwise one tab's boosted host would look
+/// like a success and stop another tab from finding its own host. The classes are
+/// not numerically ordered (`HIGH_PRIORITY_CLASS` is `0x80`, below
+/// `ABOVE_NORMAL_PRIORITY_CLASS` at `0x8000`), so membership decides.
+#[cfg(target_os = "windows")]
+fn needs_priority_boost(current_class: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+    };
+
+    !matches!(
+        current_class,
+        ABOVE_NORMAL_PRIORITY_CLASS | HIGH_PRIORITY_CLASS | REALTIME_PRIORITY_CLASS
+    )
+}
+
+/// Whether a scanned host is this spawn's own and still needs raising.
+///
+/// A host created before the spawn attempt belongs to another tab (or a stale
+/// worker) and must not end this scan; an already boosted host must not either.
+#[cfg(target_os = "windows")]
+fn host_is_ours(
+    host_pid: u32,
+    created_at: Option<u64>,
+    spawn_at: u64,
+    already_boosted: bool,
+) -> bool {
+    host_pid != 0 && !already_boosted && created_at.is_some_and(|created_at| created_at >= spawn_at)
+}
+
+/// Convert a wall-clock instant to the 100 ns `FILETIME` scale.
+#[cfg(target_os = "windows")]
+fn system_time_to_filetime(time: std::time::SystemTime) -> u64 {
+    /// 100 ns ticks between 1601-01-01 and 1970-01-01.
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => {
+            let ticks = u64::try_from(elapsed.as_nanos() / 100).unwrap_or(u64::MAX);
+            UNIX_EPOCH_FILETIME.saturating_add(ticks)
+        }
+        Err(_) => 0,
+    }
+}
+
+/// Raise the shell's threads and the ConPTY host above normal priority.
+///
+/// Under full CPU saturation the shell and its console host are starved at
+/// normal priority and keystroke echo degrades to hundreds of milliseconds.
+/// Measured p50 echo under 8/8 CPU saturation is ~302 ms unboosted, 30.0 ms with
+/// the shell process raised, and 29.8 ms with only the shell's threads raised.
+///
+/// The shell is boosted per thread, not with `SetPriorityClass`: a process
+/// priority class is inherited by every child process, so `cargo build`, `npm`,
+/// or a browser started from this shell would then outrank Illness' own normal
+/// threads and make echo worse while a build runs. Thread priority is not
+/// inherited, so the user's builds stay at normal priority while the shell's
+/// own input threads still get scheduled.
+///
+/// `spawn_at` is the instant the shell was spawned. Only ConPTY hosts created
+/// at or after it belong to this tab; older hosts (another tab's, or a leftover
+/// worker's) never end the scan. The shell is boosted synchronously while its
+/// PID is certainly ours; the later refresh re-checks liveness first, because a
+/// shell that exits within the first few milliseconds can have its PID reused by
+/// an unrelated process. The host is created slightly after the shell, so it is
+/// found on a short-lived detached thread: up to [`CONSOLE_PRIORITY_ATTEMPTS`] scans on the
+/// [`console_priority_delay`] schedule, with the shell's threads refreshed once
+/// at [`CONSOLE_PRIORITY_THREAD_REFRESH_ATTEMPT`] to cover threads created just
+/// after spawn. `ILLNESS_NO_PRIORITY_BOOST` disables the whole thing. Never
+/// panics.
+pub fn boost_console_priority(
+    shell_pid: Option<u32>,
+    spawn_at: std::time::SystemTime,
+    cancelled: bool,
+) {
+    #[cfg(target_os = "windows")]
+    {
+        if cancelled || !priority_boost_enabled() {
+            return;
+        }
+        if let Some(pid) = shell_pid {
+            boost_shell_threads(pid);
+        }
+        let spawn_at = system_time_to_filetime(spawn_at);
+        let spawned = std::thread::Builder::new()
+            .name("illness-console-priority".to_string())
+            .spawn(move || boost_console_priority_blocking(shell_pid, spawn_at));
+        if let Err(error) = spawned {
+            log::debug!("could not start the console priority worker: {error}");
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (shell_pid, spawn_at, cancelled);
+    }
+}
+
+/// Effective `ILLNESS_NO_PRIORITY_BOOST` setting, decided and logged once.
+#[cfg(target_os = "windows")]
+fn priority_boost_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        let disabled =
+            priority_boost_disabled(std::env::var("ILLNESS_NO_PRIORITY_BOOST").ok().as_deref());
+        if disabled {
+            log::info!("console priority boost disabled by ILLNESS_NO_PRIORITY_BOOST");
+        } else {
+            log::info!("console priority boost enabled: shell threads run above normal priority");
+        }
+        !disabled
+    })
+}
+
+/// How a scanned host responded to the boost attempt.
+#[cfg(target_os = "windows")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostBoost {
+    /// Freshly raised to above normal.
+    Raised,
+    /// Already at or above the target.
+    AlreadyBoosted,
+    /// Created before this spawn, so it belongs to another tab.
+    Older,
+    /// Could not open, inspect, or raise it.
+    Failed,
+}
+
+/// Blocking half of [`boost_console_priority`], run on its own thread.
+///
+/// Only ConPTY hosts are handled here; the shell's threads were boosted
+/// synchronously and are refreshed once shortly after.
+#[cfg(target_os = "windows")]
+fn boost_console_priority_blocking(shell_pid: Option<u32>, spawn_at: u64) {
+    let our_pid = std::process::id();
+    let mut scanned = 0usize;
+    let mut already_boosted = 0usize;
+    let mut skipped = 0usize;
+    for attempt in 0..CONSOLE_PRIORITY_ATTEMPTS {
+        if attempt == CONSOLE_PRIORITY_THREAD_REFRESH_ATTEMPT
+            && let Some(pid) = shell_pid
+        {
+            // The shell was boosted synchronously at spawn; this refresh only
+            // covers threads created since. A shell that exited in the
+            // meantime may have had its PID reused, so ask before touching it.
+            if process_is_alive(pid) {
+                boost_shell_threads(pid);
+            }
+        }
+        let mut raised_this_spawn = false;
+        for pid in console_tree_pids(our_pid) {
+            scanned += 1;
+            match boost_console_host(pid, spawn_at) {
+                HostBoost::Raised => raised_this_spawn = true,
+                HostBoost::AlreadyBoosted => already_boosted += 1,
+                HostBoost::Older | HostBoost::Failed => skipped += 1,
+            }
+        }
+        if raised_this_spawn {
+            return;
+        }
+        match console_priority_delay(attempt) {
+            Some(delay) => std::thread::sleep(delay),
+            None => break,
+        }
+    }
+    if scanned == 0 {
+        log::debug!(
+            "no ConPTY host was found after {CONSOLE_PRIORITY_ATTEMPTS} scans; leaving priorities alone"
+        );
+    } else {
+        // Per observation, not per process: a host that stays put is seen again
+        // on every scan.
+        log::debug!(
+            "no ConPTY host needed a boost after {CONSOLE_PRIORITY_ATTEMPTS} scans ({already_boosted} already above normal, {skipped} older or unreadable)"
+        );
+    }
+}
+
+/// Whether an open process handle refers to a process that is still running.
+///
+/// A PID taken from a Toolhelp snapshot or from `spawn` can already be gone, and
+/// Windows may have recycled that number for an unrelated process. An exited or
+/// unreadable process must therefore never be touched.
+#[cfg(target_os = "windows")]
+fn handle_is_alive(handle: windows_sys::Win32::Foundation::HANDLE) -> bool {
+    use windows_sys::Win32::Foundation::STILL_ACTIVE;
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+
+    let mut exit_code = 0u32;
+    // Safety: `exit_code` is a live out-pointer and the caller's handle grants
+    // PROCESS_QUERY_LIMITED_INFORMATION.
+    (unsafe { GetExitCodeProcess(handle, &raw mut exit_code) }) != 0
+        && exit_code as i32 == STILL_ACTIVE
+}
+
+/// Whether `pid` currently names a running process.
+///
+/// [`boost_console_priority_blocking`] refreshes the shell's threads ~15 ms after
+/// spawn; a shell that exited immediately may already have had its PID reused,
+/// so the refresh asks first instead of trusting the number from `spawn`.
+#[cfg(target_os = "windows")]
+fn process_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    if pid == 0 {
+        return false;
+    }
+    // Safety: no pointer arguments; the handle is null-checked and owns only
+    // PROCESS_QUERY_LIMITED_INFORMATION.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let handle = ProcessHandle(handle);
+    handle_is_alive(handle.0)
+}
+
+/// Owned Toolhelp snapshot handle.
+#[cfg(target_os = "windows")]
+struct SnapshotHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        // Safety: the handle came from a successful
+        // `CreateToolhelp32Snapshot` and is closed exactly once here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Whether one Toolhelp process entry names a ConPTY host.
+///
+/// Compares the fixed `szExeFile` buffer as UTF-16 without allocating: this runs
+/// for every process in the snapshot, up to eight times per worker.
+#[cfg(target_os = "windows")]
+fn entry_is_conpty_host(
+    entry: &windows_sys::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W,
+) -> bool {
+    let length = entry
+        .szExeFile
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(entry.szExeFile.len());
+    let name = &entry.szExeFile[..length];
+    wide_eq_ignore_ascii_case(name, "conhost.exe")
+        || wide_eq_ignore_ascii_case(name, "OpenConsole.exe")
+}
+
+/// ASCII-only case-insensitive comparison against a UTF-16 process name.
+#[cfg(target_os = "windows")]
+fn wide_eq_ignore_ascii_case(name: &[u16], expected: &str) -> bool {
+    name.len() == expected.len()
+        && name
+            .iter()
+            .zip(expected.as_bytes())
+            .all(|(&unit, &byte)| unit < 0x80 && (unit as u8).eq_ignore_ascii_case(&byte))
+}
+
+/// Our ConPTY hosts, direct children of this process spawned by winconpty.
+#[cfg(target_os = "windows")]
+fn console_tree_pids(our_pid: u32) -> Vec<u32> {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut hosts = Vec::new();
+    // Safety: no pointer arguments; the returned handle is checked below and
+    // owned by SnapshotHandle.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        log::debug!("could not snapshot processes to boost the console tree");
+        return hosts;
+    }
+    let snapshot = SnapshotHandle(snapshot);
+
+    // Safety: PROCESSENTRY32W is a plain C out-structure for which all-zero is
+    // valid; `dwSize` is set to its exact size as the API requires.
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    // Safety: `entry` is a live, correctly sized out-buffer for the snapshot's
+    // full lifetime.
+    let mut more = unsafe { Process32FirstW(snapshot.0, &raw mut entry) } != 0;
+    while more {
+        // The parent check is cheap and rejects almost every entry before the
+        // name is compared, so no string is built for unrelated processes.
+        if entry.th32ParentProcessID == our_pid && entry_is_conpty_host(&entry) {
+            hosts.push(entry.th32ProcessID);
+        }
+        // Safety: same live buffer, advanced to the next entry.
+        more = unsafe { Process32NextW(snapshot.0, &raw mut entry) } != 0;
+    }
+    hosts
+}
+
+/// Raise every thread the shell already owns to `THREAD_PRIORITY_ABOVE_NORMAL`.
+///
+/// Thread priority is not inherited by child processes, so the user's builds
+/// keep running at their own priority. Only the shell's existing threads are
+/// touched; a later scan in the retry worker covers threads created just after
+/// spawn. Per-thread failures are logged at debug and never fail the tab.
+#[cfg(target_os = "windows")]
+fn boost_shell_threads(pid: u32) {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        OpenThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_SET_INFORMATION,
+    };
+
+    if pid == 0 {
+        return;
+    }
+    // Safety: no pointer arguments; the returned handle is checked below and
+    // owned by SnapshotHandle.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
+        log::debug!(
+            "could not snapshot threads to boost the shell: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let snapshot = SnapshotHandle(snapshot);
+
+    // Safety: THREADENTRY32 is a plain C out-structure for which all-zero is
+    // valid; `dwSize` is set to its exact size as the API requires.
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    // Safety: `entry` is a live, correctly sized out-buffer for the snapshot's
+    // full lifetime.
+    let mut more = unsafe { Thread32First(snapshot.0, &raw mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            // Safety: no pointer arguments; the handle is null-checked, owns
+            // only THREAD_SET_INFORMATION, and is closed exactly once.
+            let thread = unsafe { OpenThread(THREAD_SET_INFORMATION, 0, entry.th32ThreadID) };
+            if thread.is_null() {
+                log::debug!(
+                    "could not open shell thread {} to raise its priority: {}",
+                    entry.th32ThreadID,
+                    std::io::Error::last_os_error()
+                );
+            } else {
+                let thread = ThreadHandle(thread);
+                // Safety: the handle grants THREAD_SET_INFORMATION.
+                let raised =
+                    unsafe { SetThreadPriority(thread.0, THREAD_PRIORITY_ABOVE_NORMAL) } != 0;
+                if !raised {
+                    log::debug!(
+                        "could not raise shell thread {} to above normal: {}",
+                        entry.th32ThreadID,
+                        std::io::Error::last_os_error()
+                    );
+                }
+            }
+        }
+        // Safety: same live buffer, advanced to the next entry.
+        more = unsafe { Thread32Next(snapshot.0, &raw mut entry) } != 0;
+    }
+}
+
+/// Owned thread handle for [`boost_shell_threads`].
+#[cfg(target_os = "windows")]
+struct ThreadHandle(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(target_os = "windows")]
+impl Drop for ThreadHandle {
+    fn drop(&mut self) {
+        // Safety: the handle came from a successful `OpenThread` and is closed
+        // exactly once here.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+    }
+}
+
+/// Raise one live ConPTY host owned by this spawn to `ABOVE_NORMAL_PRIORITY_CLASS`.
+///
+/// A host created before `spawn_at` belongs to another tab and is left alone.
+/// An already-boosted or older host is not a success, otherwise one tab's host
+/// would stop another tab's scan.
+#[cfg(target_os = "windows")]
+fn boost_console_host(pid: u32, spawn_at: u64) -> HostBoost {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        ABOVE_NORMAL_PRIORITY_CLASS, GetPriorityClass, GetProcessTimes, OpenProcess,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, SetPriorityClass,
+    };
+
+    if pid == 0 {
+        return HostBoost::Failed;
+    }
+    // Safety: no pointer arguments; the handle is null-checked and owned by
+    // ProcessHandle. Only the priority class is changed.
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SET_INFORMATION,
+            0,
+            pid,
+        )
+    };
+    if handle.is_null() {
+        log::debug!(
+            "could not open process {pid} to raise its priority: {}",
+            std::io::Error::last_os_error()
+        );
+        return HostBoost::Failed;
+    }
+    let handle = ProcessHandle(handle);
+
+    // A snapshot entry can outlive its process; a stale PID may already belong
+    // to something else, so a dead or failed query is never boosted.
+    if !handle_is_alive(handle.0) {
+        return HostBoost::Failed;
+    }
+
+    // Safety: the same handle grants PROCESS_QUERY_LIMITED_INFORMATION.
+    let current = unsafe { GetPriorityClass(handle.0) };
+    if current == 0 {
+        log::debug!(
+            "could not read the priority of process {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        return HostBoost::Failed;
+    }
+    let already_boosted = !needs_priority_boost(current);
+
+    // Safety: the same handle grants PROCESS_QUERY_LIMITED_INFORMATION and the
+    // FILETIME out-parameters are live stack values.
+    let mut created = FILETIME::default();
+    let mut exited = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let times = unsafe {
+        GetProcessTimes(
+            handle.0,
+            &raw mut created,
+            &raw mut exited,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    } != 0;
+    let created_at =
+        times.then(|| (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime));
+
+    if !host_is_ours(pid, created_at, spawn_at, already_boosted) {
+        return if already_boosted {
+            HostBoost::AlreadyBoosted
+        } else {
+            HostBoost::Older
+        };
+    }
+
+    // Safety: the handle grants PROCESS_SET_INFORMATION and is closed exactly
+    // once by ProcessHandle.
+    let raised = unsafe { SetPriorityClass(handle.0, ABOVE_NORMAL_PRIORITY_CLASS) } != 0;
+    if raised {
+        log::debug!("raised process {pid} to above-normal priority");
+        HostBoost::Raised
+    } else {
+        log::debug!(
+            "could not raise process {pid} to above-normal priority: {}",
+            std::io::Error::last_os_error()
+        );
+        HostBoost::Failed
+    }
+}
+
+/// Folder a tab opens in when no launch folder, live shell cwd, or stored tab
+/// cwd is known.
+///
+/// Explorer, the Start Menu and desktop shortcuts start the process in the
+/// executable's own folder, so that value says nothing about where the user was
+/// working. The user profile is the meaningful default there; a launch from a
+/// real console in another folder is still honoured.
+pub fn fallback_startup_dir() -> Option<PathBuf> {
+    let process = std::env::current_dir().ok();
+    let executable = std::env::current_exe().ok();
+    pick_startup_dir(
+        process.as_deref(),
+        executable.as_deref(),
+        home_dir().as_deref(),
+    )
+}
+
+/// Choose between the process directory and the user profile.
+///
+/// The profile only replaces the process directory when the process was started
+/// in the executable's own folder, and it never wins over a missing value when
+/// no profile exists.
+fn pick_startup_dir(
+    process: Option<&Path>,
+    executable: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let from_executable_folder = process
+        .zip(executable)
+        .is_some_and(|(dir, exe)| is_executable_folder(dir, exe));
+    if from_executable_folder && let Some(home) = home {
+        return Some(home.to_path_buf());
+    }
+    process.or(home).map(Path::to_path_buf)
+}
+
+/// Whether `dir` is the folder holding `executable`.
+///
+/// Compared as text so this can run on the UI thread: `current_dir` is a stored
+/// string and canonicalizing it can block on a dead network share. A launcher
+/// that reports an 8.3 form of the same folder simply keeps the process
+/// directory, which is the safe direction.
+fn is_executable_folder(dir: &Path, executable: &Path) -> bool {
+    let Some(exe_dir) = executable.parent() else {
+        return false;
+    };
+    let dir = normalized(dir);
+    let exe_dir = normalized(exe_dir);
+    if cfg!(target_os = "windows") {
+        dir.eq_ignore_ascii_case(&exe_dir)
+    } else {
+        dir == exe_dir
+    }
+}
+
+/// Path text without a trailing separator, so `C:\folder\` and `C:\folder`
+/// compare equal.
+fn normalized(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        text.into_owned()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// The signed-in user's profile folder.
+fn home_dir() -> Option<PathBuf> {
+    fn non_empty(name: &str) -> Option<std::ffi::OsString> {
+        std::env::var_os(name).filter(|value| !value.is_empty())
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(profile) = non_empty("USERPROFILE") {
+            return Some(PathBuf::from(profile));
+        }
+        let drive = non_empty("HOMEDRIVE")?;
+        let path = non_empty("HOMEPATH")?;
+        let mut home = PathBuf::from(drive);
+        home.push(path);
+        Some(home)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        non_empty("HOME").map(PathBuf::from)
+    }
+}
+
 /// Path of the wallpaper Windows currently has registered, if any.
 ///
 /// Reads `SPI_GETDESKWALLPAPER` rather than guessing a file name, so a stock
@@ -1615,12 +2324,16 @@ pub fn apply(
         };
         let hwnd = win32.hwnd.get() as HWND;
         apply_theme(hwnd, dark);
+        // Installed on the first material application: every later apply and
+        // tint update writes into the state the subclass reads.
+        install_acrylic_move_subclass(hwnd);
 
         match material {
             Material::Mica => {
                 // Mica is the wallpaper-derived system backdrop. Disable any
                 // legacy accent first, then extend the frame so DWM paints
                 // Mica through the whole client area, and apply it last.
+                set_acrylic_move_tint(hwnd, None);
                 let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
                 if !extend_frame(hwnd, true) {
                     anyhow::bail!("DWM frame extension is unavailable");
@@ -1636,12 +2349,14 @@ pub fn apply(
                 let _ = window_vibrancy::clear_acrylic(window);
                 extend_frame(hwnd, false);
                 let tint = acrylic_tint(theme_bg, opacity);
-                if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
+                let moving = set_acrylic_move_tint(hwnd, Some(tint));
+                if !apply_accent(hwnd, acrylic_state(moving), 0, tint) {
                     anyhow::bail!("legacy acrylic accent policy is unavailable");
                 }
             }
             Material::Solid => {
                 // Clearing an effect that was never applied is not an error.
+                set_acrylic_move_tint(hwnd, None);
                 let _ = apply_accent(hwnd, ACCENT_DISABLED, 0, 0);
                 let _ = window_vibrancy::clear_mica(window);
                 let _ = window_vibrancy::clear_acrylic(window);
@@ -1680,7 +2395,8 @@ pub fn apply_acrylic_tint(
         };
         let hwnd = win32.hwnd.get() as HWND;
         let tint = acrylic_tint(theme_bg, opacity);
-        if !apply_accent(hwnd, ACCENT_ENABLE_ACRYLICBLURBEHIND, 0, tint) {
+        let moving = set_acrylic_move_tint(hwnd, Some(tint));
+        if !apply_accent(hwnd, acrylic_state(moving), 0, tint) {
             anyhow::bail!("legacy acrylic accent policy is unavailable");
         }
         log::debug!(
@@ -1803,6 +2519,259 @@ fn apply_accent(hwnd: HWND, state: u32, flags: u32, gradient_color: u32) -> bool
     unsafe { function(hwnd, &raw mut data) != 0 }
 }
 
+/// Legacy acrylic accent currently applied to one window.
+///
+/// The tint is shared with the move subclass: it must swap the accent state
+/// without re-reading the config, and an opacity change during a drag must
+/// keep the blurred state until the move loop ends.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MoveAccent {
+    /// Gradient colour of the active acrylic accent; `None` when the applied
+    /// material is not legacy acrylic (Mica/Solid).
+    tint: Option<u32>,
+    /// A `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` pair is in progress and the
+    /// accent has been swapped to [`ACCENT_ENABLE_BLURBEHIND`].
+    moving: bool,
+    /// The pending modal loop is a caption drag (not a resize). Windows sends
+    /// `WM_ENTERSIZEMOVE` for both, so the hit test is recorded beforehand.
+    pending_move: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl MoveAccent {
+    fn set_tint(&mut self, tint: Option<u32>) {
+        self.tint = tint;
+        if tint.is_none() {
+            // Mica/Solid clear the accent; an in-flight move has nothing left
+            // to restore.
+            self.moving = false;
+            self.pending_move = false;
+        }
+    }
+
+    /// Accent state and tint to apply for a move transition. `None` means the
+    /// message is not actionable for this window (not acrylic, already in the
+    /// requested state, no tint recorded, or the pending loop is a resize).
+    fn move_action(&self, entering: bool) -> Option<(u32, u32)> {
+        if entering {
+            if self.moving || !self.pending_move {
+                return None;
+            }
+            let tint = self.tint?;
+            accent_state_for_move(true).map(|state| (state, tint))
+        } else {
+            if !self.moving {
+                return None;
+            }
+            let tint = self.tint?;
+            Some((ACCENT_ENABLE_ACRYLICBLURBEHIND, tint))
+        }
+    }
+}
+
+/// Accent state to use while a legacy acrylic window is being moved.
+///
+/// `active` is whether acrylic (state 4) is currently applied. The cheap blur
+/// is only valid for an active accent with a recorded tint.
+#[cfg(target_os = "windows")]
+fn accent_state_for_move(active: bool) -> Option<u32> {
+    active.then_some(ACCENT_ENABLE_BLURBEHIND)
+}
+
+/// State to apply when setting an acrylic tint: stay in the cheap blur state
+/// if a move is already in progress (opacity slider changed mid-drag).
+#[cfg(target_os = "windows")]
+fn acrylic_state(moving: bool) -> u32 {
+    accent_state_for_move(moving).unwrap_or(ACCENT_ENABLE_ACRYLICBLURBEHIND)
+}
+
+#[cfg(target_os = "windows")]
+fn move_accents() -> &'static Mutex<HashMap<usize, MoveAccent>> {
+    static ACCENTS: OnceLock<Mutex<HashMap<usize, MoveAccent>>> = OnceLock::new();
+    ACCENTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "windows")]
+fn move_subclasses() -> &'static Mutex<HashMap<usize, ()>> {
+    static SUBCLASSES: OnceLock<Mutex<HashMap<usize, ()>>> = OnceLock::new();
+    SUBCLASSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(target_os = "windows")]
+fn hwnd_key(hwnd: HWND) -> usize {
+    hwnd as usize
+}
+
+/// Record the tint of the applied acrylic accent and return whether a move is
+/// in progress, so callers can preserve state 3 until the move ends.
+#[cfg(target_os = "windows")]
+fn set_acrylic_move_tint(hwnd: HWND, tint: Option<u32>) -> bool {
+    let mut accents = move_accents()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let accent = accents.entry(hwnd_key(hwnd)).or_default();
+    accent.set_tint(tint);
+    accent.moving
+}
+
+/// Install the modal-move subclass once per window. A failure disables only
+/// this optimization; the acrylic accent remains in its normal state.
+#[cfg(target_os = "windows")]
+fn install_acrylic_move_subclass(hwnd: HWND) {
+    let key = hwnd_key(hwnd);
+    {
+        let subclasses = move_subclasses()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if subclasses.contains_key(&key) {
+            return;
+        }
+    }
+    let subclass: SUBCLASSPROC = Some(acrylic_move_subclass);
+    // Safety: `hwnd` is the live window handle supplied by `apply`; the
+    // subclass proc is a valid `extern "system"` function and the id is
+    // unique to this module. `comctl32.dll` owns the subclass until the
+    // window is destroyed.
+    let installed = unsafe { SetWindowSubclass(hwnd, subclass, ACRYLIC_MOVE_SUBCLASS_ID, 0) } != 0;
+    if installed {
+        move_subclasses()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(key, ());
+        move_accents()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(key)
+            .or_default();
+        log::debug!("acrylic move subclass installed");
+    } else {
+        log::warn!("could not install the acrylic move subclass; moves keep the acrylic accent");
+    }
+}
+
+/// Record whether the gesture Windows is about to enter is a caption drag or a
+/// resize. `WM_ENTERSIZEMOVE` covers both, and only a move benefits from the
+/// cheaper blur.
+#[cfg(target_os = "windows")]
+fn set_pending_move(hwnd: HWND, pending: bool) {
+    let mut accents = move_accents()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(accent) = accents.get_mut(&hwnd_key(hwnd)) {
+        accent.pending_move = pending;
+    }
+}
+
+/// Drop per-window state when the window is destroyed. comctl32 removes the
+/// subclass itself; the maps must not outlive the HWND or a recycled handle
+/// would inherit stale state.
+#[cfg(target_os = "windows")]
+fn forget_window(hwnd: HWND) {
+    let key = hwnd_key(hwnd);
+    move_accents()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+    move_subclasses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&key);
+}
+
+/// Swap between acrylic (4) and blur (3) while a modal move loop runs.
+///
+/// The state lock is never held across `SetWindowCompositionAttribute`: the
+/// call runs inside the window procedure, and a synchronous re-entry would
+/// deadlock the non-reentrant mutex.
+#[cfg(target_os = "windows")]
+fn swap_accent_for_move(hwnd: HWND, entering: bool) {
+    let action = {
+        let mut accents = move_accents()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(accent) = accents.get_mut(&hwnd_key(hwnd)) else {
+            return;
+        };
+        let action = accent.move_action(entering);
+        if !entering {
+            // The move loop is over either way. Never leave a failed restore
+            // latched: the next apply must return to acrylic.
+            accent.moving = false;
+            accent.pending_move = false;
+        }
+        action
+    };
+    let Some((state, tint)) = action else {
+        return;
+    };
+    let applied = apply_accent(hwnd, state, 0, tint);
+    {
+        let mut accents = move_accents()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(accent) = accents.get_mut(&hwnd_key(hwnd))
+            && entering
+        {
+            accent.moving = applied;
+        }
+    }
+    if applied {
+        log::debug!(
+            "legacy acrylic accent {} for window move (state={state}, alpha={})",
+            if entering {
+                "swapped to blur"
+            } else {
+                "restored"
+            },
+            tint >> 24
+        );
+    } else {
+        log::warn!(
+            "could not {} legacy acrylic accent for window move",
+            if entering { "swap" } else { "restore" }
+        );
+    }
+}
+
+/// Observe the modal move messages and the gesture that precedes them; every
+/// message reaches `DefSubclassProc`, including the ones handled here.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn acrylic_move_subclass(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    match message {
+        WM_NCLBUTTONDOWN => set_pending_move(hwnd, wparam == HTCAPTION as usize),
+        WM_SYSCOMMAND => {
+            let command = (wparam as u32) & 0xFFF0;
+            if command == SC_MOVE {
+                set_pending_move(hwnd, true);
+            } else if command == SC_SIZE {
+                set_pending_move(hwnd, false);
+            }
+        }
+        WM_ENTERSIZEMOVE => swap_accent_for_move(hwnd, true),
+        WM_EXITSIZEMOVE => swap_accent_for_move(hwnd, false),
+        WM_NCDESTROY => {
+            // Safety: removing this subclass from its own WM_NCDESTROY is the
+            // documented cleanup path; the proc and id match the install.
+            unsafe {
+                RemoveWindowSubclass(hwnd, Some(acrylic_move_subclass), ACRYLIC_MOVE_SUBCLASS_ID);
+            }
+            forget_window(hwnd);
+        }
+        _ => {}
+    }
+    // Safety: forwards the original message to the rest of the subclass
+    // chain/window procedure with the untouched parameters.
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
+}
+
 /// Set one 32-bit DWM attribute. Returns `true` when the compositor accepted it.
 ///
 /// # Safety
@@ -1821,14 +2790,19 @@ fn set_attribute(hwnd: HWND, attribute: u32, value: i32) -> bool {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{
-        CONTEXT_MENU_VERBS, ContextMenuAction, PEB_LAYOUT_32, PEB_LAYOUT_64, PathKind,
-        PathProbeCache, ProbeBatch, acrylic_tint, automatic_context_menu_allowed,
+        ACCENT_ENABLE_ACRYLICBLURBEHIND, ACCENT_ENABLE_BLURBEHIND, CONSOLE_PRIORITY_ATTEMPTS,
+        CONSOLE_PRIORITY_FAST_ATTEMPTS, CONSOLE_PRIORITY_FAST_RETRY, CONSOLE_PRIORITY_RETRY,
+        CONTEXT_MENU_VERBS, ContextMenuAction, MoveAccent, PEB_LAYOUT_32, PEB_LAYOUT_64, PathKind,
+        PathProbeCache, ProbeBatch, accent_state_for_move, acrylic_state, acrylic_tint,
+        automatic_context_menu_allowed, conpty_pin_inbox, console_priority_delay,
         context_menu_action, context_menu_command, context_menu_command_executable,
         context_menu_command_valid, context_menu_verbs_complete, curdir_header_layout,
-        decode_curdir_header, decode_curdir_text, is_network_path, machine_is_wow64,
-        path_has_prefix, path_kind_with_deadline, peb_layout_for_target, plausible_process_path,
-        probe_paths, probe_with_deadline, process_cwd, strip_nt_prefix, terminated_curdir_len,
-        transparency_allowed, unique_probe_paths,
+        decode_curdir_header, decode_curdir_text, entry_is_conpty_host, host_is_ours,
+        is_executable_folder, is_network_path, machine_is_wow64, needs_priority_boost,
+        path_has_prefix, path_kind_with_deadline, peb_layout_for_target, pick_startup_dir,
+        plausible_process_path, priority_boost_disabled, probe_paths, probe_with_deadline,
+        process_cwd, strip_nt_prefix, terminated_curdir_len, transparency_allowed,
+        unique_probe_paths,
     };
     use illness_core::Rgb;
     use std::ffi::OsStr;
@@ -1838,10 +2812,73 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
+    fn shortcut_launch_uses_the_user_profile_not_the_executable_folder() {
+        let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
+        let home = PathBuf::from(r"C:\Users\Simulp");
+
+        let picked = pick_startup_dir(
+            Some(Path::new(r"C:\Program Files\Illness")),
+            Some(exe),
+            Some(&home),
+        );
+
+        assert_eq!(picked.as_deref(), Some(home.as_path()));
+    }
+
+    #[test]
+    fn console_launch_folder_is_kept() {
+        let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
+        let home = PathBuf::from(r"C:\Users\Simulp");
+        let console = PathBuf::from(r"C:\work\project");
+
+        let picked = pick_startup_dir(Some(&console), Some(exe), Some(&home));
+
+        assert_eq!(picked.as_deref(), Some(console.as_path()));
+    }
+
+    #[test]
+    fn executable_folder_without_a_profile_falls_back_to_the_process_directory() {
+        let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
+        let folder = PathBuf::from(r"C:\Program Files\Illness");
+
+        assert_eq!(
+            pick_startup_dir(Some(&folder), Some(exe), None).as_deref(),
+            Some(folder.as_path())
+        );
+        assert_eq!(pick_startup_dir(None, Some(exe), None), None);
+    }
+
+    #[test]
+    fn a_missing_process_directory_still_prefers_the_profile() {
+        let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
+        let home = PathBuf::from(r"C:\Users\Simulp");
+
+        assert_eq!(
+            pick_startup_dir(None, Some(exe), Some(&home)).as_deref(),
+            Some(home.as_path())
+        );
+    }
+
+    #[test]
+    fn executable_folder_matching_ignores_case_and_trailing_separators() {
+        let exe = Path::new(r"C:\Program Files\Illness\illness.exe");
+
+        assert!(is_executable_folder(
+            Path::new(r"c:\program files\illness\"),
+            exe
+        ));
+        assert!(!is_executable_folder(
+            Path::new(r"C:\Program Files\Illness\bin"),
+            exe
+        ));
+        assert!(!is_executable_folder(Path::new(r"C:\"), exe));
+    }
+
+    #[test]
     fn peb_dos_paths_lose_object_manager_prefixes() {
         assert_eq!(
-            strip_nt_prefix(r"\??\C:\Users\Simulp\folder"),
-            PathBuf::from(r"C:\Users\Simulp\folder")
+            strip_nt_prefix(r"\??\C:\CLI\folder"),
+            PathBuf::from(r"C:\CLI\folder")
         );
         assert_eq!(strip_nt_prefix(r"\\?\E:\Files"), PathBuf::from(r"E:\Files"));
         assert_eq!(
@@ -1849,6 +2886,141 @@ mod tests {
             PathBuf::from(r"\\server\share")
         );
         assert_eq!(strip_nt_prefix(r"C:\plain"), PathBuf::from(r"C:\plain"));
+    }
+
+    /// Build the exact fixture `console_tree_pids` hands to the matcher: a
+    /// zeroed `PROCESSENTRY32W` whose fixed `szExeFile` buffer holds `exe_name`
+    /// followed by NUL padding.
+    fn process_entry(
+        exe_name: &str,
+    ) -> windows_sys::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W {
+        let mut entry = windows_sys::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<
+                windows_sys::Win32::System::Diagnostics::ToolHelp::PROCESSENTRY32W,
+            >() as u32,
+            ..Default::default()
+        };
+        for (slot, unit) in entry.szExeFile.iter_mut().zip(exe_name.encode_utf16()) {
+            *slot = unit;
+        }
+        entry
+    }
+
+    #[test]
+    fn conpty_hosts_are_recognized_by_the_shipping_matcher() {
+        // Exercises `entry_is_conpty_host` itself, not a test-only copy of the
+        // name list, so production matching cannot regress unnoticed.
+        assert!(entry_is_conpty_host(&process_entry("conhost.exe")));
+        assert!(entry_is_conpty_host(&process_entry("OpenConsole.exe")));
+        assert!(entry_is_conpty_host(&process_entry("OPENCONSOLE.EXE")));
+        assert!(!entry_is_conpty_host(&process_entry("cmd.exe")));
+        assert!(!entry_is_conpty_host(&process_entry("")));
+        assert!(!entry_is_conpty_host(&process_entry("conhost.exe.bak")));
+        // The buffer is NUL-terminated in practice, but trailing units after the
+        // terminator must be ignored rather than compared.
+        assert!(entry_is_conpty_host(&process_entry(
+            "conhost.exe\0junk.exe"
+        )));
+        // A full buffer with no terminator at all must not panic.
+        let mut full = process_entry("");
+        full.szExeFile.fill(u16::from(b'x'));
+        assert!(!entry_is_conpty_host(&full));
+    }
+
+    #[test]
+    fn only_a_class_below_above_normal_needs_a_boost() {
+        use windows_sys::Win32::System::Threading::{
+            ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+            IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
+        };
+
+        for below in [
+            IDLE_PRIORITY_CLASS,
+            BELOW_NORMAL_PRIORITY_CLASS,
+            NORMAL_PRIORITY_CLASS,
+        ] {
+            assert!(needs_priority_boost(below), "{below:#x} must be raised");
+        }
+        for above in [
+            ABOVE_NORMAL_PRIORITY_CLASS,
+            HIGH_PRIORITY_CLASS,
+            REALTIME_PRIORITY_CLASS,
+        ] {
+            assert!(
+                !needs_priority_boost(above),
+                "{above:#x} is already above normal"
+            );
+        }
+    }
+
+    #[test]
+    fn console_priority_schedule_matches_its_documented_ceiling() {
+        let mut delays = Vec::new();
+        for attempt in 0..CONSOLE_PRIORITY_ATTEMPTS {
+            match console_priority_delay(attempt) {
+                Some(delay) => delays.push(delay),
+                None => break,
+            }
+        }
+
+        let mut expected = vec![CONSOLE_PRIORITY_FAST_RETRY; CONSOLE_PRIORITY_FAST_ATTEMPTS];
+        expected.resize(CONSOLE_PRIORITY_ATTEMPTS - 1, CONSOLE_PRIORITY_RETRY);
+        assert_eq!(delays, expected);
+        assert_eq!(
+            delays.iter().sum::<Duration>(),
+            Duration::from_millis(525),
+            "15 ms x 3 + 120 ms x 4"
+        );
+        assert_eq!(console_priority_delay(CONSOLE_PRIORITY_ATTEMPTS), None);
+    }
+
+    #[test]
+    fn only_this_spawns_unboosted_host_ends_the_scan() {
+        let spawn_at = 100;
+        assert!(
+            host_is_ours(42, Some(spawn_at), spawn_at, false),
+            "our own fresh host counts"
+        );
+        assert!(
+            !host_is_ours(42, Some(spawn_at - 1), spawn_at, false),
+            "an older host belongs to another tab"
+        );
+        assert!(
+            !host_is_ours(42, Some(spawn_at + 1), spawn_at, true),
+            "an already boosted host must not end the scan"
+        );
+        assert!(
+            !host_is_ours(42, None, spawn_at, false),
+            "an unknown creation time is not this spawn's"
+        );
+        assert!(!host_is_ours(0, Some(spawn_at + 1), spawn_at, false));
+    }
+
+    #[test]
+    fn env_switches_are_parsed_by_value() {
+        assert!(conpty_pin_inbox(None), "unset defaults to inbox");
+        assert!(conpty_pin_inbox(Some("")), "empty defaults to inbox");
+        assert!(conpty_pin_inbox(Some("inbox")));
+        assert!(!conpty_pin_inbox(Some("auto")));
+        assert!(!conpty_pin_inbox(Some(" AUTO ")));
+        assert!(
+            conpty_pin_inbox(Some("OpenConsole")),
+            "an unknown value falls back to inbox"
+        );
+
+        assert!(!priority_boost_disabled(None));
+        for keep in ["", "0", "false", "no", "off", " FALSE ", " No "] {
+            assert!(
+                !priority_boost_disabled(Some(keep)),
+                "{keep:?} must keep boosting"
+            );
+        }
+        for disable in ["1", "true", "on", "yes", " YES "] {
+            assert!(
+                priority_boost_disabled(Some(disable)),
+                "{disable:?} disables"
+            );
+        }
     }
 
     #[test]
@@ -2315,10 +3487,10 @@ mod tests {
                 .collect::<Vec<_>>()
         }
 
-        let with_nul = utf16("C:\\Users\\Simulp\u{0}");
+        let with_nul = utf16("C:\\Users\\Public\u{0}");
         assert_eq!(
             decode_curdir_text(&with_nul),
-            Some(PathBuf::from(r"C:\Users\Simulp"))
+            Some(PathBuf::from(r"C:\Users\Public"))
         );
         assert_eq!(decode_curdir_text(&utf16("C:\\missing-nul")), None);
         assert_eq!(decode_curdir_text(&utf16("C:\\bad\u{0}junk\u{0}")), None);
@@ -2328,7 +3500,7 @@ mod tests {
 
         // CURDIR.Length may or may not include the terminator; accept exactly
         // those two forms and reject a non-NUL extra unit.
-        let path_without_nul = utf16("C:\\Users\\Simulp");
+        let path_without_nul = utf16("C:\\Users\\Public");
         let declared = path_without_nul.len();
         let mut terminated_after = path_without_nul.clone();
         terminated_after.extend_from_slice(&[0, 0]);
@@ -2431,5 +3603,89 @@ mod tests {
         assert_eq!(acrylic_tint(theme_bg, 0.0) & 0x00ff_ffff, 0x0056_3412);
         assert_eq!(acrylic_tint(theme_bg, 50.0) & 0x00ff_ffff, 0x0056_3412);
         assert_eq!(acrylic_tint(theme_bg, 100.0) & 0x00ff_ffff, 0x0056_3412);
+    }
+
+    #[test]
+    fn move_accent_swaps_only_an_active_acrylic_accent() {
+        let tint = 0x20_11_22_33;
+        let mut accent = MoveAccent::default();
+
+        assert_eq!(
+            accent.move_action(true),
+            None,
+            "Mica/Solid have no tint to swap"
+        );
+        accent.set_tint(Some(tint));
+        accent.pending_move = true;
+        assert_eq!(
+            accent.move_action(false),
+            None,
+            "an exit without an enter is a no-op"
+        );
+        assert_eq!(
+            accent.move_action(true),
+            Some((ACCENT_ENABLE_BLURBEHIND, tint)),
+            "the move keeps the current tint but uses the cheap blur"
+        );
+        assert_eq!(accent_state_for_move(true), Some(ACCENT_ENABLE_BLURBEHIND));
+        assert_eq!(accent_state_for_move(false), None);
+
+        // The caller commits the transition only after the Win32 call succeeds.
+        accent.moving = true;
+        assert_eq!(
+            accent.move_action(true),
+            None,
+            "a repeated enter is idempotent"
+        );
+        assert_eq!(
+            accent.move_action(false),
+            Some((ACCENT_ENABLE_ACRYLICBLURBEHIND, tint)),
+            "exit restores acrylic with the stored tint"
+        );
+    }
+
+    #[test]
+    fn move_accent_ignores_a_pending_resize() {
+        let tint = 0x20_11_22_33;
+        let mut accent = MoveAccent {
+            tint: Some(tint),
+            moving: false,
+            pending_move: false,
+        };
+
+        // `WM_ENTERSIZEMOVE` fires for border drags too; a resize must keep
+        // acrylic because only a move benefits from the cheap blur.
+        assert_eq!(accent.move_action(true), None);
+        accent.pending_move = true;
+        assert_eq!(
+            accent.move_action(true),
+            Some((ACCENT_ENABLE_BLURBEHIND, tint))
+        );
+    }
+
+    #[test]
+    fn move_accent_keeps_the_latest_tint_and_clears_with_the_material() {
+        let mut accent = MoveAccent {
+            tint: Some(0x20_11_22_33),
+            moving: true,
+            pending_move: false,
+        };
+
+        // An opacity change during the drag updates the tint but must stay in
+        // the blur state so the move loop never pays acrylic recomputation.
+        accent.set_tint(Some(0x80_44_55_66));
+        assert!(accent.moving);
+        assert_eq!(
+            accent.move_action(false),
+            Some((ACCENT_ENABLE_ACRYLICBLURBEHIND, 0x80_44_55_66))
+        );
+        assert_eq!(acrylic_state(true), ACCENT_ENABLE_BLURBEHIND);
+        assert_eq!(acrylic_state(false), ACCENT_ENABLE_ACRYLICBLURBEHIND);
+
+        // Switching to Mica/Solid clears both the tint and any in-flight move.
+        accent.set_tint(None);
+        assert_eq!(accent.tint, None);
+        assert!(!accent.moving);
+        assert_eq!(accent.move_action(false), None);
     }
 }

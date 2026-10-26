@@ -84,7 +84,7 @@ impl Default for Config {
             font_family: "Cascadia Mono".to_string(),
             font_size: 18.0,
             line_height: 1.2,
-            material: Material::Mica,
+            material: Material::Solid,
             background: BackgroundMode::Desktop,
             background_path: String::new(),
             background_opacity: 100.0,
@@ -331,7 +331,7 @@ mod tests {
         assert_eq!(config.font_family, "Cascadia Mono");
         assert_eq!(config.font_size, 18.0);
         assert_eq!(config.line_height, 1.2);
-        assert_eq!(config.material, Material::Mica);
+        assert_eq!(config.material, Material::Solid);
         assert_eq!(config.background, BackgroundMode::Desktop);
         assert!(config.background_path.is_empty());
         assert_eq!(config.background_opacity, 100.0);

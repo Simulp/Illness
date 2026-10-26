@@ -10,7 +10,6 @@
 //! After composition the image is premultiplied by a uniform material alpha
 //! (Mica/Acrylic), which lets the window backdrop show through.
 
-use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use egui::{Color32, ColorImage, Rect};
@@ -109,7 +108,7 @@ pub fn render_surface(
     }
 
     let base = design::color(spec.theme.bg);
-    let mut surface = Surface::new(width, height, rgb(base));
+    let mut surface = Surface::new(width, height, rgb(base), spec.material == Material::Solid);
     let origin_x = (spec.padding.max(0.0) * spec.ppp).round() as i32;
     let origin_y = origin_x;
     let baseline = (metrics.baseline * spec.ppp).round() as i32;
@@ -171,6 +170,79 @@ pub fn render_surface(
     Some(surface.finish(design::material_alpha(spec.material)))
 }
 
+/// Compact FNV-1a hasher for the per-frame surface fingerprint.
+///
+/// The std default (SipHash) is tuned for adversarial input. This key is only
+/// ever compared against itself in-process, so a fast non-cryptographic hasher
+/// is enough. The integer overrides keep every `.hash()` call site unchanged
+/// while avoiding the byte-at-a-time path for cell colors and flags.
+struct FastHasher(u64);
+
+impl FastHasher {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const TAG_BYTES: u64 = 0x9e37_79b9_7f4a_7c15;
+    const TAG_U8: u64 = 0x517c_c1b7_2722_0a95;
+    const TAG_U32: u64 = 0x2545_f491_4f6c_dd1d;
+    const TAG_U64: u64 = 0x94d0_49bb_1331_11eb;
+    const TAG_USIZE: u64 = 0xd6e8_feb8_6659_fd93;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    #[inline]
+    fn mix(&mut self, value: u64) {
+        self.0 = (self.0 ^ value).wrapping_mul(Self::PRIME);
+    }
+
+    #[inline]
+    fn mix_tagged(&mut self, value: u64, tag: u64) {
+        self.mix(value ^ tag);
+    }
+}
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let (chunks, remainder) = bytes.as_chunks::<8>();
+        for chunk in chunks {
+            self.mix(u64::from_le_bytes(*chunk));
+        }
+        if !remainder.is_empty() {
+            let mut word = [0u8; 8];
+            word[..remainder.len()].copy_from_slice(remainder);
+            self.mix(u64::from_le_bytes(word));
+        }
+        self.mix_tagged(bytes.len() as u64, Self::TAG_BYTES);
+    }
+
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix_tagged(u64::from(value), Self::TAG_U8);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix_tagged(u64::from(value), Self::TAG_U32);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix_tagged(value, Self::TAG_U64);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix_tagged(value as u64, Self::TAG_USIZE);
+    }
+}
+
 /// Cheap change key for the cached surface.
 ///
 /// Covers every input that changes pixels: cell contents/colors/flags,
@@ -182,7 +254,7 @@ pub fn render_surface(
 /// characters cannot change this surface, so typing does not force a
 /// re-composite of the background layer.
 pub fn fingerprint(snapshot: &Snapshot, spec: &SurfaceSpec<'_>) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let mut hasher = FastHasher::new();
 
     surface_size(spec.rect, spec.ppp).hash(&mut hasher);
     spec.cols.hash(&mut hasher);
@@ -495,10 +567,12 @@ fn paint_text(
 
             if flags.intersects(CellFlags::ALL_UNDERLINES) {
                 surface.fill_rect(x0, y1 - 1, x1, y1, fg);
+                surface.mark_ink(x0, y1 - 1, x1, y1);
             }
             if flags.contains(CellFlags::STRIKEOUT) {
                 let y = y0 + cell_height / 2;
                 surface.fill_rect(x0, y, x1, y + 1, fg);
+                surface.mark_ink(x0, y, x1, y + 1);
             }
         }
     }
@@ -545,6 +619,7 @@ fn paint_cursor(
     match snapshot.cursor.kind {
         CursorKind::Block => {
             surface.fill_rect(x0, y0, x1, y1, color);
+            surface.mark_ink(x0, y0, x1, y1);
             if let Some(cell) = snapshot.cell(col, row) {
                 let flags = cell.flags;
                 if !flags.intersects(
@@ -585,15 +660,20 @@ fn paint_cursor(
         CursorKind::Beam => {
             let width = 2.min(cell_width).max(1);
             surface.fill_rect(x0, y0, x0 + width, y1, color);
+            surface.mark_ink(x0, y0, x0 + width, y1);
         }
         CursorKind::Underline => {
             let thickness = 2.min(cell_height).max(1);
             surface.fill_rect(x0, y1 - thickness, x1, y1, color);
+            surface.mark_ink(x0, y1 - thickness, x1, y1);
         }
     }
 }
 
-/// Intermediate surface: straight sRGB plus opaque alpha.
+/// Intermediate surface: straight sRGB plus an ink coverage byte in the alpha
+/// channel. Background pixels start at zero ink and are premultiplied by the
+/// material alpha at the end; text, decorations and the cursor mark their
+/// pixels as ink so they stay fully opaque over the translucent backdrop.
 struct Surface {
     width: usize,
     height: usize,
@@ -601,12 +681,14 @@ struct Surface {
 }
 
 impl Surface {
-    fn new(width: usize, height: usize, base: [u8; 3]) -> Self {
-        let mut rgba = vec![255u8; width * height * 4];
+    fn new(width: usize, height: usize, base: [u8; 3], solid: bool) -> Self {
+        let mut rgba = vec![0u8; width * height * 4];
+        let ink = if solid { 255 } else { 0 };
         for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[0] = base[0];
             pixel[1] = base[1];
             pixel[2] = base[2];
+            pixel[3] = ink;
         }
         Self {
             width,
@@ -634,6 +716,19 @@ impl Surface {
                 row[index] = color[0];
                 row[index + 1] = color[1];
                 row[index + 2] = color[2];
+            }
+        }
+    }
+
+    /// Mark a rectangle as opaque ink (cursor, underline, strikeout).
+    fn mark_ink(&mut self, x0: i32, y0: i32, x1: i32, y1: i32) {
+        let Some((x0, y0, x1, y1)) = self.bounds(x0, y0, x1, y1) else {
+            return;
+        };
+        for y in y0..y1 {
+            let row = &mut self.rgba[y * self.width * 4..];
+            for x in x0..x1 {
+                row[x * 4 + 3] = 255;
             }
         }
     }
@@ -683,6 +778,7 @@ impl Surface {
                         / 255;
                     self.rgba[destination + channel] = blended as u8;
                 }
+                self.rgba[destination + 3] = self.rgba[destination + 3].max(coverage as u8);
             }
         }
     }
@@ -711,19 +807,27 @@ impl Surface {
                     let blended = source_channel + (destination_channel * inverse + 127) / 255;
                     self.rgba[destination + channel] = blended.min(255) as u8;
                 }
+                self.rgba[destination + 3] = self.rgba[destination + 3].max(alpha as u8);
             }
         }
     }
 
     fn finish(mut self, alpha: u8) -> ColorImage {
         let size = [self.width, self.height];
-        if alpha != 255 {
-            for pixel in self.rgba.as_chunks_mut::<4>().0 {
-                pixel[0] = premultiply(pixel[0], alpha);
-                pixel[1] = premultiply(pixel[1], alpha);
-                pixel[2] = premultiply(pixel[2], alpha);
-                pixel[3] = alpha;
-            }
+        if alpha == 255 {
+            // Solid windows are already opaque; skip the per-pixel premultiply.
+            return ColorImage::from_rgba_premultiplied(size, &self.rgba);
+        }
+        for pixel in self.rgba.as_chunks_mut::<4>().0 {
+            // Ink is binary in practice: any nonzero coverage byte means opaque
+            // text, decoration, or cursor. Select the output alpha branchlessly
+            // so the whole pass stays vectorizable.
+            let ink_mask = 0u8.wrapping_sub(u8::from(pixel[3] != 0));
+            let out_alpha = alpha | ((255 - alpha) & ink_mask);
+            pixel[0] = premultiply(pixel[0], out_alpha);
+            pixel[1] = premultiply(pixel[1], out_alpha);
+            pixel[2] = premultiply(pixel[2], out_alpha);
+            pixel[3] = out_alpha;
         }
         ColorImage::from_rgba_premultiplied(size, &self.rgba)
     }
@@ -792,7 +896,21 @@ mod tests {
 
         let alpha = design::material_alpha(spec.material);
         assert_eq!(alpha, design::material_alpha(Material::Mica));
-        assert!(image.pixels.iter().all(|pixel| pixel.a() == alpha));
+        assert!(
+            image.pixels.iter().any(|pixel| pixel.a() == alpha),
+            "background pixels keep the material alpha"
+        );
+        assert!(
+            image.pixels.iter().any(|pixel| pixel.a() == 255),
+            "glyph ink stays opaque so text does not dim"
+        );
+        assert!(
+            image
+                .pixels
+                .iter()
+                .all(|pixel| pixel.a() == alpha || pixel.a() == 255),
+            "only background and ink alpha values are allowed"
+        );
 
         let colors: HashSet<(u8, u8, u8)> = image
             .pixels
@@ -945,11 +1063,30 @@ mod tests {
         assert_eq!(design::material_alpha(Material::Acrylic), 185);
     }
 
+    #[test]
+    fn solid_surfaces_start_opaque_and_skip_premultiplication() {
+        let surface = Surface::new(2, 1, [1, 2, 3], true);
+        assert!(
+            surface.rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
+            "solid surfaces must start fully opaque"
+        );
+        let image = surface.finish(255);
+        assert_eq!(image.pixels[0].a(), 255);
+        assert_eq!(
+            (
+                image.pixels[0].r(),
+                image.pixels[0].g(),
+                image.pixels[0].b()
+            ),
+            (1, 2, 3)
+        );
+    }
+
     /// A grayscale mask must move all three channels by the same amount, so a
     /// white glyph on black never produces chroma fringing.
     #[test]
     fn mask_blending_is_channel_neutral() {
-        let mut surface = Surface::new(2, 1, [0, 0, 0]);
+        let mut surface = Surface::new(2, 1, [0, 0, 0], false);
         let glyph = SoftGlyph {
             width: 2,
             height: 1,
@@ -973,7 +1110,7 @@ mod tests {
     /// bounds. The one visible pixel receives its correct coverage.
     #[test]
     fn mask_blending_clips_offscreen_edges() {
-        let mut surface = Surface::new(2, 2, [0, 0, 0]);
+        let mut surface = Surface::new(2, 2, [0, 0, 0], false);
         let glyph = SoftGlyph {
             width: 2,
             height: 2,

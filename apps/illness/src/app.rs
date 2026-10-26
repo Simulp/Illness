@@ -389,6 +389,10 @@ fn spawn_with_deadline(
     tab_id: u64,
 ) -> Result<Session, String> {
     let (sender, receiver) = mpsc::channel();
+    // Capture the attempt instant before `CreateProcess`: the ConPTY host is
+    // created during the spawn, so a host created at or after this belongs to
+    // this tab (see `platform::boost_console_priority`).
+    let spawn_at = std::time::SystemTime::now();
     let spawned = std::thread::Builder::new()
         .name(format!("illness-shell-attempt-{tab_id}"))
         .spawn(move || {
@@ -403,7 +407,16 @@ fn spawn_with_deadline(
         return Err(format!("could not create a spawn attempt thread: {error}"));
     }
     match wait_for_spawn(&receiver, cancel, SPAWN_ATTEMPT_TIMEOUT) {
-        SpawnWait::Ready(Ok(session)) => Ok(session),
+        SpawnWait::Ready(Ok(session)) => {
+            // A tab closed between the result arriving and this line is already
+            // cancelled; boosting its dead shell would only touch a reused PID.
+            platform::boost_console_priority(
+                session.child_pid(),
+                spawn_at,
+                cancel.load(Ordering::Acquire),
+            );
+            Ok(session)
+        }
         SpawnWait::Ready(Err(error)) => Err(error.to_string()),
         SpawnWait::Timeout => Err(format!(
             "the shell did not start within {} seconds (the folder may be on an offline network share)",
@@ -681,6 +694,9 @@ impl IllnessApp {
         app.applied_ppp = app.ctx.pixels_per_point();
         app.apply_material_to(window.as_ref());
         app.rebuild_backdrop();
+        // Before the first PTY exists: force the kernel32 `CreatePseudoConsole`
+        // fallback instead of a `PATH` `conpty.dll` host.
+        platform::pin_inbox_conpty();
         app.open_tab(None);
         app
     }
@@ -717,7 +733,7 @@ impl IllnessApp {
     /// source tab's stored cwd after a successful attach. WSL, elevated shells
     /// and dead processes cannot be read and use stored/startup paths.
     fn spawn_candidates_for_new_tab(&mut self) -> (Vec<SpawnCandidate>, Option<(u64, PathBuf)>) {
-        let process = std::env::current_dir().ok();
+        let process = platform::fallback_startup_dir();
         if !self.config.inherit_cwd {
             return (
                 spawn_candidates(None, None, self.startup_folder.clone(), process),
@@ -934,7 +950,10 @@ impl IllnessApp {
             if pending.is_empty() || session.is_exited() {
                 continue;
             }
-            if let Some(bytes) = tab.view.encode_input(&pending, modifiers) {
+            if let Some(bytes) = tab
+                .view
+                .encode_input(&pending, modifiers, session.term_modes())
+            {
                 session.write(&bytes);
                 tab.user_acted = true;
             }
@@ -2302,7 +2321,7 @@ impl IllnessApp {
             None,
             cwd,
             self.startup_folder.clone(),
-            std::env::current_dir().ok(),
+            platform::fallback_startup_dir(),
         );
         let tab = self.start_tab(&profile, candidates, None);
         let id = tab.id;
@@ -2694,11 +2713,15 @@ impl IllnessApp {
             .iter()
             .map(|entry| match entry {
                 TabEntry::Terminal(tab) => TabInfo {
+                    id: tab.id,
                     title: tab.title.clone(),
                     profile: tab.profile_name.clone(),
                     accent: tab.accent,
                 },
                 TabEntry::Settings => TabInfo {
+                    // Settings has no terminal id. Keep one stable sentinel so
+                    // it can still be dragged and identity-checked.
+                    id: u64::MAX,
                     title: "Settings".to_string(),
                     profile: "Settings".to_string(),
                     accent: self.theme.accent,
@@ -2805,8 +2828,14 @@ impl IllnessApp {
                     self.note_active_terminal();
                 }
             }
-            Shortcut::Palette => self.overlays.kind = OverlayKind::Palette,
-            Shortcut::Search => self.overlays.kind = OverlayKind::Search,
+            Shortcut::Palette => {
+                self.chrome.dropdown_open = false;
+                self.overlays.kind = OverlayKind::Palette;
+            }
+            Shortcut::Search => {
+                self.chrome.dropdown_open = false;
+                self.overlays.kind = OverlayKind::Search;
+            }
             Shortcut::Settings => self.open_settings(),
             Shortcut::ZoomIn => self.set_font_size(self.config.font_size + 1.0),
             Shortcut::ZoomOut => self.set_font_size(self.config.font_size - 1.0),
@@ -2928,6 +2957,45 @@ impl IllnessApp {
             self.handle_zoom_wheel(&ctx);
         }
 
+        // Terminal input invariant: keyboard/text/IME/paste bytes are written
+        // to the PTY here, before this frame builds a snapshot or composites
+        // anything, so a keystroke never waits on paint work. Because the grid
+        // panel below reads the same frame's events, they must not be encoded
+        // a second time per frame; `TerminalView::show` must not encode input.
+        // The gate is `terminal_input_allowed`, which ignores egui focus: the
+        // grid requests focus when clicked, so focus is not "someone else owns
+        // the keyboard" here.
+        if let Some(TabEntry::Terminal(tab)) = self.tabs.get_mut(self.active)
+            && let Some(session) = &tab.session
+            && terminal_input_allowed(
+                overlay_open,
+                shortcut_used,
+                session.is_exited(),
+                keyboard_input,
+            )
+        {
+            // Idle frames (no key/text/IME/paste event) must not clone the
+            // event vector or take the terminal lock just to learn that.
+            let events = ctx.input(|input| {
+                input
+                    .events
+                    .iter()
+                    .any(is_terminal_input_event)
+                    .then(|| input.events.clone())
+            });
+            if let Some(events) = events {
+                let modifiers = ctx.input(|input| input.modifiers);
+                // Read modes from the live session so this frame's DECCKM /
+                // bracketed-paste transition already applies to this frame's keys.
+                let modes = session.term_modes();
+                if let Some(bytes) = tab.view.encode_input(&events, modifiers, modes) {
+                    session.write(&bytes);
+                    // Only bytes actually delivered to this shell count as use.
+                    tab.user_acted = true;
+                }
+            }
+        }
+
         let titlebar_height = if self.tokens.titlebar_h > 0.0 {
             self.tokens.titlebar_h
         } else {
@@ -3003,17 +3071,6 @@ impl IllnessApp {
                         && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
                     {
                         context_menu_pos = response.response.interact_pointer_pos();
-                    }
-
-                    if !overlay_open
-                        && !shortcut_used
-                        && !session.is_exited()
-                        && let Some(bytes) = tab.view.take_input(ui)
-                    {
-                        session.write(&bytes);
-                        // Only bytes actually delivered to this shell count
-                        // as use. Titlebar/tab/Settings clicks do not.
-                        tab.user_acted = true;
                     }
                 } else {
                     // Pending spawns and failed spawns have no grid yet. Keep a
@@ -3337,6 +3394,9 @@ fn spawn_spec(profile: &Profile, config: &Config, cwd: Option<&Path>) -> SpawnSp
     SpawnSpec {
         program: profile.program.clone(),
         args: shell_args(profile, config.inherit_cwd),
+        // The last-ditch attempt (`cwd = None`) keeps the real process
+        // directory: it always exists, while a profile folder may be redirected
+        // to an unreachable share.
         cwd: cwd
             .map(Path::to_path_buf)
             .or_else(|| std::env::current_dir().ok()),
@@ -3903,11 +3963,60 @@ fn active_after_move(active: usize, from: usize, to: usize) -> usize {
     }
 }
 
-/// Global shortcuts stay out of the way while a text field owns the keyboard
-/// or while Settings is open (Ctrl+W must not close Settings, Ctrl+1..9 must
-/// not switch tabs, and Ctrl+Shift+F must not steal the search key).
+/// Gate for global shortcuts only. **Never** gate terminal bytes on this.
+///
+/// `keyboard_input` is `Context::egui_wants_keyboard_input()`, which egui
+/// implements as "some widget holds keyboard focus" — not "a text field is
+/// focused". Shortcuts must yield to any focused widget (a text field, a
+/// slider, the search box), so that is the right question here.
+///
+/// It is the wrong question for terminal input: `TerminalView::show` calls
+/// `request_focus()` on the grid as soon as the user clicks it, so this gate
+/// stays closed forever and every later keystroke is dropped. Terminal bytes
+/// therefore use [`terminal_input_allowed`], which ignores focus on purpose.
+/// The two gates are intentionally separate; do not merge them.
 fn shortcuts_allowed(overlay_open: bool, settings_active: bool, keyboard_input: bool) -> bool {
     !overlay_open && !settings_active && !keyboard_input
+}
+
+/// Gate for writing encoded bytes to the active shell's PTY.
+///
+/// Deliberately focus-blind: no `egui_wants_keyboard_input()` here. Clicking the
+/// grid focuses it (see [`shortcuts_allowed`]), and the grid *is* the terminal,
+/// so focus on it must never suppress input. Only an open overlay, a shortcut
+/// that already consumed this frame's key, or a dead PTY block the bytes.
+///
+/// `settings_active` is not a parameter because a Settings tab and a terminal
+/// tab cannot occupy the active tab at the same time; Settings never reaches
+/// this gate.
+///
+/// `keyboard_input` is accepted and deliberately ignored. Passing the frame's
+/// `egui_wants_keyboard_input()` keeps this gate's call site identical in shape
+/// to [`shortcuts_allowed`], so the focus state cannot silently reappear in the
+/// comparison; `clicking_the_grid_does_not_block_terminal_input` fails if it
+/// does.
+fn terminal_input_allowed(
+    overlay_open: bool,
+    shortcut_used: bool,
+    exited: bool,
+    keyboard_input: bool,
+) -> bool {
+    let _ = keyboard_input;
+    !overlay_open && !shortcut_used && !exited
+}
+
+/// Whether an event carries bytes for the active shell.
+///
+/// Must match what [`TerminalView::encode_input`] consumes; anything else on an
+/// idle frame must not allocate or take the terminal lock.
+fn is_terminal_input_event(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key { pressed: true, .. }
+            | Event::Text(_)
+            | Event::Ime(egui::ImeEvent::Commit(_))
+            | Event::Paste(_)
+    )
 }
 
 /// Translate Ctrl+C/X/V into the clipboard events `TextEdit` listens for.
@@ -5210,6 +5319,58 @@ mod tests {
     }
 
     #[test]
+    fn terminal_input_needs_no_overlay_no_shortcut_and_a_live_shell() {
+        assert!(terminal_input_allowed(false, false, false, false));
+        assert!(
+            !terminal_input_allowed(true, false, false, false),
+            "overlay owns the keys"
+        );
+        assert!(
+            !terminal_input_allowed(false, true, false, false),
+            "shortcut consumed the key"
+        );
+        assert!(
+            !terminal_input_allowed(false, false, true, false),
+            "exited shell has no PTY"
+        );
+        assert!(!terminal_input_allowed(true, true, true, false));
+    }
+
+    /// Regression: the grid takes egui focus when clicked, and terminal input
+    /// used to be gated on `egui_wants_keyboard_input()`, so one click in the
+    /// terminal killed all later keystrokes. This runs a real `egui::Context`
+    /// so `request_focus()` produces the same memory state the app sees.
+    #[test]
+    fn clicking_the_grid_does_not_block_terminal_input() {
+        let ctx = egui::Context::default();
+        // Two frames, because focus is only observable through the memory the
+        // following frame reads; the widget stays alive so focus is not
+        // surrendered as "uninterested".
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let response = ui.allocate_response(ui.available_size(), Sense::click());
+                response.request_focus();
+            });
+            // No renderer in a headless test; the font texture delta must be
+            // acknowledged or `epaint` panics when it is dropped.
+            output.textures_delta.clear();
+        }
+
+        assert!(
+            ctx.egui_wants_keyboard_input(),
+            "the grid-like widget really holds egui focus"
+        );
+        assert!(
+            terminal_input_allowed(false, false, false, ctx.egui_wants_keyboard_input()),
+            "a focused grid must never suppress terminal bytes"
+        );
+        assert!(
+            !shortcuts_allowed(false, false, ctx.egui_wants_keyboard_input()),
+            "shortcuts still yield to a focused widget"
+        );
+    }
+
+    #[test]
     fn pending_input_keeps_newest_events_and_encodes_an_exit() {
         let mut pending = Vec::new();
         let mut events = Vec::new();
@@ -5235,7 +5396,11 @@ mod tests {
         ]);
         let view = TerminalView::default();
         assert_eq!(
-            view.encode_input(&exit, Modifiers::default()),
+            view.encode_input(
+                &exit,
+                Modifiers::default(),
+                illness_term::TermModes::default()
+            ),
             Some(b"exit\r".to_vec()),
             "buffered pre-attach typing is written once the session attaches"
         );

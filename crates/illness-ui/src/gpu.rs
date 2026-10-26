@@ -349,8 +349,8 @@ impl VertexStream {
 /// Builds the layered vertex stream for one terminal frame.
 struct VertexBuilder {
     surface_size: [u32; 2],
-    /// Material alpha, baked into every vertex so translucent windows keep
-    /// the same weight as the CPU surface.
+    /// Material alpha for solid fills and selection tints. Glyph quads stay
+    /// opaque so text over a translucent backdrop keeps full contrast.
     alpha: f32,
     layers: [Vec<u8>; LAYER_COUNT],
 }
@@ -391,13 +391,13 @@ impl VertexBuilder {
         let ndc_y1 = 1.0 - y1 as f32 / height as f32 * 2.0;
 
         let color = if slot.color {
-            [1.0, 1.0, 1.0, self.alpha]
+            [1.0, 1.0, 1.0, 1.0]
         } else {
             [
                 f32::from(fg.r()) / 255.0,
                 f32::from(fg.g()) / 255.0,
                 f32::from(fg.b()) / 255.0,
-                self.alpha,
+                1.0,
             ]
         };
         let layer = if slot.color { LAYER_COLOR } else { LAYER_MASK };
@@ -415,8 +415,20 @@ impl VertexBuilder {
         }
     }
 
-    /// Emits an axis-aligned solid rectangle in physical pixels.
-    fn push_rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color32, layer: usize) {
+    /// Emits an axis-aligned solid rectangle in physical pixels. `opaque`
+    /// quads (text cursor) keep full RGB and alpha; fills are premultiplied by
+    /// the material and fill alpha so Mica/Acrylic stays translucent.
+    #[allow(clippy::too_many_arguments)]
+    fn push_rect(
+        &mut self,
+        x0: i32,
+        y0: i32,
+        x1: i32,
+        y1: i32,
+        color: Color32,
+        layer: usize,
+        opaque: bool,
+    ) {
         let width = self.surface_size[0] as i32;
         let height = self.surface_size[1] as i32;
         let x0 = x0.clamp(0, width);
@@ -432,13 +444,27 @@ impl VertexBuilder {
         let ndc_y0 = 1.0 - y0 as f32 / height as f32 * 2.0;
         let ndc_y1 = 1.0 - y1 as f32 / height as f32 * 2.0;
 
-        let fill_alpha = f32::from(color.a()) / 255.0;
-        let color = [
-            f32::from(color.r()) / 255.0 * self.alpha * fill_alpha,
-            f32::from(color.g()) / 255.0 * self.alpha * fill_alpha,
-            f32::from(color.b()) / 255.0 * self.alpha * fill_alpha,
-            fill_alpha,
-        ];
+        // `Color32` stores premultiplied channels, so read straight sRGB back
+        // before applying fill/material alpha; otherwise translucent fills are
+        // premultiplied twice and their tint squares.
+        let [red, green, blue, alpha] = color.to_srgba_unmultiplied();
+        let fill_alpha = f32::from(alpha) / 255.0;
+        let color = if opaque {
+            [
+                f32::from(red) / 255.0,
+                f32::from(green) / 255.0,
+                f32::from(blue) / 255.0,
+                1.0,
+            ]
+        } else {
+            let alpha = fill_alpha * self.alpha;
+            [
+                f32::from(red) / 255.0 * alpha,
+                f32::from(green) / 255.0 * alpha,
+                f32::from(blue) / 255.0 * alpha,
+                alpha,
+            ]
+        };
         let target = &mut self.layers[layer];
         let corners = [
             ([ndc_x0, ndc_y0], [0.0, 0.0]),
@@ -508,6 +534,7 @@ fn build_fills(
             origin + (row as i32 + 1) * cell_height,
             spec.tokens.selection,
             LAYER_FILLS,
+            false,
         );
     }
 
@@ -533,6 +560,7 @@ fn build_fills(
                     origin + (row as i32 + 1) * cell_height,
                     highlight,
                     LAYER_FILLS,
+                    false,
                 );
             }
         }
@@ -560,13 +588,13 @@ fn build_fills(
     let color = design::color(spec.theme.cursor);
     match snapshot.cursor.kind {
         CursorKind::Block => {
-            builder.push_rect(x0, y0, x1, y1, color, LAYER_FILLS);
+            builder.push_rect(x0, y0, x1, y1, color, LAYER_FILLS, true);
         }
         CursorKind::Beam => {
-            builder.push_rect(x0, y0, x0 + 2, y1, color, LAYER_CURSOR);
+            builder.push_rect(x0, y0, x0 + 2, y1, color, LAYER_CURSOR, true);
         }
         CursorKind::Underline => {
-            builder.push_rect(x0, y1 - 2, x1, y1, color, LAYER_CURSOR);
+            builder.push_rect(x0, y1 - 2, x1, y1, color, LAYER_CURSOR, true);
         }
     }
 }
@@ -1308,6 +1336,106 @@ mod tests {
     }
 
     #[test]
+    fn glyph_alpha_stays_opaque_over_translucent_materials() {
+        let mut builder = VertexBuilder::new([32, 32], 185, std::array::from_fn(|_| Vec::new()));
+        let slot = GlyphSlot {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            left: 0,
+            top: 0,
+            color: false,
+        };
+        builder.push_quad(slot, 8, 8, Color32::from_rgb(0x7e, 0xe7, 0x87));
+        let (counts, layers) = builder.finish();
+        assert_eq!(counts[LAYER_MASK], 6, "one glyph is two triangles");
+        let vertex = &layers[LAYER_MASK][..VERTEX_SIZE];
+        let read = |offset: usize| {
+            f32::from_le_bytes(vertex[offset..offset + 4].try_into().expect("float"))
+        };
+        assert!(
+            (read(16) - 0x7e as f32 / 255.0).abs() < 1e-6,
+            "red is not dimmed"
+        );
+        assert_eq!(read(28), 1.0, "glyph alpha must stay opaque");
+    }
+
+    #[test]
+    fn fills_fade_with_material_but_cursor_fills_stay_opaque() {
+        let mut builder = VertexBuilder::new([32, 32], 185, std::array::from_fn(|_| Vec::new()));
+        let selection = Color32::from_rgb(0x88, 0xc0, 0xd0);
+        let cursor = Color32::from_rgb(0xe5, 0x53, 0x4b);
+        builder.push_rect(0, 0, 8, 8, selection, LAYER_FILLS, false);
+        builder.push_rect(8, 0, 16, 8, cursor, LAYER_FILLS, true);
+        let (counts, layers) = builder.finish();
+        assert_eq!(counts[LAYER_FILLS], 12);
+
+        let read = |layer: &[u8], quad: usize, offset: usize| {
+            let vertex = &layer[quad * VERTEX_SIZE..];
+            f32::from_le_bytes(vertex[offset..offset + 4].try_into().expect("float"))
+        };
+
+        let material = 185.0 / 255.0;
+        assert!(
+            (read(&layers[LAYER_FILLS], 0, 28) - material).abs() < 1e-6,
+            "selection fill alpha must follow the material alpha"
+        );
+        assert!(
+            (read(&layers[LAYER_FILLS], 0, 16) - 0x88 as f32 / 255.0 * material).abs() < 1e-6,
+            "selection fill RGB must be premultiplied by the material alpha"
+        );
+
+        assert_eq!(
+            read(&layers[LAYER_FILLS], 6, 28),
+            1.0,
+            "cursor fill alpha must stay opaque"
+        );
+        assert!(
+            (read(&layers[LAYER_FILLS], 6, 16) - 0xe5 as f32 / 255.0).abs() < 1e-6,
+            "cursor fill RGB must stay at full colour"
+        );
+    }
+
+    #[test]
+    fn translucent_fills_are_not_double_premultiplied() {
+        let mut builder = VertexBuilder::new([32, 32], 185, std::array::from_fn(|_| Vec::new()));
+        let highlight = Color32::from_rgba_unmultiplied(0x88, 0xc0, 0xd0, 96);
+        let cursor = Color32::from_rgb(0xe5, 0x53, 0x4b);
+        builder.push_rect(0, 0, 8, 8, highlight, LAYER_FILLS, false);
+        builder.push_rect(8, 0, 16, 8, cursor, LAYER_FILLS, true);
+        let (_, layers) = builder.finish();
+
+        let read = |quad: usize, offset: usize| {
+            let vertex = &layers[LAYER_FILLS][quad * VERTEX_SIZE..];
+            f32::from_le_bytes(vertex[offset..offset + 4].try_into().expect("float"))
+        };
+
+        let material = 185.0 / 255.0;
+        let fill = 96.0 / 255.0;
+        let expected_alpha = fill * material;
+        assert!(
+            (read(0, 28) - expected_alpha).abs() < 1e-6,
+            "translucent fill alpha must be fill * material once"
+        );
+        // `Color32` round-trips through premultiplied storage, so allow a
+        // couple of 8-bit steps while proving the tint is not squared.
+        assert!(
+            (read(0, 16) - 0x88 as f32 / 255.0 * expected_alpha).abs() < 0.01,
+            "translucent fill RGB must not be premultiplied twice"
+        );
+        assert!(
+            (read(0, 20) - 0xc0 as f32 / 255.0 * expected_alpha).abs() < 0.01,
+            "translucent fill green must not be premultiplied twice"
+        );
+        assert_eq!(read(6, 28), 1.0, "opaque cursor alpha stays opaque");
+        assert!(
+            (read(6, 16) - 0xe5 as f32 / 255.0).abs() < 1e-6,
+            "opaque cursor keeps full RGB"
+        );
+    }
+
+    #[test]
     fn mask_pipeline_uses_grayscale_premultiplied_alpha() {
         let blend = mask_blend_state();
         assert_eq!(blend, wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING);
@@ -1412,7 +1540,7 @@ mod tests {
         let mut builds = 0;
         let rebuilt = stream.update(7, 1, [64, 64], 255, |builder| {
             builds += 1;
-            builder.push_rect(0, 0, 8, 8, Color32::WHITE, LAYER_FILLS);
+            builder.push_rect(0, 0, 8, 8, Color32::WHITE, LAYER_FILLS, false);
         });
         assert!(rebuilt);
         assert_eq!(builds, 1);

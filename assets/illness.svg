@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#161820"/>
+      <stop offset="50%" stop-color="#0f1015"/>
+      <stop offset="100%" stop-color="#090a0d"/>
+    </linearGradient>
+
+    <linearGradient id="borderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3d4252"/>
+      <stop offset="50%" stop-color="#232630"/>
+      <stop offset="100%" stop-color="#13151b"/>
+    </linearGradient>
+
+    <radialGradient id="screenGlow" cx="45%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#6ee787" stop-opacity="0.08"/>
+      <stop offset="60%" stop-color="#6ee787" stop-opacity="0.01"/>
+      <stop offset="100%" stop-color="#000000" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <rect
+    x="18"
+    y="18"
+    width="476"
+    height="476"
+    rx="104"
+    ry="104"
+    fill="url(#bgGradient)"
+    stroke="url(#borderGradient)"
+    stroke-width="5"
+  />
+
+  <rect
+    x="22"
+    y="22"
+    width="468"
+    height="468"
+    rx="100"
+    ry="100"
+    fill="url(#screenGlow)"
+    pointer-events="none"
+  />
+
+  <g filter="url(#neonGlow)">
+    <path
+      d="M 125 168 L 215 256 L 125 344"
+      fill="none"
+      stroke="#6ee787"
+      stroke-width="28"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+
+    <path
+      d="M 252 280 L 285 280 L 312 205 L 345 345 L 372 250 L 388 280 L 435 280"
+      fill="none"
+      stroke="#6ee787"
+      stroke-width="26"
+      stroke-linecap="round"
+      stroke-linejoin="round"
+    />
+  </g>
+</svg>

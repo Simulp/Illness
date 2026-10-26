@@ -20,7 +20,7 @@ pub fn material_alpha(material: Material) -> u8 {
 }
 
 /// Mix `amount` of `other` into `base` (sRGB-space interpolation).
-fn mix(base: Color32, other: Color32, amount: f32) -> Color32 {
+pub fn mix(base: Color32, other: Color32, amount: f32) -> Color32 {
     let channel =
         |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * amount).round() as u8;
     Color32::from_rgb(
@@ -28,6 +28,14 @@ fn mix(base: Color32, other: Color32, amount: f32) -> Color32 {
         channel(base.g(), other.g()),
         channel(base.b(), other.b()),
     )
+}
+
+/// Fade a colour for an animation by scaling only its alpha. Unlike
+/// [`Color32::gamma_multiply`] this keeps the RGB channels intact, so a dark
+/// hover does not flash darker while it fades in.
+pub fn fade(color: Color32, opacity: f32) -> Color32 {
+    let alpha = (255.0 * opacity.clamp(0.0, 1.0)).round() as u8;
+    Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -48,10 +56,13 @@ pub struct Tokens {
     pub font_small: f32,
     pub font_body: f32,
     pub font_title: f32,
+    pub font_header: f32,
 
     pub bg: Color32,
     pub bg_elev: Color32,
     pub bg_sunken: Color32,
+    pub card_bg: Color32,
+    pub card_border: Color32,
     pub border: Color32,
     pub text: Color32,
     pub text_dim: Color32,
@@ -60,7 +71,7 @@ pub struct Tokens {
     pub danger: Color32,
     pub selection: Color32,
 
-    // Aliases kept for the other UI modules and the skeleton's existing callers.
+    // Aliases kept for the other UI modules and existing callers.
     pub bg_elevated: Color32,
     pub bg_hover: Color32,
     pub bg_active: Color32,
@@ -89,17 +100,32 @@ impl Tokens {
         let accent = color(theme.accent);
 
         let bg_elev = mix(bg, Color32::WHITE, 0.06);
-        let bg_sunken = mix(bg, Color32::BLACK, 0.04);
+        let bg_sunken = mix(bg, Color32::BLACK, 0.05);
+
+        let card_bg = if light {
+            mix(bg, Color32::BLACK, 0.025)
+        } else {
+            mix(bg, Color32::WHITE, 0.035)
+        };
+
+        let card_border = if light {
+            mix(bg, Color32::BLACK, 0.08)
+        } else {
+            mix(bg, Color32::WHITE, 0.07)
+        };
+
         let border = if light {
             mix(bg, Color32::BLACK, 0.10)
         } else {
             mix(bg, Color32::WHITE, 0.08)
         };
+
         let hover = if light {
-            mix(bg, Color32::BLACK, 0.07)
+            mix(bg, Color32::BLACK, 0.08)
         } else {
-            mix(bg, Color32::WHITE, 0.07)
+            mix(bg, Color32::WHITE, 0.10)
         };
+
         let text_dim = mix(bg, text, 0.60);
         let danger = Color32::from_rgb(0xE5, 0x53, 0x4B);
 
@@ -119,11 +145,14 @@ impl Tokens {
 
             font_small: 12.0,
             font_body: 13.5,
-            font_title: 14.5,
+            font_title: 15.0,
+            font_header: 22.0,
 
             bg,
             bg_elev,
             bg_sunken,
+            card_bg,
+            card_border,
             border,
             text,
             text_dim,
@@ -196,7 +225,7 @@ pub fn pill(ui: &mut egui::Ui, text: &str, color: Color32) -> egui::Response {
     ui.painter().rect_filled(
         rect,
         CornerRadius::same(255),
-        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 40),
+        Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35),
     );
     ui.painter()
         .galley(rect.center() - galley.size() * 0.5, galley, color);
@@ -334,5 +363,34 @@ mod tests {
         assert_eq!(material_alpha(Material::Solid), 255);
         assert_eq!(material_alpha(Material::Mica), 210);
         assert_eq!(material_alpha(Material::Acrylic), 185);
+    }
+
+    #[test]
+    fn hover_is_distinct_from_the_elevated_surface() {
+        for theme in Theme::all() {
+            let tokens = Tokens::from_theme(theme);
+            assert_ne!(
+                tokens.hover, tokens.bg_elev,
+                "hover must not equal the elevated surface for {}",
+                theme.name
+            );
+            assert_ne!(
+                tokens.hover, tokens.bg,
+                "hover must not equal the base surface for {}",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
+    fn fade_scales_only_alpha() {
+        let color = Color32::from_rgb(0x7e, 0xe7, 0x87);
+        let faded = fade(color, 0.5);
+        let [r, g, b, a] = faded.to_srgba_unmultiplied();
+        assert_eq!((r, g, b), (0x7e, 0xe7, 0x87));
+        assert_eq!(a, 128);
+        assert_eq!(fade(color, 0.0).a(), 0);
+        assert_eq!(fade(color, 1.0).a(), 255);
+        assert_eq!(fade(color, 2.0).a(), 255);
     }
 }

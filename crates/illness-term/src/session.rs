@@ -346,6 +346,17 @@ impl Session {
         snapshot
     }
 
+    /// Current terminal modes without building a snapshot.
+    ///
+    /// Input is encoded before the frame paints, so it must not read modes from
+    /// the previous frame's snapshot: a program that enables bracketed paste or
+    /// application-cursor keys this frame would otherwise be encoded against the
+    /// old state for one frame.
+    pub fn term_modes(&self) -> TermModes {
+        let term = self.term.lock();
+        modes_from(*term.mode())
+    }
+
     /// Start a selection at a viewport position.
     pub fn selection_start(&self, kind: SelectionType, col: usize, row: usize, side: Side) {
         let mut term = self.term.lock();
@@ -939,6 +950,14 @@ mod tests {
         assert!(modes.mouse_reporting);
         assert!(modes.sgr_mouse);
         assert!(modes.alternate_screen);
+    }
+
+    #[test]
+    fn term_modes_match_the_snapshot_modes() {
+        let session = session(20, 5);
+        session.feed_for_test(b"\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?1049h");
+
+        assert_eq!(session.term_modes(), session.snapshot().modes);
     }
 
     #[test]

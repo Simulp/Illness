@@ -1,21 +1,21 @@
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Area, Color32, ComboBox, Context, DragValue, FontId, Frame, Id, Key, Layout,
+    Align, Align2, Area, Color32, ComboBox, Context, CornerRadius, FontId, Frame, Id, Key, Layout,
     Margin, Modifiers, Order, Pos2, Rect, Response, RichText, ScrollArea, Sense, Slider, Stroke,
     StrokeKind, TextEdit, Ui, Vec2,
 };
 use illness_core::config::BackgroundMode;
 use illness_core::{Config, CursorKind, Material, Profile, Rgb, Theme};
-use std::path::{Path, PathBuf};
 
 use crate::chrome::{Action, TabInfo};
 use crate::design::{self, Tokens};
 use crate::fonts;
 use crate::icons::{self, Icon};
 
-pub const PALETTE_WIDTH: f32 = 640.0;
+pub const PALETTE_WIDTH: f32 = 680.0;
 pub const SEARCH_WIDTH: f32 = 380.0;
 pub const SEARCH_HEIGHT: f32 = 40.0;
 
@@ -23,6 +23,21 @@ pub const SEARCH_HEIGHT: f32 = 40.0;
 const TOAST_SECS: f64 = 3.0;
 /// 0.47 of opaque black, used only for modal backdrops.
 const BACKDROP_ALPHA: u8 = 160;
+/// Height of one command row. Roomier than a menu row so the palette breathes.
+const PALETTE_ROW_HEIGHT: f32 = 40.0;
+const PALETTE_SEARCH_HEIGHT: f32 = 46.0;
+const PALETTE_VISIBLE_ROWS: usize = 8;
+/// Everything except the scrollable list: margins, search field, gaps,
+/// divider and footer. Kept as an explicit sum so the row math stays obvious:
+/// top margin 12 + search 46 + gap 10 + gap 10 + divider 1 + gap 8 +
+/// footer 20 + gap 4 + bottom margin 12 = 123. The painted outer rect is
+/// exactly this tall plus the list, so the 12px insets are included.
+const PALETTE_CHROME_HEIGHT: f32 =
+    12.0 + PALETTE_SEARCH_HEIGHT + 10.0 + 10.0 + 1.0 + 8.0 + 20.0 + 4.0 + 12.0;
+/// Entry animation for overlay surfaces. Short enough to feel instant.
+const ENTRY_SECS: f32 = 0.16;
+const HOVER_SECS: f32 = 0.12;
+const TOGGLE_SECS: f32 = 0.14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum OverlayKind {
@@ -45,8 +60,15 @@ pub struct OverlayState {
     pub toast: Option<String>,
     /// Absolute egui time at which the current toast expires.
     pub toast_deadline: Option<f64>,
+    /// Overlay kind observed on the previous frame; used to restart entry animations.
+    pub anim_kind: OverlayKind,
+    /// Absolute egui time at which the current overlay appeared.
+    pub opened_at: f64,
     /// `(profile index, name at the start of the active name edit)`.
     pub profile_name_edit: Option<(usize, String)>,
+    /// Bumped every time an overlay closes. Used as a scroll-id salt so the
+    /// palette reopens at the top instead of restoring the old scroll offset.
+    pub palette_generation: u64,
 }
 
 impl Default for OverlayState {
@@ -60,7 +82,10 @@ impl Default for OverlayState {
             search_index: None,
             toast: None,
             toast_deadline: None,
+            anim_kind: OverlayKind::None,
+            opened_at: 0.0,
             profile_name_edit: None,
+            palette_generation: 0,
         }
     }
 }
@@ -68,6 +93,9 @@ impl Default for OverlayState {
 impl OverlayState {
     pub fn close(&mut self) {
         self.kind = OverlayKind::None;
+        self.query.clear();
+        self.selected = 0;
+        self.palette_generation = self.palette_generation.wrapping_add(1);
     }
 
     /// Show `message` and restart its lifetime. Replacing a toast must clear the
@@ -105,6 +133,12 @@ pub fn show(
     tabs: &[TabInfo],
 ) -> Vec<Action> {
     show_toast(ctx, state, tokens);
+
+    let now = ctx.input(|input| input.time);
+    if state.anim_kind != state.kind {
+        state.anim_kind = state.kind;
+        state.opened_at = now;
+    }
 
     let mut actions = Vec::new();
     if matches!(state.kind, OverlayKind::None) {
@@ -433,6 +467,71 @@ fn execute_command(command: Command, config: &mut Config, actions: &mut Vec<Acti
     }
 }
 
+/// Draws only the palette rows inside the scroll viewport.
+///
+/// The row pitch matches [`palette_metrics`] (row height plus the 3px gap), so
+/// `show_rows` can virtualize the full list while keeping the reserved height
+/// and row clip identical. Returns the clicked command, if any, plus the
+/// resulting vertical scroll offset (used by tests).
+fn palette_list(
+    ui: &mut Ui,
+    items: &[PaletteItem],
+    tokens: &Tokens,
+    state: &mut OverlayState,
+    list_height: f32,
+    moved: bool,
+) -> (Option<Command>, f32) {
+    let row_gap = 3.0;
+    let row_pitch = PALETTE_ROW_HEIGHT + row_gap;
+    // `show_rows` reads the real spacing to compute the row pitch. The palette
+    // chrome keeps implicit spacing at zero, so restore it for the footer.
+    let previous_gap = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = row_gap;
+    let output = ScrollArea::vertical()
+        .id_salt(("illness_palette_scroll", state.palette_generation))
+        .max_height(list_height)
+        .auto_shrink([false, false])
+        .show_rows(ui, PALETTE_ROW_HEIGHT, items.len(), |ui, range| {
+            if moved {
+                // `show_rows` scopes the viewport to the rendered range, so the
+                // absolute row rect can be derived even when the selected row
+                // lies outside that range. Centering matches the old
+                // `Response::scroll_to_me` behavior.
+                let top =
+                    ui.max_rect().top() + (state.selected as f32 - range.start as f32) * row_pitch;
+                let target = Rect::from_min_size(
+                    Pos2::new(ui.max_rect().left(), top),
+                    Vec2::new(ui.max_rect().width(), PALETTE_ROW_HEIGHT),
+                );
+                ui.scroll_to_rect(target, Some(Align::Center));
+            }
+
+            let mut chosen = None;
+            for index in range {
+                let item = &items[index];
+                let response = menu_row(
+                    ui,
+                    tokens,
+                    &item.label,
+                    &item.hint,
+                    item.icon,
+                    Id::unique(("illness_palette_row", index)),
+                    index == state.selected,
+                );
+                if response.clicked() {
+                    chosen = Some(item.command.clone());
+                }
+                if response.hovered() && ui.ctx().input(|input| input.pointer.delta() != Vec2::ZERO)
+                {
+                    state.selected = index;
+                }
+            }
+            chosen
+        });
+    ui.spacing_mut().item_spacing.y = previous_gap;
+    (output.inner, output.state.clamped_offset().y)
+}
+
 fn show_palette(
     ctx: &Context,
     state: &mut OverlayState,
@@ -442,50 +541,128 @@ fn show_palette(
     tabs: &[TabInfo],
 ) -> Vec<Action> {
     let screen = ctx.content_rect();
-    if backdrop(ctx, "illness_palette_backdrop", BACKDROP_ALPHA) {
-        state.close();
-        return Vec::new();
-    }
+    let (entry, slide) = entry_progress(ctx, state);
+    let width = PALETTE_WIDTH.min((screen.width() - 32.0).max(320.0));
+    // Resolve the list before sizing so the surface height and the visible
+    // rows agree. `items` is only rebuilt below if the TextEdit actually
+    // changed the query, avoiding a second full palette build every frame.
+    let mut items = palette_items(&state.query, profiles, tabs);
+    let sizing_count = items.len();
+    let settled_y = (screen.top() + screen.height() * 0.14).max(screen.top() + 12.0);
+    let palette_pos = Pos2::new(screen.center().x - width * 0.5, settled_y - slide);
+    let available_height = (screen.bottom() - settled_y - 8.0).max(160.0);
+    let (list_height, palette_height) = palette_metrics(sizing_count, available_height);
+    let palette_rect = Rect::from_min_size(palette_pos, Vec2::new(width, palette_height));
 
-    let width = PALETTE_WIDTH.min((screen.width() - 24.0).max(320.0));
-    let position = Pos2::new(
-        screen.center().x - width * 0.5,
-        screen.top() + screen.height() * 0.18,
-    );
     let mut chosen = None;
+    let mut bg_clicked = false;
 
-    Area::new(Id::unique("illness_palette"))
+    // Single unified modal area: fixes the backdrop z-order bug permanently
+    Area::new(Id::unique("illness_palette_modal"))
         .order(Order::Foreground)
-        .fixed_pos(position)
-        .sense(Sense::click())
+        .fixed_pos(Pos2::ZERO)
+        .interactable(true)
+        .fade_in(false)
         .show(ctx, |ui| {
-            ui.set_width(width);
-            Frame::new()
-                .fill(tokens.bg_elev)
-                .stroke(Stroke::new(1.0, tokens.border))
-                .corner_radius(12.0)
-                .inner_margin(12)
-                .show(ui, |ui| {
-                    ui.set_width(width - 24.0);
-                    Frame::new()
-                        .fill(tokens.bg)
-                        .stroke(Stroke::new(1.0, tokens.border))
-                        .corner_radius(tokens.radius_md)
-                        .inner_margin(Margin::symmetric(10, 6))
-                        .show(ui, |ui| {
-                            let output = TextEdit::singleline(&mut state.query)
-                                .hint_text("Search commands…")
-                                .desired_width(f32::INFINITY)
-                                .font(FontId::proportional(16.0))
-                                .text_color(tokens.text)
-                                .frame(Frame::NONE)
-                                .return_key(None)
-                                .show(ui);
-                            output.response.request_focus();
-                        });
+            // 1. Draw modal dark backdrop
+            let (bg_rect, bg_resp) = ui.allocate_exact_size(screen.size(), Sense::click());
+            let backdrop_alpha = (f32::from(BACKDROP_ALPHA) * entry).round() as u8;
+            ui.painter()
+                .rect_filled(bg_rect, 0.0, Color32::from_black_alpha(backdrop_alpha));
 
-                    ui.add_space(8.0);
-                    let items = palette_items(&state.query, profiles, tabs);
+            // 2. Record backdrop clicks; containment is checked against the
+            // exact painted rect after the content has been laid out.
+            bg_clicked = bg_resp.clicked();
+
+            // 3. Draw the palette surface on exactly `palette_rect`, then lay
+            // content out inside its 12px inset. Painting manually keeps the
+            // interactive/hit-test rect identical to the visible border.
+            ui.scope_builder(egui::UiBuilder::new().max_rect(palette_rect), |ui| {
+                ui.set_width(width);
+                ui.set_opacity(entry);
+                ui.painter().rect_filled(palette_rect, 14.0, tokens.bg_elev);
+                ui.painter().rect_stroke(
+                    palette_rect,
+                    14.0,
+                    Stroke::new(1.0, tokens.border),
+                    StrokeKind::Inside,
+                );
+                let mut content = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(palette_rect.shrink(12.0))
+                        .layout(Layout::top_down(Align::Min)),
+                );
+                {
+                    let ui = &mut content;
+                    ui.set_width(width - 24.0);
+                    // Only the explicit add_space calls below contribute
+                    // vertical gaps; implicit item spacing would overflow the
+                    // fixed PALETTE_CHROME_HEIGHT math.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+
+                    // --- Search Bar Header ---
+                    let (search_bar_rect, _) = ui.allocate_exact_size(
+                        Vec2::new(ui.available_width(), PALETTE_SEARCH_HEIGHT),
+                        Sense::hover(),
+                    );
+                    ui.painter()
+                        .rect_filled(search_bar_rect, tokens.radius_md, tokens.bg_sunken);
+                    ui.painter().rect_stroke(
+                        search_bar_rect,
+                        tokens.radius_md,
+                        Stroke::new(1.0, tokens.border),
+                        StrokeKind::Inside,
+                    );
+
+                    // Vertically centered search icon
+                    let icon_center =
+                        Pos2::new(search_bar_rect.left() + 23.0, search_bar_rect.center().y);
+                    icons::paint_icon(
+                        ui.painter(),
+                        Rect::from_center_size(icon_center, Vec2::splat(16.0)),
+                        Icon::Search,
+                        tokens.text_dim,
+                    );
+
+                    // Vertically centered text input
+                    let input_rect = Rect::from_min_max(
+                        Pos2::new(search_bar_rect.left() + 46.0, search_bar_rect.top() + 8.0),
+                        Pos2::new(
+                            search_bar_rect.right() - 12.0,
+                            search_bar_rect.bottom() - 8.0,
+                        ),
+                    );
+                    let mut edit_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(input_rect)
+                            .layout(Layout::left_to_right(Align::Center)),
+                    );
+                    let output = TextEdit::singleline(&mut state.query)
+                        .hint_text("Search commands, profiles, tabs…")
+                        .desired_width(input_rect.width())
+                        .font(FontId::proportional(14.5))
+                        .text_color(tokens.text)
+                        .margin(Margin::ZERO)
+                        .align(Align2::LEFT_CENTER)
+                        .frame(Frame::NONE)
+                        .return_key(None)
+                        .show(&mut edit_ui);
+                    output.response.request_focus();
+
+                    // The TextEdit may have changed the query this frame.
+                    // Rebuild rows only when it did, so Enter/arrows match
+                    // what the user just typed rather than the pre-edit
+                    // list used for the outer height above.
+                    if output.response.changed() {
+                        items = palette_items(&state.query, profiles, tabs);
+                        if items.len() != sizing_count {
+                            ctx.request_repaint();
+                        }
+                    }
+
+                    ui.add_space(10.0);
+
+                    // --- Command List ---
                     if state.selected >= items.len() {
                         state.selected = items.len().saturating_sub(1);
                     }
@@ -504,49 +681,51 @@ fn show_palette(
                     }
 
                     if items.is_empty() {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("No matching commands")
-                                .size(12.0)
-                                .color(tokens.text_dim),
-                        );
+                        ui.add_space(16.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(
+                                RichText::new("No matching commands")
+                                    .size(13.0)
+                                    .color(tokens.text_dim),
+                            );
+                        });
+                        ui.add_space(16.0);
                     } else {
-                        ScrollArea::vertical()
-                            .max_height(34.0 * 10.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for (index, item) in items.iter().enumerate() {
-                                    let response = menu_row(
-                                        ui,
-                                        tokens,
-                                        &item.label,
-                                        &item.hint,
-                                        item.icon,
-                                        index == state.selected,
-                                    );
-                                    if response.clicked() {
-                                        chosen = Some(item.command.clone());
-                                    }
-                                    if response.hovered()
-                                        && ctx.input(|input| input.pointer.delta() != Vec2::ZERO)
-                                    {
-                                        state.selected = index;
-                                    }
-                                    if moved && index == state.selected {
-                                        response.scroll_to_me(Some(Align::Center));
-                                    }
-                                }
-                            });
+                        let (command, _) =
+                            palette_list(ui, &items, tokens, state, list_height, moved);
+                        if command.is_some() {
+                            chosen = command;
+                        }
                     }
 
-                    ui.add_space(6.0);
-                    ui.label(
-                        RichText::new("↑↓ navigate   Enter run   Esc close")
-                            .size(10.5)
-                            .color(tokens.text_dim),
-                    );
-                });
+                    // --- Footer Divider & Key Hints ---
+                    ui.add_space(10.0);
+                    let (sep, _) = ui
+                        .allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+                    ui.painter().rect_filled(sep, 0.0, tokens.border);
+                    ui.add_space(8.0);
+
+                    ui.horizontal_centered(|ui| {
+                        ui.add_space(6.0);
+                        palette_footer_hint(ui, tokens, "↑↓", "Navigate");
+                        ui.add_space(18.0);
+                        palette_footer_hint(ui, tokens, "↵", "Select");
+                        ui.add_space(18.0);
+                        palette_footer_hint(ui, tokens, "Esc", "Dismiss");
+                    });
+                    ui.add_space(4.0);
+                }
+            });
         });
+
+    if bg_clicked
+        && ctx
+            .input(|input| input.pointer.interact_pos())
+            .is_none_or(|position| !palette_rect.contains(position))
+    {
+        state.close();
+        return Vec::new();
+    }
 
     if let Some(command) = chosen {
         let mut actions = Vec::new();
@@ -558,11 +737,187 @@ fn show_palette(
     }
 }
 
+/// Height of the scrollable list and of the whole palette surface.
+/// Rows are capped at [`PALETTE_VISIBLE_ROWS`] and by the viewport so the
+/// footer always stays on screen in short windows.
+fn palette_metrics(rows: usize, available_height: f32) -> (f32, f32) {
+    let rows = rows.min(PALETTE_VISIBLE_ROWS);
+    let desired_list = if rows == 0 {
+        52.0
+    } else {
+        rows as f32 * PALETTE_ROW_HEIGHT + rows.saturating_sub(1) as f32 * 3.0
+    };
+    let max_list = (available_height - PALETTE_CHROME_HEIGHT).max(PALETTE_ROW_HEIGHT);
+    let list = desired_list.min(max_list);
+    (list, (PALETTE_CHROME_HEIGHT + list).min(available_height))
+}
+
+/// Entry animation for overlay surfaces. Returns `(opacity, slide_offset)` where
+/// the offset is 8 px at first paint and settles at zero.
+fn entry_progress(ctx: &Context, state: &OverlayState) -> (f32, f32) {
+    let now = ctx.input(|input| input.time);
+    let elapsed = (now - state.opened_at).max(0.0) as f32;
+    let linear = (elapsed / ENTRY_SECS).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - linear).powi(3);
+    if linear < 1.0 {
+        ctx.request_repaint();
+    }
+    (eased, (1.0 - eased) * 8.0)
+}
+
+fn palette_footer_hint(ui: &mut Ui, tokens: &Tokens, key: &str, label: &str) {
+    let font = FontId::proportional(10.5);
+    let label_font = FontId::proportional(11.0);
+    let key_galley = ui
+        .painter()
+        .layout_no_wrap(key.to_owned(), font.clone(), tokens.text_dim);
+    let label_galley = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), label_font, tokens.text_dim);
+    let badge_size = key_galley.size() + Vec2::new(10.0, 4.0);
+    let total = Vec2::new(
+        badge_size.x + 6.0 + label_galley.size().x,
+        badge_size.y.max(label_galley.size().y).max(20.0),
+    );
+    let (rect, _) = ui.allocate_exact_size(total, Sense::hover());
+    let badge_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + badge_size.x * 0.5, rect.center().y),
+        badge_size,
+    );
+
+    ui.painter().rect_filled(badge_rect, 4.0, tokens.bg_sunken);
+    ui.painter().rect_stroke(
+        badge_rect,
+        4.0,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+    ui.painter().galley(
+        badge_rect.center() - key_galley.size() * 0.5,
+        key_galley,
+        tokens.text_dim,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            badge_rect.right() + 6.0,
+            rect.center().y - label_galley.size().y * 0.5,
+        ),
+        label_galley,
+        tokens.text_dim,
+    );
+}
+
+fn menu_row(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    label: &str,
+    hint: &str,
+    icon: Icon,
+    row_id: Id,
+    selected: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), PALETTE_ROW_HEIGHT),
+        Sense::click(),
+    );
+
+    let painter = ui.painter().with_clip_rect(rect);
+    let selected_t = ui
+        .ctx()
+        .animate_bool_with_time(row_id.with("selected"), selected, 0.10);
+    let hovered_t = ui.ctx().animate_bool_with_time(
+        row_id.with("hovered"),
+        response.hovered() && !selected,
+        HOVER_SECS,
+    );
+
+    if selected_t > 0.0 {
+        painter.rect_filled(
+            rect,
+            tokens.radius_sm,
+            design::fade(tokens.hover, selected_t),
+        );
+        painter.rect_stroke(
+            rect,
+            tokens.radius_sm,
+            Stroke::new(1.0, design::fade(tokens.border, selected_t)),
+            StrokeKind::Inside,
+        );
+
+        // Accent indicator
+        let indicator = Rect::from_min_size(
+            Pos2::new(rect.left() + 2.0, rect.top() + 7.0),
+            Vec2::new(3.0, rect.height() - 14.0),
+        );
+        painter.rect_filled(indicator, 1.5, design::fade(tokens.accent, selected_t));
+    } else if hovered_t > 0.0 {
+        painter.rect_filled(
+            rect,
+            tokens.radius_sm,
+            design::fade(tokens.bg_sunken, hovered_t),
+        );
+    }
+
+    // Content is inset by a pixel so the selected row's inside stroke is not
+    // clipped; the background stroke above uses the full rect instead.
+    let content = ui.painter().with_clip_rect(rect.shrink(1.0));
+
+    // Centered icon
+    let icon_rect = Rect::from_center_size(
+        Pos2::new(rect.left() + 22.0, rect.center().y),
+        Vec2::splat(16.0),
+    );
+    icons::paint_icon(
+        &content,
+        icon_rect,
+        icon,
+        design::mix(tokens.text_dim, tokens.accent, selected_t),
+    );
+
+    // Centered label
+    content.text(
+        Pos2::new(rect.left() + 46.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::proportional(13.5),
+        tokens.text,
+    );
+
+    // Centered shortcut badge. Long profile paths are elided so the badge
+    // cannot grow wider than the row.
+    if !hint.is_empty() {
+        let hint = elide_path(hint, 44);
+        let font = FontId::proportional(10.5);
+        let galley = content.layout_no_wrap(hint, font.clone(), tokens.text_dim);
+        let badge_size = galley.size() + Vec2::new(10.0, 4.0);
+        let badge_rect = Rect::from_center_size(
+            Pos2::new(rect.right() - badge_size.x * 0.5 - 10.0, rect.center().y),
+            badge_size,
+        );
+
+        content.rect_filled(badge_rect, tokens.radius_sm - 1.0, tokens.bg_sunken);
+        content.rect_stroke(
+            badge_rect,
+            tokens.radius_sm - 1.0,
+            Stroke::new(1.0, tokens.border),
+            StrokeKind::Inside,
+        );
+        content.galley(
+            badge_rect.center() - galley.size() * 0.5,
+            galley,
+            tokens.text_dim,
+        );
+    }
+
+    response
+}
+
 fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<Action> {
     let screen = ctx.content_rect();
+    let (entry, slide) = entry_progress(ctx, state);
     let position = Pos2::new(
         screen.right() - SEARCH_WIDTH - 12.0,
-        screen.top() + tokens.titlebar_h + 12.0,
+        screen.top() + tokens.titlebar_h + 12.0 - slide,
     );
     let mut actions = Vec::new();
 
@@ -570,7 +925,9 @@ fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<
         .order(Order::Foreground)
         .fixed_pos(position)
         .sense(Sense::click())
+        .fade_in(false)
         .show(ctx, |ui| {
+            ui.set_opacity(entry);
             Frame::new()
                 .fill(tokens.bg_elev)
                 .stroke(Stroke::new(1.0, tokens.border))
@@ -586,6 +943,8 @@ fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<
                             .desired_width(196.0)
                             .font(FontId::proportional(13.0))
                             .text_color(tokens.text)
+                            .margin(Margin::ZERO)
+                            .align(Align2::LEFT_CENTER)
                             .frame(Frame::NONE)
                             .return_key(None)
                             .show(ui);
@@ -623,7 +982,6 @@ fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<
         });
 
     if matches!(state.kind, OverlayKind::Search) {
-        // Match the shifted shortcut first: unmodified `consume_key` also matches Shift+Enter.
         let shifted = ctx.input_mut(|input| input.consume_key(Modifiers::SHIFT, Key::Enter));
         let plain =
             !shifted && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Enter));
@@ -649,11 +1007,11 @@ pub fn show_settings_panel(
 
     Frame::new()
         .fill(tokens.bg)
-        .inner_margin(Margin::symmetric(24, 18))
+        .inner_margin(Margin::symmetric(28, 20))
         .show(ui, |ui| {
             ui.set_min_size(ui.available_size());
 
-            let content_width = ui.available_width().min(760.0);
+            let content_width = ui.available_width().min(780.0);
             let pad = ((ui.available_width() - content_width) * 0.5).max(0.0);
 
             ui.horizontal_top(|ui| {
@@ -664,9 +1022,10 @@ pub fn show_settings_panel(
                     Vec2::new(content_width, ui.available_height()),
                     Layout::top_down(Align::Min),
                     |ui| {
+                        // Header
                         ui.label(
                             RichText::new("Settings")
-                                .size(22.0)
+                                .size(24.0)
                                 .strong()
                                 .color(tokens.text),
                         );
@@ -676,15 +1035,17 @@ pub fn show_settings_panel(
                             tokens,
                             "Changes apply instantly and save shortly after you stop editing.",
                         );
-                        ui.add_space(6.0);
-                        hairline(ui, tokens);
-                        ui.add_space(6.0);
+                        ui.add_space(14.0);
 
+                        // Scroll Area with breathing room for the scrollbar
                         ScrollArea::vertical()
                             .id_salt("illness_settings_scroll")
                             .max_height(ui.available_height())
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.y = 6.0;
+                                ui.add_space(2.0);
+
                                 changed |= appearance_section(
                                     ui,
                                     tokens,
@@ -697,6 +1058,7 @@ pub fn show_settings_panel(
                                 changed |= terminal_section(ui, tokens, config);
                                 changed |= profiles_section(ui, tokens, config, state);
                                 about_section(ui, tokens, theme, state);
+                                ui.add_space(48.0);
                             });
                     },
                 );
@@ -721,82 +1083,141 @@ fn appearance_section(
     let mut changed = false;
     section_title(ui, tokens, "Appearance");
 
-    changed |= setting_row(ui, tokens, "Theme", |ui| {
-        let mut chosen = config.theme.clone();
-        ComboBox::from_id_salt("illness_settings_theme")
-            .width(170.0)
-            .height(300.0)
-            .selected_text(Theme::by_name(&config.theme).name)
-            .popup_style(popup_style(tokens))
-            .show_ui(ui, |ui| {
-                for theme in Theme::all() {
-                    ui.selectable_value(&mut chosen, theme.name.to_string(), theme.name);
-                }
-            });
-        select_theme(config, &chosen)
-    });
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Theme",
+        Some("Application color palette across windows and tabs"),
+        |ui| {
+            let mut chosen = config.theme.clone();
+            let current = Theme::by_name(&config.theme);
 
-    changed |= setting_row(ui, tokens, "Material", |ui| {
-        let mut chosen = config.material;
-        let mut picked = false;
-        ComboBox::from_id_salt("illness_settings_material")
-            .width(170.0)
-            .selected_text(material_label(config.material, material_fallback))
-            .popup_style(popup_style(tokens))
-            .show_ui(ui, |ui| {
-                for material in [Material::Mica, Material::Acrylic, Material::Solid] {
-                    if ui
-                        .selectable_label(config.material == material, material_name(material))
-                        .clicked()
-                    {
-                        chosen = material;
-                        picked = true;
-                    }
-                }
-            });
-        if !picked {
-            return false;
-        }
-        match material_pick(config.material, material_fallback, chosen) {
-            MaterialPick::Changed => {
-                config.material = chosen;
-                true
-            }
-            MaterialPick::Retry => {
-                // Re-selecting the unavailable request retries it without
-                // rewriting config; the app falls back again only on failure.
-                *retry_material = true;
-                false
-            }
-            MaterialPick::None => false,
-        }
-    });
-
-    let background_enabled = background_controls_enabled(config.material);
-    changed |= setting_row(ui, tokens, "Background", |ui| {
-        ui.add_enabled_ui(background_enabled, |ui| {
-            let mut chosen = config.background;
-            ComboBox::from_id_salt("illness_settings_background")
-                .width(170.0)
-                .selected_text(background_name(config.background))
+            ComboBox::from_id_salt("illness_settings_theme")
+                .width(190.0)
+                .height(300.0)
+                .selected_text(current.name)
                 .popup_style(popup_style(tokens))
                 .show_ui(ui, |ui| {
-                    for mode in [
-                        BackgroundMode::Desktop,
-                        BackgroundMode::Image,
-                        BackgroundMode::None,
-                    ] {
-                        ui.selectable_value(&mut chosen, mode, background_name(mode));
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for theme in Theme::all() {
+                        let is_active = chosen.eq_ignore_ascii_case(theme.name);
+                        let (row_rect, row_resp) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 28.0),
+                            Sense::click(),
+                        );
+
+                        if is_active {
+                            ui.painter()
+                                .rect_filled(row_rect, tokens.radius_sm, tokens.hover);
+                            ui.painter().rect_stroke(
+                                row_rect,
+                                tokens.radius_sm,
+                                Stroke::new(1.0, tokens.border),
+                                StrokeKind::Inside,
+                            );
+                        } else if row_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(row_rect, tokens.radius_sm, tokens.bg_sunken);
+                        }
+
+                        // Theme Accent Dot Swatch
+                        let dot_center = Pos2::new(row_rect.left() + 14.0, row_rect.center().y);
+                        ui.painter()
+                            .circle_filled(dot_center, 4.5, design::color(theme.accent));
+
+                        // Label
+                        ui.painter().text(
+                            Pos2::new(row_rect.left() + 28.0, row_rect.center().y),
+                            Align2::LEFT_CENTER,
+                            theme.name,
+                            FontId::proportional(12.5),
+                            if is_active {
+                                tokens.text
+                            } else {
+                                tokens.text_dim
+                            },
+                        );
+
+                        if row_resp.clicked() {
+                            chosen = theme.name.to_string();
+                        }
                     }
                 });
-            if chosen != config.background {
-                config.background = chosen;
-                return true;
+            select_theme(config, &chosen)
+        },
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Material",
+        Some("Compositor backdrop transparency effect"),
+        |ui| {
+            let mut chosen = config.material;
+            let mut picked = false;
+            ComboBox::from_id_salt("illness_settings_material")
+                .width(170.0)
+                .selected_text(material_label(config.material, material_fallback))
+                .popup_style(popup_style(tokens))
+                .show_ui(ui, |ui| {
+                    for material in [Material::Mica, Material::Acrylic, Material::Solid] {
+                        if ui
+                            .selectable_label(config.material == material, material_name(material))
+                            .clicked()
+                        {
+                            chosen = material;
+                            picked = true;
+                        }
+                    }
+                });
+            if !picked {
+                return false;
             }
-            false
-        })
-        .inner
-    });
+            match material_pick(config.material, material_fallback, chosen) {
+                MaterialPick::Changed => {
+                    config.material = chosen;
+                    true
+                }
+                MaterialPick::Retry => {
+                    *retry_material = true;
+                    false
+                }
+                MaterialPick::None => false,
+            }
+        },
+    );
+
+    let background_enabled = background_controls_enabled(config.material);
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Background",
+        Some("Source image or wallpaper for translucent materials"),
+        |ui| {
+            ui.add_enabled_ui(background_enabled, |ui| {
+                let mut chosen = config.background;
+                ComboBox::from_id_salt("illness_settings_background")
+                    .width(170.0)
+                    .selected_text(background_name(config.background))
+                    .popup_style(popup_style(tokens))
+                    .show_ui(ui, |ui| {
+                        for mode in [
+                            BackgroundMode::Desktop,
+                            BackgroundMode::Image,
+                            BackgroundMode::None,
+                        ] {
+                            ui.selectable_value(&mut chosen, mode, background_name(mode));
+                        }
+                    });
+                if chosen != config.background {
+                    config.background = chosen;
+                    return true;
+                }
+                false
+            })
+            .inner
+        },
+    );
 
     if config.background == BackgroundMode::Image {
         changed |= ui
@@ -808,172 +1229,168 @@ fn appearance_section(
 
     let opacity_enabled =
         background_opacity_enabled(config.material, config.background, backdrop_present);
-    changed |= setting_row(ui, tokens, "Background opacity", |ui| {
-        ui.add_enabled_ui(opacity_enabled, |ui| {
-            ui.spacing_mut().slider_width = 150.0;
-            let mut opacity = config.background_opacity;
-            let changed = ui
-                .add(
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Background Opacity",
+        Some("0% paints solid theme background; 100% keeps material strength"),
+        |ui| {
+            ui.add_enabled_ui(opacity_enabled, |ui| {
+                ui.spacing_mut().slider_width = 150.0;
+                let mut opacity = config.background_opacity;
+                let response = ui.add(
                     Slider::new(&mut opacity, 0.0..=100.0)
                         .fixed_decimals(0)
                         .suffix("%"),
-                )
-                .changed();
-            if changed {
-                config.background_opacity = if opacity.is_finite() {
-                    opacity.clamp(0.0, 100.0)
+                );
+                if response.changed() {
+                    config.background_opacity = if opacity.is_finite() {
+                        opacity.clamp(0.0, 100.0)
+                    } else {
+                        100.0
+                    };
+                    true
                 } else {
-                    100.0
-                };
-            }
-            changed
-        })
-        .inner
-    });
+                    false
+                }
+            })
+            .inner
+        },
+    );
+
     if material_fallback && config.material != Material::Solid {
-        muted_label(
+        info_note(
             ui,
             tokens,
-            "Native materials are unavailable, so the window is Solid. Opacity and the image \
-             apply when the request becomes available.",
+            "Native materials are unavailable, so the window is Solid. Opacity and images apply when available.",
         );
     } else if !background_enabled {
-        muted_label(
+        info_note(
             ui,
             tokens,
-            "Solid paints an opaque theme background. Choose Mica or Acrylic to use a wallpaper.",
+            "Solid paints an opaque background. Choose Mica or Acrylic to use desktop wallpapers.",
         );
     } else if !opacity_enabled {
-        let message = if config.material == Material::Mica
-            && config.background == BackgroundMode::Image
-        {
-            "The image could not be loaded, so Mica paints only its native backdrop and ignores opacity."
-        } else {
-            "Mica with no background ignores opacity. Choose Desktop or Image, or use Acrylic, to enable it."
-        };
-        muted_label(ui, tokens, message);
-    } else {
-        muted_label(
-            ui,
-            tokens,
-            "0% paints a solid theme background; 100% keeps the material strength.",
-        );
+        let message =
+            if config.material == Material::Mica && config.background == BackgroundMode::Image {
+                "The image could not be loaded, so Mica paints only its native backdrop."
+            } else {
+                "Mica with no background ignores opacity. Choose Desktop or Image, or use Acrylic."
+            };
+        info_note(ui, tokens, message);
     }
 
-    changed |= setting_row(ui, tokens, "Font", |ui| {
-        let families = fonts::installed_families();
-        let mut chosen = config.font_family.clone();
-        ComboBox::from_id_salt("illness_settings_font")
-            .width(220.0)
-            .height(320.0)
-            .selected_text(chosen.clone())
-            .popup_style(popup_style(tokens))
-            .show_ui(ui, |ui| {
-                if !families
-                    .iter()
-                    .any(|family| family.eq_ignore_ascii_case(&chosen))
-                {
-                    let current = chosen.clone();
-                    ui.selectable_value(&mut chosen, current.clone(), current);
-                }
-                for family in &families {
-                    ui.selectable_value(&mut chosen, family.clone(), family);
-                }
-            });
-        if chosen != config.font_family {
-            config.font_family = chosen;
-            true
-        } else {
-            false
-        }
-    });
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Font",
+        Some("Monospace font family used for terminal rendering"),
+        |ui| {
+            let families = fonts::installed_families();
+            let mut chosen = config.font_family.clone();
+            ComboBox::from_id_salt("illness_settings_font")
+                .width(220.0)
+                .height(300.0)
+                .selected_text(chosen.clone())
+                .popup_style(popup_style(tokens))
+                .show_ui(ui, |ui| {
+                    if !families
+                        .iter()
+                        .any(|family| family.eq_ignore_ascii_case(&chosen))
+                    {
+                        let current = chosen.clone();
+                        ui.selectable_value(&mut chosen, current.clone(), current);
+                    }
+                    for family in families {
+                        ui.selectable_value(&mut chosen, family.clone(), family);
+                    }
+                });
+            if chosen != config.font_family {
+                config.font_family = chosen;
+                true
+            } else {
+                false
+            }
+        },
+    );
 
-    ui.add_space(10.0);
-    changed |= setting_row(ui, tokens, "Font size", |ui| {
-        let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
-        let mut size = config.font_size;
-        let dragged = ui
-            .add(
-                DragValue::new(&mut size)
-                    .range(8.0..=40.0)
-                    .speed(0.1)
-                    .fixed_decimals(0)
-                    .suffix(" pt"),
-            )
-            .changed();
-        let minus = text_button(ui, tokens, "-", false, Vec2::new(26.0, 24.0)).clicked();
-
-        let mut step_changed = false;
-        if dragged {
-            config.font_size = clamp_font_size(size);
-            step_changed = true;
-        } else if plus && config.font_size < 40.0 {
-            config.font_size = clamp_font_size(config.font_size + 1.0);
-            step_changed = true;
-        }
-        if minus && config.font_size > 8.0 {
-            config.font_size = clamp_font_size(config.font_size - 1.0);
-            step_changed = true;
-        }
-        step_changed
-    });
-
-    changed |= setting_row(ui, tokens, "Line height", |ui| {
-        let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
-        ui.label(
-            RichText::new(format!("{:.1}", config.line_height))
-                .size(12.0)
-                .color(tokens.text),
-        );
-        let minus = text_button(ui, tokens, "−", false, Vec2::new(26.0, 24.0)).clicked();
-
-        let mut step_changed = false;
-        if plus && config.line_height < 2.0 {
-            config.line_height = clamp_line_height(config.line_height + 0.1);
-            step_changed = true;
-        }
-        if minus && config.line_height > 1.0 {
-            config.line_height = clamp_line_height(config.line_height - 0.1);
-            step_changed = true;
-        }
-        step_changed
-    });
-
-    ui.add_space(10.0);
-    muted_label(ui, tokens, "Cursor");
-    let cursors = [CursorKind::Block, CursorKind::Beam, CursorKind::Underline];
-    let selected_cursor = cursors
-        .iter()
-        .position(|cursor| *cursor == config.cursor)
-        .unwrap_or(0);
-    let mut chosen_cursor = None;
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        for (index, cursor) in cursors.iter().enumerate() {
-            if text_button(
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Font Size",
+        Some("Terminal character size in points"),
+        |ui| {
+            stepper_widget(
                 ui,
                 tokens,
-                cursor_name(*cursor),
-                index == selected_cursor,
-                Vec2::new(74.0, 26.0),
+                "font_size",
+                &format!("{:.0} pt", config.font_size),
+                |dir| {
+                    if dir < 0 {
+                        if config.font_size > 8.0 {
+                            config.font_size = clamp_font_size(config.font_size - 1.0);
+                            return true;
+                        }
+                    } else if config.font_size < 40.0 {
+                        config.font_size = clamp_font_size(config.font_size + 1.0);
+                        return true;
+                    }
+                    false
+                },
             )
-            .clicked()
-            {
-                chosen_cursor = Some(*cursor);
-            }
-        }
-    });
-    if let Some(cursor) = chosen_cursor
-        && cursor != config.cursor
-    {
-        config.cursor = cursor;
-        changed = true;
-    }
-    muted_label(ui, tokens, "Cursor shape applies to new tabs.");
+        },
+    );
 
-    changed |= setting_row(ui, tokens, "Blink cursor", |ui| {
-        toggle(ui, tokens, &mut config.cursor_blink)
-    });
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Line Height",
+        Some("Line height multiplier (1.0 - 2.0)"),
+        |ui| {
+            stepper_widget(
+                ui,
+                tokens,
+                "line_height",
+                &format!("{:.1}", config.line_height),
+                |dir| {
+                    if dir < 0 {
+                        if config.line_height > 1.0 {
+                            config.line_height = clamp_line_height(config.line_height - 0.1);
+                            return true;
+                        }
+                    } else if config.line_height < 2.0 {
+                        config.line_height = clamp_line_height(config.line_height + 0.1);
+                        return true;
+                    }
+                    false
+                },
+            )
+        },
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Cursor Style",
+        Some("Cursor shape applied to new sessions"),
+        |ui| {
+            let cursors = [
+                (CursorKind::Block, "Block"),
+                (CursorKind::Beam, "Beam"),
+                (CursorKind::Underline, "Underline"),
+            ];
+            segmented_cursor_widget(ui, tokens, &mut config.cursor, &cursors)
+        },
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Blink Cursor",
+        Some("Terminal cursor smoothly blinks when focused"),
+        |ui| toggle(ui, tokens, &mut config.cursor_blink),
+    );
+
     changed
 }
 
@@ -988,57 +1405,41 @@ fn background_image_row(
     let summary = if current.is_empty() {
         "No image selected".to_string()
     } else {
-        elide_path(&current, 54)
+        elide_path(&current, 40)
     };
 
-    ui.horizontal(|ui| {
-        let path_label = ui.label(RichText::new(summary).size(11.0).color(tokens.text_dim));
-        if !current.is_empty() {
-            path_label.on_hover_text(&current);
-        }
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if text_button(ui, tokens, "Clear", false, Vec2::new(56.0, 24.0)).clicked()
-                && !current.is_empty()
-            {
-                let previous = config.background_path.clone();
-                config.background_path.clear();
-                cleanup_imported_background(&previous, Path::new(""));
-                changed = true;
-            }
-            if text_button(ui, tokens, "Browse", false, Vec2::new(66.0, 24.0)).clicked()
-                && let Some(source) = rfd::FileDialog::new()
-                    .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
-                    .pick_file()
-            {
-                match import_background(&source) {
-                    Ok(path) => {
-                        let previous = config.background_path.clone();
-                        config.background_path = path.to_string_lossy().into_owned();
-                        cleanup_imported_background(&previous, &path);
-                        changed = true;
-                    }
-                    Err(error) => state.set_toast(error),
+    setting_card(ui, tokens, "Custom Image", Some(&summary), |ui| {
+        if text_button(ui, tokens, "Browse", false, Vec2::new(68.0, 26.0)).clicked()
+            && let Some(source) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "bmp"])
+                .pick_file()
+        {
+            match import_background(&source) {
+                Ok(path) => {
+                    let previous = config.background_path.clone();
+                    config.background_path = path.to_string_lossy().into_owned();
+                    cleanup_imported_background(&previous, &path);
+                    changed = true;
                 }
+                Err(error) => state.set_toast(error),
             }
-        });
-    });
-
-    changed
+        }
+        if !current.is_empty()
+            && text_button(ui, tokens, "Clear", false, Vec2::new(56.0, 26.0)).clicked()
+        {
+            let previous = config.background_path.clone();
+            config.background_path.clear();
+            cleanup_imported_background(&previous, Path::new(""));
+            changed = true;
+        }
+        changed
+    })
 }
 
-/// Background controls are meaningful only when the material lets the desktop
-/// show through. Solid deliberately paints an opaque theme background.
 pub fn background_controls_enabled(material: Material) -> bool {
     material != Material::Solid
 }
 
-/// Whether the opacity slider has any visible effect.
-///
-/// Solid ignores it. Mica consumes opacity only through a painted backdrop:
-/// no background paints only the native Mica backdrop, and an Image whose
-/// decode failed has nothing to paint. Acrylic keeps working even with `None`
-/// because the accent tint consumes the opacity. `backdrop_present` is whether
-/// the app currently holds a backdrop texture.
 fn background_opacity_enabled(
     material: Material,
     mode: BackgroundMode,
@@ -1055,8 +1456,6 @@ fn background_opacity_enabled(
     }
 }
 
-/// Copy a chosen image into `%APPDATA%\illness\backgrounds` under a safe,
-/// collision-free name and return the stored path. The source is untouched.
 fn import_background(source: &Path) -> Result<PathBuf, String> {
     let appdata = std::env::var_os("APPDATA")
         .ok_or_else(|| "Cannot save background: APPDATA is not set".to_string())?;
@@ -1108,10 +1507,6 @@ fn import_background_into(source: &Path, directory: &Path) -> Result<PathBuf, St
     Err("Could not find a free background file name".to_string())
 }
 
-/// Delete a previously imported copy after it is replaced or cleared.
-///
-/// Only files directly inside the app's backgrounds directory are removed, so
-/// choosing a picture from elsewhere never deletes the user's source file.
 fn cleanup_imported_background(previous: &str, replacement: &Path) {
     let Ok(appdata) = std::env::var("APPDATA") else {
         return;
@@ -1138,8 +1533,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(&right.to_string_lossy())
 }
 
-/// Lowercase ASCII stem with path separators and dots removed, so the copied
-/// file cannot escape the backgrounds directory or collide on case.
 fn safe_stem(stem: &std::ffi::OsStr) -> String {
     let mut cleaned = String::new();
     for character in stem.to_string_lossy().chars() {
@@ -1164,88 +1557,111 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     let mut changed = false;
     section_title(ui, tokens, "Terminal");
 
-    changed |= setting_row(ui, tokens, "Default shell", |ui| {
-        let mut chosen = config.default_profile.clone();
-        let selected = if chosen.trim().is_empty() {
-            "None".to_string()
-        } else {
-            chosen.clone()
-        };
-        ComboBox::from_id_salt("illness_settings_default_shell")
-            .width(170.0)
-            .selected_text(selected)
-            .popup_style(popup_style(tokens))
-            .show_ui(ui, |ui| {
-                for profile in &config.profiles {
-                    if profile.program.trim().is_empty() {
-                        continue;
-                    }
-                    ui.selectable_value(&mut chosen, profile.name.clone(), &profile.name);
-                }
-            });
-        if chosen != config.default_profile {
-            config.default_profile = chosen;
-            true
-        } else {
-            false
-        }
-    });
-
-    changed |= setting_row(ui, tokens, "Scrollback", |ui| {
-        let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
-        ui.label(
-            RichText::new(format!("{}", config.scrollback))
-                .size(12.0)
-                .color(tokens.text),
-        );
-        let minus = text_button(ui, tokens, "−", false, Vec2::new(26.0, 24.0)).clicked();
-
-        let mut step_changed = false;
-        if plus && config.scrollback < 200_000 {
-            config.scrollback = clamp_scrollback(config.scrollback.saturating_add(1_000));
-            step_changed = true;
-        }
-        if minus && config.scrollback > 1_000 {
-            config.scrollback = clamp_scrollback(config.scrollback.saturating_sub(1_000));
-            step_changed = true;
-        }
-        step_changed
-    });
-    muted_label(ui, tokens, "Scrollback changes apply to new tabs.");
-
-    changed |= setting_row(ui, tokens, "Padding", |ui| {
-        let plus = text_button(ui, tokens, "+", false, Vec2::new(26.0, 24.0)).clicked();
-        ui.label(
-            RichText::new(format!("{:.0}", config.padding))
-                .size(12.0)
-                .color(tokens.text),
-        );
-        let minus = text_button(ui, tokens, "−", false, Vec2::new(26.0, 24.0)).clicked();
-
-        let mut step_changed = false;
-        if plus && config.padding < 32.0 {
-            config.padding = clamp_padding(config.padding + 1.0);
-            step_changed = true;
-        }
-        if minus && config.padding > 0.0 {
-            config.padding = clamp_padding(config.padding - 1.0);
-            step_changed = true;
-        }
-        step_changed
-    });
-
-    changed |= setting_row(ui, tokens, "New tabs inherit current folder", |ui| {
-        toggle(ui, tokens, &mut config.inherit_cwd)
-    });
-    muted_label(
+    changed |= setting_card(
         ui,
         tokens,
-        "New tabs start in the active tab's shell folder; otherwise the launch folder. Applies at spawn, so changing it does not move open tabs. PowerShell 7 follows cwd changes; Windows PowerShell 5.1 needs its default prompt, so a custom prompt keeps its own $? but may not sync the folder.",
+        "Default Shell",
+        Some("Profile launched when clicking the new tab button"),
+        |ui| {
+            let mut chosen = config.default_profile.clone();
+            let selected = if chosen.trim().is_empty() {
+                "None".to_string()
+            } else {
+                chosen.clone()
+            };
+            ComboBox::from_id_salt("illness_settings_default_shell")
+                .width(170.0)
+                .selected_text(selected)
+                .popup_style(popup_style(tokens))
+                .show_ui(ui, |ui| {
+                    for profile in &config.profiles {
+                        if profile.program.trim().is_empty() {
+                            continue;
+                        }
+                        ui.selectable_value(&mut chosen, profile.name.clone(), &profile.name);
+                    }
+                });
+            if chosen != config.default_profile {
+                config.default_profile = chosen;
+                true
+            } else {
+                false
+            }
+        },
     );
 
-    changed |= setting_row(ui, tokens, "Copy on select", |ui| {
-        toggle(ui, tokens, &mut config.copy_on_select)
-    });
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Scrollback Lines",
+        Some("History lines preserved in terminal memory"),
+        |ui| {
+            stepper_widget(
+                ui,
+                tokens,
+                "scrollback",
+                &format!("{}", config.scrollback),
+                |dir| {
+                    if dir < 0 {
+                        if config.scrollback > 1_000 {
+                            config.scrollback =
+                                clamp_scrollback(config.scrollback.saturating_sub(1_000));
+                            return true;
+                        }
+                    } else if config.scrollback < 200_000 {
+                        config.scrollback =
+                            clamp_scrollback(config.scrollback.saturating_add(1_000));
+                        return true;
+                    }
+                    false
+                },
+            )
+        },
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Window Padding",
+        Some("Internal padding between window border and text grid"),
+        |ui| {
+            stepper_widget(
+                ui,
+                tokens,
+                "padding",
+                &format!("{:.0} px", config.padding),
+                |dir| {
+                    if dir < 0 {
+                        if config.padding > 0.0 {
+                            config.padding = clamp_padding(config.padding - 1.0);
+                            return true;
+                        }
+                    } else if config.padding < 32.0 {
+                        config.padding = clamp_padding(config.padding + 1.0);
+                        return true;
+                    }
+                    false
+                },
+            )
+        },
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Inherit Working Folder",
+        Some("New tabs start in the active tab's current directory"),
+        |ui| toggle(ui, tokens, &mut config.inherit_cwd),
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
+        "Copy on Select",
+        Some("Automatically copy highlighted text to system clipboard"),
+        |ui| toggle(ui, tokens, &mut config.copy_on_select),
+    );
+
     changed
 }
 
@@ -1256,10 +1672,10 @@ fn profiles_section(
     state: &mut OverlayState,
 ) -> bool {
     section_title(ui, tokens, "Profiles");
-    muted_label(
+    info_note(
         ui,
         tokens,
-        "Changes apply to new tabs. Names must be unique; renaming updates the default shell.",
+        "Changes apply to new tabs. Renaming a profile automatically updates the default shell.",
     );
     ui.add_space(4.0);
 
@@ -1278,31 +1694,41 @@ fn profiles_section(
         let mut name = committed_name.clone();
 
         Frame::new()
-            .fill(tokens.bg)
+            .fill(tokens.bg_elev)
             .stroke(Stroke::new(1.0, tokens.border))
-            .corner_radius(tokens.radius_sm)
-            .inner_margin(Margin::symmetric(8, 6))
+            .corner_radius(tokens.radius_md)
+            .inner_margin(Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
 
-                ui.horizontal(|ui| {
-                    let (swatch, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
-                    ui.painter().rect_filled(
-                        swatch.shrink(2.0),
-                        2.0,
+                // Top Header Row: Vertically Centered
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+
+                    // Accent Dot. Painted after the name so it can follow the
+                    // text's line box: a singleline TextEdit's glyphs sit below
+                    // the row centre, which makes a row-centred dot look high.
+                    let (swatch, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+
+                    // In-place Profile Name
+                    let name_width = (ui.available_width() - 36.0).max(100.0);
+                    let name_output = TextEdit::singleline(&mut name)
+                        .hint_text("Profile name")
+                        .desired_width(name_width)
+                        .font(FontId::proportional(14.0))
+                        .text_color(tokens.text)
+                        .margin(Margin::ZERO)
+                        .align(Align2::LEFT_CENTER)
+                        .frame(Frame::NONE)
+                        .show(ui);
+                    let dot_y = name_output.galley_pos.y + name_output.galley.size().y * 0.5;
+                    ui.painter().circle_filled(
+                        Pos2::new(swatch.center().x, dot_y),
+                        5.0,
                         design::color(profile.accent),
                     );
+                    let name_response = name_output.response;
 
-                    let name_width = (ui.available_width() - 74.0).max(80.0);
-                    let name_response = ui.add(
-                        TextEdit::singleline(&mut name)
-                            .hint_text("Profile name")
-                            .desired_width(name_width)
-                            .font(FontId::proportional(12.0))
-                            .text_color(tokens.text)
-                            .margin(Margin::symmetric(6, 3))
-                            .frame(edit_frame(tokens)),
-                    );
                     if name_response.gained_focus() {
                         state.profile_name_edit = Some((index, committed_name.clone()));
                     }
@@ -1318,8 +1744,6 @@ fn profiles_section(
                                 other != index && existing.trim().eq_ignore_ascii_case(trimmed)
                             });
                         if duplicate {
-                            // Reject the keystroke instead of deleting a profile
-                            // from `Config::sanitized` later.
                             state.set_toast(format!("Profile name \"{trimmed}\" is already used"));
                         } else {
                             let new_name = name.clone();
@@ -1343,34 +1767,35 @@ fn profiles_section(
 
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if count > 1 {
-                            if text_button(ui, tokens, "Remove", false, Vec2::new(58.0, 22.0))
-                                .clicked()
-                            {
+                            let del_btn = icon_button(ui, tokens, Icon::Close, 20.0);
+                            if del_btn.clicked() {
                                 remove = Some(index);
                             }
-                        } else {
-                            ui.label(
-                                RichText::new("Last profile")
-                                    .size(10.0)
-                                    .color(tokens.text_dim),
-                            );
+                            del_btn.on_hover_text("Remove profile");
                         }
                     });
                 });
 
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    let browse_width = 54.0;
-                    let program_width = (ui.available_width() - browse_width - 12.0).max(80.0);
-                    let program = ui.add(
+                ui.add_space(8.0);
+
+                // Executable Row: Unified 30px height and centered layout
+                ui.horizontal_centered(|ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
+
+                    let browse_width = 74.0;
+                    let input_width = (ui.available_width() - browse_width - 8.0).max(120.0);
+
+                    let program = ui.add_sized(
+                        [input_width, 30.0],
                         TextEdit::singleline(&mut profile.program)
-                            .hint_text("C:\\Windows\\System32\\cmd.exe")
-                            .desired_width(program_width)
-                            .font(FontId::proportional(11.5))
+                            .hint_text("Command or executable path")
+                            .font(FontId::monospace(11.5))
                             .text_color(tokens.text)
-                            .margin(Margin::symmetric(6, 3))
+                            .margin(Margin::symmetric(16, 0))
+                            .align(Align2::LEFT_CENTER)
                             .frame(edit_frame(tokens)),
                     );
+
                     if program.changed() {
                         changed = true;
                     }
@@ -1383,7 +1808,7 @@ fn profiles_section(
                     }
 
                     let browse =
-                        text_button(ui, tokens, "Browse", false, Vec2::new(browse_width, 22.0));
+                        text_button(ui, tokens, "Browse", false, Vec2::new(browse_width, 30.0));
                     if browse.clicked()
                         && let Some(path) = rfd::FileDialog::new()
                             .add_filter("Programs", &["exe", "cmd", "bat", "com"])
@@ -1395,20 +1820,25 @@ fn profiles_section(
                     }
                 });
 
+                // Args preview tag
                 let args = profile.args.join(" ");
-                ui.add_space(2.0);
-                let summary = if args.is_empty() {
-                    "No arguments".to_string()
-                } else {
-                    elide_path(&args, 46)
-                };
-                let args_label = ui.label(
-                    RichText::new(format!("Args: {summary}"))
-                        .size(10.5)
-                        .color(tokens.text_dim),
-                );
                 if !args.is_empty() {
-                    args_label.on_hover_text(args);
+                    ui.add_space(6.0);
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            RichText::new("Arguments:")
+                                .size(11.0)
+                                .color(tokens.text_dim),
+                        );
+                        let summary = elide_path(&args, 46);
+                        let badge = ui.label(
+                            RichText::new(summary)
+                                .size(11.0)
+                                .monospace()
+                                .color(tokens.text),
+                        );
+                        badge.on_hover_text(args);
+                    });
                 }
             });
         ui.add_space(6.0);
@@ -1438,7 +1868,8 @@ fn profiles_section(
         changed = true;
     }
 
-    if text_button(ui, tokens, "Add profile", false, Vec2::new(92.0, 24.0)).clicked() {
+    ui.add_space(4.0);
+    if text_button(ui, tokens, "+ Add Profile", false, Vec2::new(124.0, 30.0)).clicked() {
         let name = unique_profile_name(&config.profiles);
         config.profiles.push(Profile {
             name: name.clone(),
@@ -1446,36 +1877,162 @@ fn profiles_section(
             args: Vec::new(),
             accent: Rgb::new(tokens.accent.r(), tokens.accent.g(), tokens.accent.b()),
         });
-        state.set_toast(format!("Added \"{name}\"; choose its program"));
+        state.set_toast(format!("Added \"{name}\"; set its executable path"));
         changed = true;
     }
 
     changed
 }
 
+/// Decode the bundled logo once and cache it in egui's temporary data store.
+/// Keeping the handle there avoids re-uploading a 256px texture each frame.
+fn app_logo(ctx: &Context) -> Option<egui::TextureHandle> {
+    const LOGO_PNG: &[u8] = include_bytes!("../../../assets/illness.png");
+    let id = Id::unique("illness_app_logo_texture");
+    if let Some(cached) = ctx.data(|data| data.get_temp::<Option<egui::TextureHandle>>(id)) {
+        return cached;
+    }
+
+    let decoded = image::load_from_memory(LOGO_PNG).ok().map(|image| {
+        let image = image.to_rgba8();
+        let (width, height) = image.dimensions();
+        egui::ColorImage::from_rgba_unmultiplied([width as usize, height as usize], image.as_raw())
+    });
+    let handle = decoded
+        .map(|pixels| ctx.load_texture("illness_app_logo", pixels, egui::TextureOptions::LINEAR));
+    // Cache the negative result too: a corrupt asset must not re-decode every frame.
+    ctx.data_mut(|data| data.insert_temp(id, handle.clone()));
+    handle
+}
+
 fn about_section(ui: &mut Ui, tokens: &Tokens, theme: &Theme, state: &mut OverlayState) {
     section_title(ui, tokens, "About");
-    ui.label(RichText::new("Illness 0.1.0").size(13.0).color(tokens.text));
-    muted_label(ui, tokens, "The Terminal Emulator for the Terminally Ill.");
-    muted_label(ui, tokens, format!("Active theme: {}", theme.name));
-    muted_label(ui, tokens, "License: MIT OR Apache-2.0");
-    ui.add_space(4.0);
 
-    if link_row(
-        ui,
-        tokens,
-        "Alacritty",
-        "https://github.com/alacritty/alacritty",
-    ) {
-        state.set_toast("Copied Alacritty link".to_string());
-    }
-    if link_row(ui, tokens, "egui", "https://github.com/emilk/egui") {
-        state.set_toast("Copied egui link".to_string());
-    }
-    if text_button(ui, tokens, "Copy license", false, Vec2::new(96.0, 24.0)).clicked() {
-        ui.ctx().copy_text("MIT OR Apache-2.0".to_string());
-        state.set_toast("Copied license".to_string());
-    }
+    Frame::new()
+        .fill(tokens.bg_elev)
+        .stroke(Stroke::new(1.0, tokens.border))
+        .corner_radius(tokens.radius_md)
+        .inner_margin(Margin::same(18))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+
+            // Header Banner: App Icon + Name + Tagline
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+
+                // Real app logo, decoded once and cached for the panel's lifetime.
+                let (icon_box, _) = ui.allocate_exact_size(Vec2::splat(48.0), Sense::hover());
+                if let Some(logo) = app_logo(ui.ctx()) {
+                    ui.painter().image(
+                        logo.id(),
+                        icon_box,
+                        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                        Color32::WHITE,
+                    );
+                } else {
+                    ui.painter()
+                        .rect_filled(icon_box, tokens.radius_md, tokens.bg_sunken);
+                    ui.painter().rect_stroke(
+                        icon_box,
+                        tokens.radius_md,
+                        Stroke::new(1.0, tokens.accent),
+                        StrokeKind::Inside,
+                    );
+                    icons::paint_icon(
+                        ui.painter(),
+                        Rect::from_center_size(icon_box.center(), Vec2::splat(22.0)),
+                        Icon::Terminal,
+                        tokens.accent,
+                    );
+                }
+
+                ui.vertical(|ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.label(
+                            RichText::new("Illness Terminal")
+                                .size(16.0)
+                                .strong()
+                                .color(tokens.text),
+                        );
+
+                        // Version Pill Badge
+                        let version_font = FontId::proportional(10.5);
+                        let v_galley = ui.painter().layout_no_wrap(
+                            "v0.1.0".to_owned(),
+                            version_font.clone(),
+                            tokens.text,
+                        );
+                        let badge_size = v_galley.size() + Vec2::new(10.0, 4.0);
+                        let (badge_rect, _) = ui.allocate_exact_size(badge_size, Sense::hover());
+                        ui.painter().rect_filled(badge_rect, 4.0, tokens.bg_sunken);
+                        ui.painter().rect_stroke(
+                            badge_rect,
+                            4.0,
+                            Stroke::new(1.0, tokens.border),
+                            StrokeKind::Inside,
+                        );
+                        ui.painter().text(
+                            badge_rect.center(),
+                            Align2::CENTER_CENTER,
+                            "v0.1.0",
+                            version_font,
+                            tokens.text,
+                        );
+                    });
+                    ui.label(
+                        RichText::new("The Terminal Emulator for the Terminally Ill.")
+                            .size(11.5)
+                            .color(tokens.text_dim),
+                    );
+                });
+            });
+
+            ui.add_space(14.0);
+            let (divider, _) =
+                ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().rect_filled(divider, 0.0, tokens.border);
+            ui.add_space(12.0);
+
+            // Information Grid
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Active Theme: ")
+                        .size(12.0)
+                        .color(tokens.text_dim),
+                );
+                ui.label(RichText::new(theme.name).size(12.0).color(tokens.text));
+                ui.add_space(16.0);
+                ui.label(RichText::new("License: ").size(12.0).color(tokens.text_dim));
+                ui.label(
+                    RichText::new("MIT OR Apache-2.0")
+                        .size(12.0)
+                        .color(tokens.text),
+                );
+            });
+
+            ui.add_space(14.0);
+
+            // Action Buttons Strip
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+
+                if link_row(
+                    ui,
+                    tokens,
+                    "Alacritty ↗",
+                    "https://github.com/alacritty/alacritty",
+                ) {
+                    state.set_toast("Copied Alacritty link");
+                }
+                if link_row(ui, tokens, "egui ↗", "https://github.com/emilk/egui") {
+                    state.set_toast("Copied egui link");
+                }
+                if text_button(ui, tokens, "Copy License", false, Vec2::new(96.0, 26.0)).clicked() {
+                    ui.ctx().copy_text("MIT OR Apache-2.0".to_string());
+                    state.set_toast("Copied license to clipboard");
+                }
+            });
+        });
 }
 
 fn show_context_menu(
@@ -1492,7 +2049,7 @@ fn show_context_menu(
 
     let screen = ctx.content_rect();
     let width = 220.0;
-    let estimated_height = 230.0;
+    let estimated_height = 296.0;
     let x = position
         .x
         .min(screen.right() - width - 8.0)
@@ -1522,7 +2079,17 @@ fn show_context_menu(
                         ("Clear", "", Icon::Terminal, Command::Clear),
                     ];
                     for (label, hint, icon, command) in entries {
-                        if menu_row(ui, tokens, label, hint, icon, false).clicked() {
+                        if menu_row(
+                            ui,
+                            tokens,
+                            label,
+                            hint,
+                            icon,
+                            Id::unique(("illness_context_row", label)),
+                            false,
+                        )
+                        .clicked()
+                        {
                             chosen = Some(command);
                         }
                     }
@@ -1538,7 +2105,17 @@ fn show_context_menu(
                         ("Settings", "Ctrl+,", Icon::Settings, Command::Settings),
                     ];
                     for (label, hint, icon, command) in entries {
-                        if menu_row(ui, tokens, label, hint, icon, false).clicked() {
+                        if menu_row(
+                            ui,
+                            tokens,
+                            label,
+                            hint,
+                            icon,
+                            Id::unique(("illness_context_row", label)),
+                            false,
+                        )
+                        .clicked()
+                        {
                             chosen = Some(command);
                         }
                     }
@@ -1599,76 +2176,33 @@ fn show_toast(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) {
     };
 
     ctx.request_repaint_after(Duration::from_secs_f64((deadline - now).max(0.001)));
+    let elapsed = (now - (deadline - TOAST_SECS)).max(0.0);
+    let remaining = (deadline - now).max(0.0);
+    let fade_in = (elapsed / 0.12).clamp(0.0, 1.0);
+    let fade_out = (remaining / 0.18).clamp(0.0, 1.0);
+    let opacity = fade_in.min(fade_out) as f32;
+    if opacity < 1.0 {
+        ctx.request_repaint_after(Duration::from_millis(16));
+    }
     Area::new(Id::unique("illness_toast"))
         .order(Order::Tooltip)
-        .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -20.0))
+        .anchor(
+            Align2::CENTER_BOTTOM,
+            Vec2::new(0.0, -20.0 - (1.0 - opacity) * 4.0),
+        )
         .interactable(false)
+        .fade_in(false)
         .show(ctx, |ui| {
+            ui.set_opacity(opacity);
             Frame::new()
                 .fill(tokens.bg_elev)
                 .stroke(Stroke::new(1.0, tokens.border))
                 .corner_radius(tokens.radius_md)
-                .inner_margin(Margin::symmetric(12, 8))
+                .inner_margin(Margin::symmetric(14, 8))
                 .show(ui, |ui| {
-                    ui.label(RichText::new(message).size(12.0).color(tokens.text));
+                    ui.label(RichText::new(message).size(12.5).color(tokens.text));
                 });
         });
-}
-
-fn menu_row(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    label: &str,
-    hint: &str,
-    icon: Icon,
-    selected: bool,
-) -> Response {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
-
-    let fill = if selected {
-        tokens.selection
-    } else if response.hovered() {
-        tokens.hover
-    } else {
-        Color32::TRANSPARENT
-    };
-    if fill != Color32::TRANSPARENT {
-        ui.painter().rect_filled(rect, tokens.radius_sm, fill);
-    }
-
-    let painter = ui.painter().with_clip_rect(rect.shrink(1.0));
-    let icon_rect = Rect::from_center_size(
-        Pos2::new(rect.left() + 18.0, rect.center().y),
-        Vec2::splat(16.0),
-    );
-    icons::paint_icon(
-        &painter,
-        icon_rect,
-        icon,
-        if selected {
-            tokens.accent
-        } else {
-            tokens.text_dim
-        },
-    );
-    painter.text(
-        Pos2::new(rect.left() + 36.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(13.0),
-        tokens.text,
-    );
-    if !hint.is_empty() {
-        painter.text(
-            Pos2::new(rect.right() - 10.0, rect.center().y),
-            Align2::RIGHT_CENTER,
-            hint,
-            FontId::proportional(10.5),
-            tokens.text_dim,
-        );
-    }
-    response
 }
 
 fn edit_frame(tokens: &Tokens) -> Frame {
@@ -1678,8 +2212,247 @@ fn edit_frame(tokens: &Tokens) -> Frame {
         .corner_radius(tokens.radius_sm)
 }
 
-/// ComboBox popups use `window_fill`, which the app sets to transparent for
-/// its frameless material backdrop. Give these menus an opaque panel.
+fn setting_card<R>(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    title: &str,
+    description: Option<&str>,
+    controls: impl FnOnce(&mut Ui) -> R,
+) -> R {
+    let desired_width = ui.available_width();
+    let min_height = if description.is_some() { 56.0 } else { 46.0 };
+
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(desired_width, min_height), Sense::hover());
+
+    let hover = ui.ctx().animate_bool_with_time(
+        Id::unique(("illness_setting_card", title)),
+        response.hovered(),
+        HOVER_SECS,
+    );
+    let bg = design::mix(tokens.bg_elev, tokens.hover, hover);
+    ui.painter().rect_filled(rect, tokens.radius_md, bg);
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_md,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+
+    let controls_width = 340.0_f32.min(rect.width() * 0.55);
+    let text_left = rect.left() + 16.0;
+    let text_right = (rect.right() - controls_width - 8.0).max(text_left);
+
+    if let Some(desc) = description {
+        let title_pos = Pos2::new(text_left, rect.center().y - 10.0);
+        let desc_pos = Pos2::new(text_left, rect.center().y + 10.0);
+
+        ui.painter().text(
+            title_pos,
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(tokens.font_body),
+            tokens.text,
+        );
+        ui.painter().text(
+            desc_pos,
+            Align2::LEFT_CENTER,
+            desc,
+            FontId::proportional(tokens.font_small),
+            tokens.text_dim,
+        );
+    } else {
+        ui.painter().text(
+            Pos2::new(text_left, rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(tokens.font_body),
+            tokens.text,
+        );
+    }
+
+    let mut right_child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(Rect::from_min_max(
+                Pos2::new(text_right, rect.top()),
+                Pos2::new(rect.right() - 14.0, rect.bottom()),
+            ))
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+
+    controls(&mut right_child)
+}
+
+fn stepper_widget(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    salt: &str,
+    label: &str,
+    mut on_step: impl FnMut(i32) -> bool,
+) -> bool {
+    let mut changed = false;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(128.0, 30.0), Sense::hover());
+
+    ui.painter()
+        .rect_filled(rect, tokens.radius_sm, tokens.bg_sunken);
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+
+    let btn_w = 30.0;
+    let minus_rect = Rect::from_min_size(rect.min, Vec2::new(btn_w, rect.height()));
+    let plus_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - btn_w, rect.top()),
+        Vec2::new(btn_w, rect.height()),
+    );
+
+    let minus_resp = ui.interact(
+        minus_rect,
+        Id::unique(("illness_stepper", salt, "minus")),
+        Sense::click(),
+    );
+    if minus_resp.hovered() {
+        ui.painter().rect_filled(
+            minus_rect,
+            CornerRadius {
+                nw: tokens.radius_sm as u8,
+                sw: tokens.radius_sm as u8,
+                ne: 0,
+                se: 0,
+            },
+            tokens.hover,
+        );
+    }
+    ui.painter().text(
+        minus_rect.center(),
+        Align2::CENTER_CENTER,
+        "−",
+        FontId::proportional(15.0),
+        if minus_resp.hovered() {
+            tokens.text
+        } else {
+            tokens.text_dim
+        },
+    );
+    if minus_resp.clicked() {
+        changed |= on_step(-1);
+    }
+
+    let plus_resp = ui.interact(
+        plus_rect,
+        Id::unique(("illness_stepper", salt, "plus")),
+        Sense::click(),
+    );
+    if plus_resp.hovered() {
+        ui.painter().rect_filled(
+            plus_rect,
+            CornerRadius {
+                ne: tokens.radius_sm as u8,
+                se: tokens.radius_sm as u8,
+                nw: 0,
+                sw: 0,
+            },
+            tokens.hover,
+        );
+    }
+    ui.painter().text(
+        plus_rect.center(),
+        Align2::CENTER_CENTER,
+        "+",
+        FontId::proportional(15.0),
+        if plus_resp.hovered() {
+            tokens.text
+        } else {
+            tokens.text_dim
+        },
+    );
+    if plus_resp.clicked() {
+        changed |= on_step(1);
+    }
+
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(tokens.font_small),
+        tokens.text,
+    );
+
+    changed
+}
+
+fn segmented_cursor_widget(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    current: &mut CursorKind,
+    options: &[(CursorKind, &str)],
+) -> bool {
+    let mut changed = false;
+    let height = 30.0;
+    let opt_width = 74.0;
+    let total_width = opt_width * options.len() as f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_width, height), Sense::hover());
+
+    ui.painter()
+        .rect_filled(rect, tokens.radius_sm, tokens.bg_sunken);
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
+
+    for (i, (kind, label)) in options.iter().enumerate() {
+        let opt_rect = Rect::from_min_size(
+            Pos2::new(rect.left() + i as f32 * opt_width, rect.top()),
+            Vec2::new(opt_width, height),
+        );
+        let resp = ui.interact(
+            opt_rect,
+            Id::unique(("illness_cursor_option", i)),
+            Sense::click(),
+        );
+        let selected = *current == *kind;
+
+        if selected {
+            let pill = opt_rect.shrink(2.0);
+            ui.painter()
+                .rect_filled(pill, tokens.radius_sm - 1.0, tokens.bg_elev);
+            ui.painter().rect_stroke(
+                pill,
+                tokens.radius_sm - 1.0,
+                Stroke::new(1.0, tokens.border),
+                StrokeKind::Inside,
+            );
+        } else if resp.hovered() {
+            ui.painter()
+                .rect_filled(opt_rect.shrink(2.0), tokens.radius_sm - 1.0, tokens.hover);
+        }
+
+        ui.painter().text(
+            opt_rect.center(),
+            Align2::CENTER_CENTER,
+            *label,
+            FontId::proportional(tokens.font_small),
+            if selected {
+                tokens.text
+            } else {
+                tokens.text_dim
+            },
+        );
+
+        if resp.clicked() && *current != *kind {
+            *current = *kind;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn popup_style(tokens: &Tokens) -> egui::style::StyleModifier {
     let tokens = *tokens;
     egui::style::StyleModifier::new(move |style| {
@@ -1687,43 +2460,28 @@ fn popup_style(tokens: &Tokens) -> egui::style::StyleModifier {
         style.visuals.window_stroke = Stroke::new(1.0, tokens.border);
         style.visuals.window_corner_radius = egui::CornerRadius::same(tokens.radius_md as u8);
         style.visuals.menu_corner_radius = egui::CornerRadius::same(tokens.radius_md as u8);
+        style.spacing.menu_margin = Margin::same(4);
     })
 }
 
-fn setting_row(
-    ui: &mut Ui,
-    tokens: &Tokens,
-    label: &str,
-    controls: impl FnOnce(&mut Ui) -> bool,
-) -> bool {
-    let mut changed = false;
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(13.0).color(tokens.text));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            changed = controls(ui);
-        });
-    });
-    changed
-}
-
 fn section_title(ui: &mut Ui, tokens: &Tokens, title: &str) {
-    ui.add_space(10.0);
+    ui.add_space(14.0);
     ui.label(
         RichText::new(title)
-            .size(11.0)
+            .size(tokens.font_title)
             .strong()
-            .color(tokens.accent),
+            .color(tokens.text),
     );
+    ui.add_space(2.0);
+}
+
+fn info_note(ui: &mut Ui, tokens: &Tokens, text: &str) {
+    ui.label(RichText::new(text).size(11.0).color(tokens.text_dim));
     ui.add_space(2.0);
 }
 
 fn muted_label(ui: &mut Ui, tokens: &Tokens, text: impl Into<String>) {
     ui.label(RichText::new(text.into()).size(11.0).color(tokens.text_dim));
-}
-
-fn hairline(ui: &mut Ui, tokens: &Tokens) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, tokens.border);
 }
 
 fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: Vec2) -> Response {
@@ -1740,20 +2498,19 @@ fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: 
         tokens.bg
     } else if selected {
         tokens.accent
-    } else if response.hovered() {
-        tokens.hover
     } else {
-        tokens.bg
+        let hover = ui
+            .ctx()
+            .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+        design::mix(tokens.bg_elev, tokens.hover, hover)
     };
     ui.painter().rect_filled(rect, tokens.radius_sm, fill);
-    if !selected {
-        ui.painter().rect_stroke(
-            rect,
-            tokens.radius_sm,
-            Stroke::new(1.0, tokens.border),
-            StrokeKind::Inside,
-        );
-    }
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
     let text_color = if !enabled {
         tokens.text_dim
     } else if selected {
@@ -1765,30 +2522,48 @@ fn text_button(ui: &mut Ui, tokens: &Tokens, label: &str, selected: bool, size: 
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::proportional(12.0),
+        FontId::proportional(11.5),
         text_color,
     );
     response
 }
 
 fn toggle(ui: &mut Ui, tokens: &Tokens, value: &mut bool) -> bool {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(36.0, 20.0), Sense::click());
-    let track = if *value {
-        tokens.accent
-    } else {
-        tokens.selection
-    };
-    ui.painter().rect_filled(rect, 10.0, track);
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(38.0, 20.0), Sense::click());
+    let radius = rect.height() * 0.5;
+    let on = ui
+        .ctx()
+        .animate_bool_with_time(response.id, *value, TOGGLE_SECS);
+    let track = design::mix(
+        if response.hovered() {
+            design::mix(tokens.bg_sunken, tokens.hover, 0.45)
+        } else {
+            tokens.bg_sunken
+        },
+        tokens.accent,
+        on,
+    );
+    ui.painter().rect_filled(rect, radius, track);
+    ui.painter().rect_stroke(
+        rect,
+        radius,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
+    );
 
-    let knob_x = if *value {
-        rect.right() - 10.0
-    } else {
-        rect.left() + 10.0
-    };
+    let knob_x = egui::lerp((rect.left() + radius)..=(rect.right() - radius), on);
     ui.painter().circle_filled(
         Pos2::new(knob_x, rect.center().y),
-        7.0,
-        if *value { tokens.bg } else { tokens.text_dim },
+        radius - 3.0,
+        design::mix(
+            if response.hovered() {
+                tokens.text
+            } else {
+                tokens.text_dim
+            },
+            Color32::WHITE,
+            on,
+        ),
     );
 
     if response.clicked() {
@@ -1801,69 +2576,63 @@ fn toggle(ui: &mut Ui, tokens: &Tokens, value: &mut bool) -> bool {
 
 fn icon_button(ui: &mut Ui, tokens: &Tokens, icon: Icon, size: f32) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    if response.hovered() {
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+    if hover > 0.0 {
         ui.painter()
-            .rect_filled(rect, tokens.radius_sm, tokens.hover);
+            .rect_filled(rect, tokens.radius_sm, design::fade(tokens.hover, hover));
     }
     let icon_rect = Rect::from_center_size(rect.center(), Vec2::splat(12.0));
     icons::paint_icon(
         ui.painter(),
         icon_rect,
         icon,
-        if response.hovered() {
-            tokens.text
-        } else {
-            tokens.text_dim
-        },
+        design::mix(tokens.text_dim, tokens.text, hover),
     );
     response
 }
 
 fn chevron_button(ui: &mut Ui, tokens: &Tokens, up: bool) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-    if response.hovered() {
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+    if hover > 0.0 {
         ui.painter()
-            .rect_filled(rect, tokens.radius_sm, tokens.hover);
+            .rect_filled(rect, tokens.radius_sm, design::fade(tokens.hover, hover));
     }
 
-    let color = if response.hovered() {
-        tokens.text
-    } else {
-        tokens.text_dim
-    };
     icons::paint_icon(
         ui.painter(),
         Rect::from_center_size(rect.center(), Vec2::splat(12.0)),
         if up { Icon::ArrowUp } else { Icon::ArrowDown },
-        color,
+        design::mix(tokens.text_dim, tokens.text, hover),
     );
     response
 }
 
 fn link_row(ui: &mut Ui, tokens: &Tokens, label: &str, url: &str) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 24.0), Sense::click());
-    if response.hovered() {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(80.0, 24.0), Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+    if hover > 0.0 {
         ui.painter()
-            .rect_filled(rect, tokens.radius_sm, tokens.hover);
+            .rect_filled(rect, tokens.radius_sm, design::fade(tokens.hover, hover));
     }
-    ui.painter().text(
-        Pos2::new(rect.left() + 4.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        label,
-        FontId::proportional(12.0),
-        if response.hovered() {
-            tokens.accent
-        } else {
-            tokens.text
-        },
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, tokens.border),
+        StrokeKind::Inside,
     );
     ui.painter().text(
-        Pos2::new(rect.right() - 4.0, rect.center().y),
-        Align2::RIGHT_CENTER,
-        "copy",
-        FontId::proportional(10.5),
-        tokens.text_dim,
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.5),
+        design::mix(tokens.text, tokens.accent, hover),
     );
     if response.clicked() {
         ui.ctx().copy_text(url.to_string());
@@ -1881,7 +2650,6 @@ fn material_name(material: Material) -> &'static str {
     }
 }
 
-/// Label the requested material, flagging a session-only Solid fallback.
 fn material_label(material: Material, fallback: bool) -> String {
     if fallback && material != Material::Solid {
         format!("{} (unavailable)", material_name(material))
@@ -1892,11 +2660,8 @@ fn material_label(material: Material, fallback: bool) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaterialPick {
-    /// Nothing changed.
     None,
-    /// A different material was chosen and should be persisted/applied.
     Changed,
-    /// The same unavailable native material was re-selected; retry it.
     Retry,
 }
 
@@ -1918,14 +2683,6 @@ fn background_name(mode: BackgroundMode) -> &'static str {
     }
 }
 
-fn cursor_name(cursor: CursorKind) -> &'static str {
-    match cursor {
-        CursorKind::Block => "Block",
-        CursorKind::Beam => "Beam",
-        CursorKind::Underline => "Underline",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1942,6 +2699,166 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
+    }
+
+    #[test]
+    fn palette_fits_short_and_tall_windows() {
+        assert_eq!(
+            PALETTE_CHROME_HEIGHT, 123.0,
+            "fixed chrome height includes the 12px insets and no implicit spacing"
+        );
+
+        let (short_list, short_total) = palette_metrics(40, 405.0);
+        assert!(
+            short_total <= 405.0,
+            "palette {short_total} must fit a 405px viewport"
+        );
+        assert!(short_list >= PALETTE_ROW_HEIGHT);
+
+        let (tall_list, tall_total) = palette_metrics(40, 600.0);
+        assert!((tall_list - 341.0).abs() < 0.01, "eight rows with 3px gaps");
+        assert!((tall_total - (123.0 + 341.0)).abs() < 0.01);
+        assert!(tall_list > short_list);
+
+        let (empty_list, empty_total) = palette_metrics(0, 600.0);
+        assert_eq!(empty_list, 52.0);
+        assert_eq!(empty_total, 123.0 + 52.0);
+
+        // 720x480 puts the palette top at 14% and leaves 8px below it.
+        let available = 480.0 - 480.0 * 0.14 - 8.0;
+        let (_, total) = palette_metrics(40, available);
+        assert!(
+            total <= available + 0.01,
+            "height-capped palette must fit the viewport: {total} > {available}"
+        );
+    }
+
+    #[test]
+    fn palette_keyboard_scroll_reaches_offscreen_rows() {
+        let profiles: Vec<Profile> = (0..25)
+            .map(|index| Profile {
+                name: format!("Profile {index}"),
+                ..Default::default()
+            })
+            .collect();
+        let items = palette_items("", &profiles, &[]);
+        assert!(items.len() > 20, "need enough rows to scroll");
+
+        let theme = Theme::by_name("Illness Dark");
+        let tokens = Tokens::from_theme(theme);
+        let ctx = egui::Context::default();
+        // Observe the offset after a single pass instead of mid-animation.
+        ctx.all_styles_mut(|style| style.scroll_animation = egui::style::ScrollAnimation::none());
+
+        let mut state = OverlayState {
+            kind: OverlayKind::Palette,
+            selected: items.len() - 1,
+            ..Default::default()
+        };
+        let mut scroll_y = 0.0;
+        for frame in 0..3 {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 480.0))),
+                time: Some(frame as f64 * 0.1),
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                let (_, offset) = palette_list(ui, &items, &tokens, &mut state, 341.0, true);
+                scroll_y = offset;
+            })
+            .drop_without_applying_deltas();
+        }
+
+        assert!(
+            scroll_y > 0.0,
+            "keyboard selection did not scroll the virtualized list: {scroll_y}"
+        );
+    }
+
+    #[test]
+    fn palette_arrow_down_reaches_offscreen_rows() {
+        let profiles: Vec<Profile> = (0..25)
+            .map(|index| Profile {
+                name: format!("Profile {index}"),
+                ..Default::default()
+            })
+            .collect();
+        let items_len = palette_items("", &profiles, &[]).len();
+        assert!(
+            items_len > 20,
+            "need enough rows to navigate past the viewport"
+        );
+
+        let theme = Theme::by_name("Illness Dark");
+        let tokens = Tokens::from_theme(theme);
+        let mut config = Config::default();
+        let ctx = egui::Context::default();
+        let mut state = OverlayState {
+            kind: OverlayKind::Palette,
+            ..Default::default()
+        };
+
+        let target = 22;
+        assert!(target < items_len);
+        for frame in 0..target {
+            let raw = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(720.0, 480.0))),
+                time: Some(frame as f64 * 0.1),
+                events: vec![egui::Event::Key {
+                    key: Key::ArrowDown,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }],
+                ..Default::default()
+            };
+            ctx.run_ui(raw, |ui| {
+                let actions =
+                    show_palette(ui.ctx(), &mut state, &tokens, &mut config, &profiles, &[]);
+                assert!(actions.is_empty(), "ArrowDown must not activate a command");
+            })
+            .drop_without_applying_deltas();
+        }
+
+        assert_eq!(state.selected, target);
+    }
+
+    #[test]
+    fn close_resets_the_palette_and_advances_generation() {
+        let mut state = OverlayState {
+            kind: OverlayKind::Palette,
+            query: "set".to_string(),
+            selected: 3,
+            ..Default::default()
+        };
+        let generation = state.palette_generation;
+
+        state.close();
+
+        assert_eq!(state.kind, OverlayKind::None);
+        assert!(state.query.is_empty());
+        assert_eq!(state.selected, 0);
+        assert_eq!(state.palette_generation, generation + 1);
+    }
+
+    #[test]
+    fn enter_uses_the_query_edited_in_the_same_frame() {
+        // The pre-edit list used for sizing starts with New Tab.
+        let mut items = palette_items("", &[], &[]);
+        assert!(matches!(items[0].command, Command::NewTab(_)));
+
+        // A same-frame keystroke changes the query and show_palette rebuilds
+        // `items`; Enter then resolves against that fresh list, whose first
+        // item is Settings.
+        items = palette_items("settings", &[], &[]);
+        assert!(
+            matches!(
+                items.first().map(|item| &item.command),
+                Some(Command::Settings)
+            ),
+            "Enter must use the edited query, not the stale sizing list"
+        );
     }
 
     #[test]
@@ -1972,12 +2889,10 @@ mod tests {
 
     #[test]
     fn material_pick_retries_the_unavailable_request_and_accepts_solid() {
-        // Fallback shows Mica; choosing Solid is a real persisted change.
         assert_eq!(
             material_pick(Material::Mica, true, Material::Solid),
             MaterialPick::Changed
         );
-        // Choosing the same unavailable native material retries it.
         assert_eq!(
             material_pick(Material::Mica, true, Material::Mica),
             MaterialPick::Retry
@@ -1986,7 +2901,6 @@ mod tests {
             material_pick(Material::Acrylic, true, Material::Acrylic),
             MaterialPick::Retry
         );
-        // A healthy session selecting its current material is a no-op.
         assert_eq!(
             material_pick(Material::Mica, false, Material::Mica),
             MaterialPick::None
@@ -2016,7 +2930,6 @@ mod tests {
             BackgroundMode::Desktop,
             false
         ));
-        // An Image whose decode failed paints only native Mica.
         assert!(!background_opacity_enabled(
             Material::Mica,
             BackgroundMode::Image,
@@ -2027,7 +2940,6 @@ mod tests {
             BackgroundMode::Image,
             true
         ));
-        // Acrylic's accent tint consumes opacity even without a texture.
         for mode in [
             BackgroundMode::Desktop,
             BackgroundMode::Image,
@@ -2144,7 +3056,7 @@ mod tests {
         assert!(short.ends_with("pwsh.exe"));
         assert!(short.contains('…'));
 
-        let unicode = "C:\\Users\\Simulp\\Документы\\shell.exe";
+        let unicode = "C:\\CLI\\Документы\\shell.exe";
         assert_eq!(elide_path(unicode, 16).chars().count(), 16);
     }
 
