@@ -23,6 +23,22 @@ Install version 0.11.8 first:
 '@
 }
 
+# Rust embeds the absolute path of every panic site. Without remapping, the
+# shipped exe contains C:\Users\<you>\.cargo\registry\... and .rustup\... from
+# dependency panic messages, which leaks the build machine's user name.
+# CARGO_ENCODED_RUSTFLAGS is used because plain RUSTFLAGS is split on spaces and
+# a profile path can contain them.
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
+$remaps = @(
+    "--remap-path-prefix=$env:USERPROFILE\.cargo=C:\cargo",
+    "--remap-path-prefix=$env:USERPROFILE\.rustup=C:\rust",
+    "--remap-path-prefix=$repoRoot=."
+)
+$env:CARGO_ENCODED_RUSTFLAGS = ($remaps -join [char]0x1f)
+if ($env:RUSTFLAGS) {
+    throw 'RUSTFLAGS is set; unset it so the path remap is the only flag set.'
+}
+
 # Run from this directory so cargo-packager discovers only this Packager.toml.
 Push-Location $PSScriptRoot
 try {
