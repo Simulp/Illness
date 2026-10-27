@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "illness"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1262,7 +1262,7 @@ dependencies = [
 
 [[package]]
 name = "illness-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "illness-term"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "illness-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "egui",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "illness_explorer_command_injector"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
  "windows-core",

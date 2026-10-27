@@ -225,7 +225,7 @@ mounted; its stale entry goes on that user's next launch once HKLM is complete.
 **Don't want to build?** Download the installer (or the standalone `illness.exe`) from
 **[Releases](https://github.com/Simulp/Illness/releases)** -- no toolchain, no SDK, no packager.
 
-**Or build it:** `.\apps\illness\build-installer.ps1` -> `dist\illness_0.1.0_x64-setup.exe`, about
+**Or build it:** `.\apps\illness\build-installer.ps1` -> `dist\illness_0.2.0_x64-setup.exe`, about
 2-3 minutes once the two prereqs are in place.
 
 Five steps, roughly 4-5 minutes cold, 2-3 warm:
@@ -235,7 +235,7 @@ Five steps, roughly 4-5 minutes cold, 2-3 warm:
    `makeappx.exe`. No SDK and no `.appx` in `dist\`? Step 3 stops and names the missing component
    (about 2 min to add via the Visual Studio installer).
 3. Build the installer (about 2-3 min): `.\apps\illness\build-installer.ps1`
-4. Run `dist\illness_0.1.0_x64-setup.exe` (UAC prompt, about 30 s).
+4. Run `dist\illness_0.2.0_x64-setup.exe` (UAC prompt, about 30 s).
 5. Verify: right-click any folder and look for **Open with Illness** in the short menu.
 
 Step 3 runs four phases, in this order:

@@ -10,7 +10,7 @@
 
 name = "illness"
 product-name = "Illness"
-version = "0.1.0"
+version = "0.2.0"
 identifier = "dev.simulp.illness"
 publisher = "Simulp"
 description = "A Windows-first terminal emulator built on Alacritty's VT core and egui."

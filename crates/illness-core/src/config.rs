@@ -91,7 +91,7 @@ impl Default for Config {
         Self {
             theme: "Illness Dark".to_string(),
             font_family: "Cascadia Mono".to_string(),
-            font_size: 13.0,
+            font_size: 16.0,
             line_height: 1.2,
             material: Material::Solid,
             background: BackgroundMode::Desktop,
@@ -213,7 +213,7 @@ impl Config {
         } else {
             self.font_family = self.font_family.trim().to_string();
         }
-        self.font_size = finite_or(self.font_size, 13.0).clamp(8.0, 40.0);
+        self.font_size = finite_or(self.font_size, 16.0).clamp(8.0, 40.0);
         self.line_height = finite_or(self.line_height, 1.2).clamp(1.0, 2.0);
         self.padding = finite_or(self.padding, 8.0).clamp(0.0, 32.0);
         self.background_path = self.background_path.trim().to_string();
@@ -397,7 +397,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.theme, "Illness Dark");
         assert_eq!(config.font_family, "Cascadia Mono");
-        assert_eq!(config.font_size, 13.0);
+        assert_eq!(config.font_size, 16.0);
         assert_eq!(config.line_height, 1.2);
         assert_eq!(config.material, Material::Solid);
         assert_eq!(config.background, BackgroundMode::Desktop);

@@ -21,7 +21,7 @@
   <Identity
     Name="Simulp.Illness"
     Publisher="CN=Simulp"
-    Version="0.1.0.0" />
+    Version="0.2.0.0" />
   <Properties>
     <DisplayName>Illness</DisplayName>
     <PublisherDisplayName>Simulp</PublisherDisplayName>

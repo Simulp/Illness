@@ -16,8 +16,8 @@ use crate::fonts;
 use crate::icons::{self, Icon};
 
 pub const PALETTE_WIDTH: f32 = 680.0;
-pub const SEARCH_WIDTH: f32 = 380.0;
-pub const SEARCH_HEIGHT: f32 = 40.0;
+pub const SEARCH_WIDTH: f32 = 400.0;
+pub const SEARCH_HEIGHT: f32 = 44.0;
 
 /// How long a toast stays on screen.
 const TOAST_SECS: f64 = 3.0;
@@ -932,70 +932,308 @@ fn menu_row(
 fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<Action> {
     let screen = ctx.content_rect();
     let (entry, slide) = entry_progress(ctx, state);
+    let width = SEARCH_WIDTH.min((screen.width() - 24.0).max(280.0));
+    let height = SEARCH_HEIGHT;
     let position = Pos2::new(
-        screen.right() - SEARCH_WIDTH - 12.0,
-        screen.top() + tokens.titlebar_h + 12.0 - slide,
+        screen.right() - width - 12.0,
+        screen.top() + tokens.titlebar_h + 10.0 - slide,
     );
     let mut actions = Vec::new();
 
+    // Alt+C toggles case sensitivity
+    let alt_c = ctx.input_mut(|input| input.consume_key(Modifiers::ALT, Key::C));
+    if alt_c {
+        state.case_sensitive = !state.case_sensitive;
+        if !state.search.is_empty() {
+            actions.push(Action::Search(search_request(state, true)));
+        }
+    }
+
+    let area_rect = Rect::from_min_size(position, Vec2::new(width, height)).expand(6.0);
     Area::new(Id::unique("illness_search"))
         .order(Order::Foreground)
-        .fixed_pos(position)
+        .fixed_pos(area_rect.min)
         .sense(Sense::click())
         .fade_in(false)
         .show(ctx, |ui| {
             ui.set_opacity(entry);
-            Frame::new()
-                .fill(tokens.bg_elev)
-                .stroke(Stroke::new(1.0, tokens.border))
-                .corner_radius(tokens.radius_md)
-                .inner_margin(Margin::symmetric(8, 4))
-                .show(ui, |ui| {
-                    ui.set_width(SEARCH_WIDTH - 16.0);
-                    ui.set_height(SEARCH_HEIGHT - 8.0);
-                    ui.horizontal_centered(|ui| {
-                        ui.spacing_mut().item_spacing.x = 4.0;
-                        let output = TextEdit::singleline(&mut state.search)
-                            .hint_text("Search")
-                            .desired_width(196.0)
-                            .font(FontId::proportional(13.0))
-                            .text_color(tokens.text)
-                            .margin(Margin::ZERO)
-                            .align(Align2::LEFT_CENTER)
-                            .frame(Frame::NONE)
-                            .return_key(None)
-                            .show(ui);
-                        output.response.request_focus();
+            let bar_rect = Rect::from_min_size(position, Vec2::new(width, height));
 
-                        if text_button(
-                            ui,
-                            tokens,
-                            "Aa",
-                            state.case_sensitive,
-                            Vec2::new(26.0, 22.0),
-                        )
-                        .clicked()
-                        {
-                            state.case_sensitive = !state.case_sensitive;
-                        }
+            // Layered drop shadows for elevation over active terminal text
+            let shadow_outer = bar_rect.translate(Vec2::new(0.0, 3.0)).expand(3.0);
+            let shadow_alpha = (28.0 * entry).round() as u8;
+            ui.painter().rect_filled(
+                shadow_outer,
+                tokens.radius_lg,
+                Color32::from_black_alpha(shadow_alpha),
+            );
+            let shadow_inner = bar_rect.translate(Vec2::new(0.0, 1.5)).expand(1.0);
+            let inner_alpha = (45.0 * entry).round() as u8;
+            ui.painter().rect_filled(
+                shadow_inner,
+                tokens.radius_md + 1.0,
+                Color32::from_black_alpha(inner_alpha),
+            );
 
-                        let count = state.search_index.map_or_else(
-                            || "0/0".to_string(),
-                            |(current, total)| format!("{current}/{total}"),
-                        );
-                        ui.label(RichText::new(count).size(10.5).color(tokens.text_dim));
+            // Floating card surface
+            ui.painter()
+                .rect_filled(bar_rect, tokens.radius_md, tokens.bg_elev);
+            ui.painter().rect_stroke(
+                bar_rect,
+                tokens.radius_md,
+                Stroke::new(1.0, tokens.border),
+                StrokeKind::Inside,
+            );
 
-                        if chevron_button(ui, tokens, true).clicked() {
-                            actions.push(Action::Search(search_request(state, false)));
-                        }
-                        if chevron_button(ui, tokens, false).clicked() {
-                            actions.push(Action::Search(search_request(state, true)));
-                        }
-                        if icon_button(ui, tokens, Icon::Close, 20.0).clicked() {
-                            state.close();
-                        }
-                    });
-                });
+            let content_rect = bar_rect.shrink2(Vec2::new(8.0, 6.0));
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(content_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+
+            let ui = &mut content_ui;
+            let gap = 4.0;
+            ui.spacing_mut().item_spacing.x = gap;
+
+            // Match count badge layout calculation
+            let show_count = !state.search.is_empty();
+            let count_text = if show_count {
+                match state.search_index {
+                    Some((cur, tot)) => format!("{cur}/{tot}"),
+                    None => "0/0".to_string(),
+                }
+            } else {
+                String::new()
+            };
+            let count_font = FontId::proportional(11.5);
+            let count_galley = if show_count {
+                Some(ui.painter().layout_no_wrap(
+                    count_text.clone(),
+                    count_font.clone(),
+                    tokens.text,
+                ))
+            } else {
+                None
+            };
+            let count_badge_w = count_galley.as_ref().map_or(0.0, |g| g.size().x + 14.0);
+
+            // Dynamically calculate width needed for right controls to expand the search field
+            let mut right_w = 30.0; // "Aa" button
+            if show_count {
+                right_w += gap + count_badge_w;
+            }
+            right_w += gap + 1.0 + gap; // divider 1
+            right_w += 28.0 + gap + 28.0; // prev + next chevrons
+            right_w += gap + 1.0 + gap; // divider 2
+            right_w += 28.0; // close button
+
+            let input_w = (ui.available_width() - right_w - gap).max(120.0);
+
+            // 1. Inset Search Input Field (32px height provides full vertical clearance)
+            let (input_box_rect, _) =
+                ui.allocate_exact_size(Vec2::new(input_w, 32.0), Sense::hover());
+            ui.painter()
+                .rect_filled(input_box_rect, tokens.radius_sm, tokens.bg_sunken);
+
+            let clear_width = if !state.search.is_empty() { 26.0 } else { 8.0 };
+            // Give TextEdit the full vertical bounds so its line height is never clipped
+            let text_edit_rect = Rect::from_min_max(
+                Pos2::new(input_box_rect.left() + 30.0, input_box_rect.top()),
+                Pos2::new(
+                    input_box_rect.right() - clear_width,
+                    input_box_rect.bottom(),
+                ),
+            );
+
+            let mut edit_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(text_edit_rect)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            let output = TextEdit::singleline(&mut state.search)
+                .hint_text("Find in terminal…")
+                .desired_width(text_edit_rect.width())
+                .font(FontId::proportional(13.0))
+                .text_color(tokens.text)
+                .margin(Margin::ZERO)
+                .align(Align2::LEFT_CENTER)
+                .frame(Frame::NONE)
+                .return_key(None)
+                .show(&mut edit_ui);
+            output.response.request_focus();
+
+            if output.response.changed() {
+                if state.search.is_empty() {
+                    state.search_index = None;
+                }
+                actions.push(Action::Search(search_request(state, true)));
+            }
+
+            // Animate focus accent on input border & search icon
+            let is_focused = output.response.has_focus();
+            let focus_t = ui.ctx().animate_bool_with_time(
+                Id::unique("illness_search_focus"),
+                is_focused,
+                0.12,
+            );
+            let icon_color = design::mix(tokens.text_dim, tokens.accent, focus_t);
+            let search_icon_center =
+                Pos2::new(input_box_rect.left() + 15.0, input_box_rect.center().y);
+            icons::paint_icon(
+                ui.painter(),
+                Rect::from_center_size(search_icon_center, Vec2::splat(13.5)),
+                Icon::Search,
+                icon_color,
+            );
+
+            let stroke_color = design::mix(tokens.border, tokens.accent, focus_t);
+            ui.painter().rect_stroke(
+                input_box_rect,
+                tokens.radius_sm,
+                Stroke::new(1.0, stroke_color),
+                StrokeKind::Inside,
+            );
+
+            // Inline clear button
+            if !state.search.is_empty() {
+                let clear_rect = Rect::from_center_size(
+                    Pos2::new(input_box_rect.right() - 14.0, input_box_rect.center().y),
+                    Vec2::splat(18.0),
+                );
+                let clear_resp = ui.interact(
+                    clear_rect,
+                    Id::unique("illness_search_clear"),
+                    Sense::click(),
+                );
+                let clear_hover = ui.ctx().animate_bool_with_time(
+                    clear_resp.id,
+                    clear_resp.hovered(),
+                    HOVER_SECS,
+                );
+                if clear_hover > 0.0 {
+                    ui.painter().rect_filled(
+                        clear_rect,
+                        tokens.radius_sm - 2.0,
+                        design::fade(tokens.hover, clear_hover),
+                    );
+                }
+                icons::paint_icon(
+                    ui.painter(),
+                    Rect::from_center_size(clear_rect.center(), Vec2::splat(10.0)),
+                    Icon::Close,
+                    design::mix(tokens.text_dim, tokens.text, clear_hover),
+                );
+                let clear_resp = clear_resp.on_hover_text("Clear");
+                if clear_resp.clicked() {
+                    state.search.clear();
+                    state.search_index = None;
+                    actions.push(Action::Search(search_request(state, true)));
+                }
+            }
+
+            // 2. Case Sensitivity Toggle ("Aa")
+            let case_resp = search_toggle_button(
+                ui,
+                tokens,
+                Id::unique("illness_search_case"),
+                "Aa",
+                state.case_sensitive,
+                "Match Case (Alt+C)",
+                Vec2::new(30.0, 30.0),
+            );
+            if case_resp.clicked() {
+                state.case_sensitive = !state.case_sensitive;
+                if !state.search.is_empty() {
+                    actions.push(Action::Search(search_request(state, true)));
+                }
+            }
+
+            // 3. Match Count Badge
+            if show_count {
+                let (total_is_zero, text_color, badge_bg, badge_stroke) = match state.search_index {
+                    Some((_, 0)) => (
+                        true,
+                        tokens.danger,
+                        design::fade(tokens.danger, 0.12),
+                        design::fade(tokens.danger, 0.35),
+                    ),
+                    Some(_) => (false, tokens.text, tokens.bg_sunken, tokens.border),
+                    None => (true, tokens.text_dim, tokens.bg_sunken, tokens.border),
+                };
+
+                let (badge_rect, badge_resp) =
+                    ui.allocate_exact_size(Vec2::new(count_badge_w, 24.0), Sense::hover());
+                ui.painter()
+                    .rect_filled(badge_rect, tokens.radius_sm - 2.0, badge_bg);
+                ui.painter().rect_stroke(
+                    badge_rect,
+                    tokens.radius_sm - 2.0,
+                    Stroke::new(1.0, badge_stroke),
+                    StrokeKind::Inside,
+                );
+                if let Some(galley) = count_galley {
+                    ui.painter().galley(
+                        badge_rect.center() - galley.size() * 0.5,
+                        galley,
+                        text_color,
+                    );
+                }
+                let tooltip = if total_is_zero {
+                    "No matching results"
+                } else {
+                    "Match position and total"
+                };
+                badge_resp.on_hover_text(tooltip);
+            }
+
+            // 4. Divider 1
+            search_divider(ui, tokens);
+
+            // 5. Previous Match Button
+            if search_icon_button(
+                ui,
+                tokens,
+                Icon::ArrowUp,
+                Vec2::splat(28.0),
+                "Previous Match (Shift+Enter)",
+                false,
+            )
+            .clicked()
+            {
+                actions.push(Action::Search(search_request(state, false)));
+            }
+
+            // 6. Next Match Button
+            if search_icon_button(
+                ui,
+                tokens,
+                Icon::ArrowDown,
+                Vec2::splat(28.0),
+                "Next Match (Enter)",
+                false,
+            )
+            .clicked()
+            {
+                actions.push(Action::Search(search_request(state, true)));
+            }
+
+            // 7. Divider 2
+            search_divider(ui, tokens);
+
+            // 8. Close Button
+            if search_icon_button(
+                ui,
+                tokens,
+                Icon::Close,
+                Vec2::splat(28.0),
+                "Close (Esc)",
+                true,
+            )
+            .clicked()
+            {
+                state.close();
+            }
         });
 
     if matches!(state.kind, OverlayKind::Search) {
@@ -1008,6 +1246,117 @@ fn show_search(ctx: &Context, state: &mut OverlayState, tokens: &Tokens) -> Vec<
     }
 
     actions
+}
+
+fn search_toggle_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    id: Id,
+    label: &str,
+    active: bool,
+    tooltip: &str,
+    size: Vec2,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let active_t = ui
+        .ctx()
+        .animate_bool_with_time(id.with("active"), active, 0.10);
+    let hover_t = ui.ctx().animate_bool_with_time(
+        id.with("hover"),
+        response.hovered() && !active,
+        HOVER_SECS,
+    );
+
+    let bg = if active_t > 0.0 {
+        design::fade(tokens.accent, 0.18 * active_t)
+    } else if hover_t > 0.0 {
+        design::fade(tokens.hover, hover_t)
+    } else {
+        tokens.bg_sunken
+    };
+
+    let stroke_color = if active_t > 0.0 {
+        design::mix(tokens.border, tokens.accent, active_t)
+    } else {
+        tokens.border
+    };
+
+    ui.painter().rect_filled(rect, tokens.radius_sm, bg);
+    ui.painter().rect_stroke(
+        rect,
+        tokens.radius_sm,
+        Stroke::new(1.0, stroke_color),
+        StrokeKind::Inside,
+    );
+
+    let text_color = if active_t > 0.0 {
+        design::mix(tokens.text, tokens.accent, active_t)
+    } else if hover_t > 0.0 {
+        tokens.text
+    } else {
+        tokens.text_dim
+    };
+
+    ui.painter().text(
+        rect.center(),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(12.5),
+        text_color,
+    );
+
+    response.on_hover_text(tooltip)
+}
+
+fn search_icon_button(
+    ui: &mut Ui,
+    tokens: &Tokens,
+    icon: Icon,
+    size: Vec2,
+    tooltip: &str,
+    danger_on_hover: bool,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
+    if hover > 0.0 {
+        let fill = if danger_on_hover {
+            design::fade(tokens.danger, 0.18 * hover)
+        } else {
+            design::fade(tokens.hover, hover)
+        };
+        ui.painter().rect_filled(rect, tokens.radius_sm, fill);
+        if danger_on_hover {
+            ui.painter().rect_stroke(
+                rect,
+                tokens.radius_sm,
+                Stroke::new(1.0, design::fade(tokens.danger, 0.35 * hover)),
+                StrokeKind::Inside,
+            );
+        }
+    }
+
+    let color = if hover > 0.0 && danger_on_hover {
+        design::mix(tokens.text_dim, tokens.danger, hover)
+    } else {
+        design::mix(tokens.text_dim, tokens.text, hover)
+    };
+
+    icons::paint_icon(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(12.0)),
+        icon,
+        color,
+    );
+
+    response.on_hover_text(tooltip)
+}
+
+fn search_divider(ui: &mut Ui, tokens: &Tokens) {
+    let divider_color = design::mix(tokens.border, tokens.text_dim, 0.30);
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 18.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, divider_color);
 }
 
 pub fn show_settings_panel(
@@ -1336,13 +1685,13 @@ fn appearance_section(
         ui,
         tokens,
         "Font Size",
-        Some("Terminal character size in points"),
+        Some("Terminal character size in pixels; 16 px matches Windows Terminal's 12 pt default"),
         |ui| {
             stepper_widget(
                 ui,
                 tokens,
                 "font_size",
-                &format!("{:.0} pt", config.font_size),
+                &format!("{:.0} px", config.font_size),
                 |dir| {
                     if dir < 0 {
                         if config.font_size > 8.0 {
@@ -2911,25 +3260,6 @@ fn icon_button(ui: &mut Ui, tokens: &Tokens, icon: Icon, size: f32) -> Response 
         ui.painter(),
         icon_rect,
         icon,
-        design::mix(tokens.text_dim, tokens.text, hover),
-    );
-    response
-}
-
-fn chevron_button(ui: &mut Ui, tokens: &Tokens, up: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-    let hover = ui
-        .ctx()
-        .animate_bool_with_time(response.id, response.hovered(), HOVER_SECS);
-    if hover > 0.0 {
-        ui.painter()
-            .rect_filled(rect, tokens.radius_sm, design::fade(tokens.hover, hover));
-    }
-
-    icons::paint_icon(
-        ui.painter(),
-        Rect::from_center_size(rect.center(), Vec2::splat(12.0)),
-        if up { Icon::ArrowUp } else { Icon::ArrowDown },
         design::mix(tokens.text_dim, tokens.text, hover),
     );
     response

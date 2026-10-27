@@ -21,7 +21,7 @@ at the normal install directory, so the install directory must contain:
   when a verb is clicked. The installer keeps the DLL in the `appx`
   subdirectory, so that path is what an install has to preserve.
 
-Identity: `Simulp.Illness`, publisher `CN=Simulp`, version `0.1.0.0`.
+Identity: `Simulp.Illness`, publisher `CN=Simulp`, version `0.2.0.0`.
 
 ## Build
 
