@@ -54,6 +54,9 @@ struct UploadStats {
 /// Grid size plus physical cell size; any change needs a PTY resize.
 type LayoutKey = (usize, usize, u32, u32);
 
+/// Motion dedupe key: cell, button, and ctrl/alt/shift state.
+type MotionKey = ((usize, usize), MouseButton, bool, bool, bool);
+
 /// Delay before committing a drag-resize. Intermediate sizes are dropped so
 /// the 10k-line scrollback is not reflowed every pointer frame.
 const RESIZE_DEBOUNCE_SECS: f64 = 0.09;
@@ -260,6 +263,104 @@ enum PressOwner {
     Scrollbar,
 }
 
+/// Pointer button events for one frame, read once so the mouse path does not
+/// query egui input repeatedly on every painted frame.
+#[derive(Debug, Clone, Copy, Default)]
+struct PointerFrame {
+    primary_pressed: bool,
+    middle_pressed: bool,
+    secondary_pressed: bool,
+    primary_released: bool,
+    middle_released: bool,
+    secondary_released: bool,
+    any_pressed: bool,
+    any_released: bool,
+    any_down: bool,
+}
+
+/// Buttons whose press report the child received and that are still down.
+///
+/// Two buttons can be down at once. A single slot lost the first press, so the
+/// drag was attributed to the wrong button and one mouse-up went missing. The
+/// newest press stays last, which makes it the drag button for motion.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ReportedButtons {
+    down: [Option<MouseButton>; 3],
+}
+
+impl ReportedButtons {
+    /// Records a press once; a repeated press does not duplicate the button.
+    fn insert(&mut self, button: MouseButton) {
+        if self.contains(button) {
+            return;
+        }
+        if let Some(slot) = self.down.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(button);
+        }
+    }
+
+    /// Drops a released button; returns whether its press was tracked.
+    fn remove(&mut self, button: MouseButton) -> bool {
+        let Some(slot) = self.down.iter_mut().find(|slot| **slot == Some(button)) else {
+            return false;
+        };
+        *slot = None;
+        self.compact();
+        true
+    }
+
+    /// Keeps the newest press last after a hole was punched in the set.
+    fn compact(&mut self) {
+        let mut next = [None; 3];
+        for (index, button) in self.down.iter().flatten().enumerate() {
+            next[index] = Some(*button);
+        }
+        self.down = next;
+    }
+
+    fn contains(&self, button: MouseButton) -> bool {
+        self.down.contains(&Some(button))
+    }
+
+    fn is_empty(&self) -> bool {
+        self.down.iter().all(Option::is_none)
+    }
+
+    /// Most recently pressed button that is still down, if any.
+    fn latest(&self) -> Option<MouseButton> {
+        self.down.iter().rev().flatten().next().copied()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = MouseButton> + '_ {
+        self.down.iter().flatten().copied()
+    }
+
+    fn clear(&mut self) {
+        self.down = [None; 3];
+    }
+}
+
+/// Mouse-reporting modes from the previous frame, so a mode toggle can drop
+/// the hover dedupe even if the pointer never moved.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MouseModes {
+    reporting: bool,
+    motion: bool,
+    drag: bool,
+    sgr: bool,
+}
+
+impl MouseModes {
+    fn from_modes(modes: TermModes) -> Self {
+        Self {
+            reporting: modes.mouse_reporting,
+            motion: modes.mouse_motion,
+            drag: modes.mouse_drag,
+            sgr: modes.sgr_mouse,
+        }
+    }
+}
+
 /// Where a fresh press landed, independent of whether a bar currently exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PressTarget {
@@ -284,6 +385,179 @@ fn press_target(bar: Option<&Scrollbar>, pos: Pos2, primary_pressed: bool) -> Pr
     } else {
         PressTarget::Track
     }
+}
+
+/// Whether the child gets mouse reports this frame.
+///
+/// Shift normally bypasses reporting so the press becomes a local selection.
+/// A press that was already reported keeps reporting until its release, or the
+/// child would never see the mouse-up and the tracked button would leak. A
+/// press that starts with Shift held is never reported, so `held` stays false
+/// and the latch still wins.
+fn reports_mouse(reporting: bool, shift: bool, held: bool) -> bool {
+    reporting && (!shift || held)
+}
+
+/// Whether Shift suppresses motion this frame.
+///
+/// A press that was already reported keeps reporting motion until it ends, so
+/// holding Shift mid-drag cannot stall a vim/tmux drag. A press that started
+/// with Shift holds the latch and must stay suppressed even after Shift is
+/// released, or releasing it would flip a selection into reporting.
+fn shift_blocks_motion(shift: bool, latch: bool, held: bool) -> bool {
+    (shift || latch) && !held
+}
+
+/// Whether a release frame ends the tracked press.
+///
+/// Another reported button may still be down, so a single release does not end
+/// the drag. egui's `any_down` wins over the tracked set when a per-button
+/// release was missed, or the press would latch forever.
+fn press_ended(reported: &ReportedButtons, any_down: bool) -> bool {
+    reported.is_empty() || !any_down
+}
+
+/// Whether this frame ends a gesture whose release must be honored.
+///
+/// A local press never reports a button, so it is always the primary button
+/// that owns the drag: another button coming up mid-drag (a right click while
+/// the left button is still down) must not freeze the selection. A reported
+/// press tracks its own buttons, so any release may be the end frame and
+/// [`press_ended`] decides whether the tracked set is empty.
+fn gesture_released(reported: &ReportedButtons, released: bool, primary_released: bool) -> bool {
+    if reported.is_empty() {
+        primary_released
+    } else {
+        released
+    }
+}
+
+/// Whether this frame ends the press's sticky ownership of the pointer.
+fn gesture_ended(
+    reported: &ReportedButtons,
+    released: bool,
+    primary_released: bool,
+    any_down: bool,
+    focused: bool,
+) -> bool {
+    (gesture_released(reported, released, primary_released) || !any_down || !focused)
+        && press_ended(reported, any_down)
+}
+
+/// Whether button-less hover motion may be written this frame.
+///
+/// A background window must not drive a child's hover reports, so a repaint
+/// caused by another window cannot feed the PTY. A drag that began while the
+/// window was focused may finish.
+fn motion_allowed(focused: bool, dragging: bool) -> bool {
+    focused || dragging
+}
+
+/// Buttons whose press must reach the child this frame, in a stable order.
+fn mouse_presses(pointer: PointerFrame) -> Vec<MouseButton> {
+    let mut buttons = Vec::new();
+    if pointer.primary_pressed {
+        buttons.push(MouseButton::Left);
+    }
+    if pointer.middle_pressed {
+        buttons.push(MouseButton::Middle);
+    }
+    if pointer.secondary_pressed {
+        buttons.push(MouseButton::Right);
+    }
+    buttons
+}
+
+/// Releases to report this frame.
+///
+/// The release is reported whenever reporting is on, even if Shift went down
+/// after the matching press: dropping it would leave the child waiting for a
+/// mouse-up that never arrives.
+fn mouse_releases(pointer: PointerFrame) -> Vec<MouseButton> {
+    let mut releases = Vec::new();
+    for (released, button) in [
+        (pointer.primary_released, MouseButton::Left),
+        (pointer.middle_released, MouseButton::Middle),
+        (pointer.secondary_released, MouseButton::Right),
+    ] {
+        if released {
+            releases.push(button);
+        }
+    }
+    releases
+}
+
+/// Mouse-ups to write this frame: only buttons whose press this view reported.
+///
+/// egui reports every button it saw come up, including one it owned elsewhere:
+/// a drag that began on the scrollbar thumb or on another tab never produced a
+/// press report, so writing its release would hand the child a mouse-up with
+/// no matching down. The button leaves the tracked set first, so a repeated
+/// release frame writes nothing.
+fn tracked_releases(reported: &mut ReportedButtons, pointer: PointerFrame) -> Vec<MouseButton> {
+    let mut writes = Vec::new();
+    for button in mouse_releases(pointer) {
+        if reported.remove(button) {
+            writes.push(button);
+        }
+    }
+    writes
+}
+
+/// Mouse-up reports a press lost outside the window still owes the child.
+///
+/// winit delivers no release when the button comes up off the window, so a
+/// 1002/1003 child would keep the button latched and later hover would arrive
+/// button-less. Every tracked button gets one release at the last reported
+/// cell, or at `fallback` when nothing was reported yet. Reporting that has
+/// since been turned off means the child stopped listening, so nothing is due.
+fn lost_release_reports(
+    reporting: bool,
+    reported: &ReportedButtons,
+    last_cell: Option<(usize, usize)>,
+    fallback: (usize, usize),
+    mods: Mods,
+    sgr: bool,
+) -> Vec<Vec<u8>> {
+    if !reporting {
+        return Vec::new();
+    }
+    let (row, col) = last_cell.unwrap_or(fallback);
+    reported
+        .iter()
+        .map(|button| encode_mouse(MousePhase::Release, button, col, row, mods, sgr))
+        .collect()
+}
+
+/// Whether a press that lost the pointer must defer its owed mouse-up.
+///
+/// `PointerGone` is not a release: winit keeps capture, a `CursorMoved`
+/// follows, and the real release arrives later. Writing the mouse-up at the
+/// window edge now would put it on the wrong cell and leave a second, orphan
+/// one for the real release. Only losing focus or the button itself ends it.
+fn defers_release(any_down: bool, focused: bool) -> bool {
+    any_down && focused
+}
+
+/// Whether this frame must pay a lost press's owed mouse-up before writing a
+/// new press or release.
+///
+/// A frame can carry both a press and a release. Skipping the payment on that
+/// frame let it write down, down, up, so the child never matched the first
+/// press. Paying whenever the debt is owed keeps the order down, up, down, up;
+/// the paid-up buttons leave the tracked set, so the same frame's release path
+/// cannot write a second, orphan mouse-up.
+fn pays_deferred_release(any_pressed: bool, deferred: bool) -> bool {
+    any_pressed && deferred
+}
+
+/// Clamp a stored cell into a grid that may have shrunk since it was written.
+fn clamp_cell(cell: (usize, usize), grid: (usize, usize)) -> (usize, usize) {
+    let (cols, rows) = grid;
+    (
+        cell.0.min(rows.saturating_sub(1)),
+        cell.1.min(cols.saturating_sub(1)),
+    )
 }
 
 /// Whether this view owes the grid a mouse release this frame.
@@ -451,9 +725,15 @@ pub struct TerminalResponse {
     pub actions: Vec<TerminalAction>,
     pub cols: usize,
     pub rows: usize,
-    /// Whether the view wrote input bytes (mouse reports, alternate-screen
-    /// wheel keys) straight to this session during the frame.
+    /// Whether the view wrote non-motion input bytes (press, release, wheel,
+    /// alternate-screen wheel keys) straight to this session during the frame.
+    /// A mouse-up this view owed a press it lost outside the window is
+    /// bookkeeping and never sets this flag.
     pub input_sent: bool,
+    /// Whether the view wrote a hover or drag motion report. Motion is not a
+    /// user action: it must not hide the startup recovery card or count as use,
+    /// and it never sets [`Self::input_sent`].
+    pub motion_sent: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -473,7 +753,57 @@ pub struct TerminalView {
     /// wheel encoding between frames. Keyboard/paste encoding takes the live
     /// modes from the session instead.
     modes: TermModes,
+    /// Cell, button, and ctrl/alt/shift state of the last hover-motion report,
+    /// so a stationary pointer (or a repaint) does not flood the PTY with
+    /// duplicates, while a modifier change still reports.
+    motion_cell: Option<MotionKey>,
+    /// `(row, col)` of the last mouse report written, so a mouse-up lost
+    /// outside the window still lands on the cell the child last heard about.
+    last_report: Option<(usize, usize)>,
+    /// Buttons whose press report the child received and that are still down.
+    /// Tracked here because egui keeps `pointer.down` set after `PointerGone`.
+    reported: ReportedButtons,
+    /// True while a grid press is tracked, reported or local. It is the
+    /// gesture's lifetime, so a second press cannot retake the Shift latch.
+    press_active: bool,
+    /// Shift override latched when a grid press starts. Releasing Shift
+    /// mid-drag must not flip an in-progress selection into reporting.
+    press_shift_override: bool,
+    /// A press whose release egui never saw still owes the child a mouse-up.
+    /// The write waits for the real release, focus loss, or a new press.
+    deferred_release: bool,
+    /// Buttons the host saw come up that egui never delivered, because
+    /// egui-winit drops mouse events while it has no pointer position. Only
+    /// these buttons are paid on the next painted frame, and only the tracked
+    /// press bookkeeping changes: a local selection drag is not touched.
+    host_release_pending: ReportedButtons,
+    /// Buttons whose press was reported but whose tracking ended without a
+    /// release, such as a focus loss. Their mouse-up is still owed and is paid
+    /// by the next painted pass at the last reported cell, clamped into the
+    /// live grid.
+    host_owed: ReportedButtons,
+    /// Set when a host release covered the primary button while a local
+    /// selection was still live. The next normal frame finalizes it, because
+    /// egui never delivered the release frame that would have.
+    host_selection_release: bool,
+    /// Modifiers from the last painted frame, used by `motion_wanted_at` to
+    /// rebuild the motion dedupe key without querying input.
+    last_mods: Mods,
+    /// Grid geometry of the last painted frame, so `motion_wanted_at` can map
+    /// a pointer position between frames.
+    grid_rect: Option<Rect>,
+    grid_metrics: Option<CellMetrics>,
+    grid_cells: Option<(usize, usize)>,
+    /// Mouse-reporting modes seen on the previous frame; a change drops the
+    /// stale hover dedupe.
+    observed_mouse: Option<MouseModes>,
+    /// Window focus seen on the previous frame; losing or regaining it drops
+    /// the stale hover dedupe.
+    observed_focus: Option<bool>,
     last_layout: Option<(usize, usize, u32, u32)>,
+    /// Whether the last painted snapshot had scrollback, so the app's gate can
+    /// ask without building a second snapshot.
+    scrollback: bool,
     blink_epoch: f64,
     wheel_accum: f32,
     selecting: bool,
@@ -537,6 +867,7 @@ impl TerminalView {
                 cols: target_cols,
                 rows: target_rows,
                 input_sent: false,
+                motion_sent: false,
             };
         }
 
@@ -603,6 +934,7 @@ impl TerminalView {
             );
         }
         self.modes = snapshot.modes;
+        self.observe_mouse_modes(snapshot.modes);
         let (cols, rows) = (snapshot.cols, snapshot.rows);
         if cols == 0 || rows == 0 {
             return TerminalResponse {
@@ -611,12 +943,18 @@ impl TerminalView {
                 cols,
                 rows,
                 input_sent: false,
+                motion_sent: false,
             };
         }
         let grid_rect = Rect::from_min_size(
             pos2(content_rect.min.x + padding, content_rect.min.y + padding),
             vec2(metrics.width * cols as f32, metrics.height * rows as f32),
         );
+        // Remember the mapping this frame used, so the app's repaint gate can
+        // answer "would a move here report?" between frames.
+        self.grid_rect = Some(grid_rect);
+        self.grid_metrics = Some(metrics);
+        self.grid_cells = Some((cols, rows));
 
         let origin = grid_rect.min;
         let selection = selection_ranges(&snapshot, cols, rows);
@@ -696,7 +1034,7 @@ impl TerminalView {
             .or_else(|| response.hover_pos());
         let mods = ui.input(|input| input.modifiers);
         let ctrl = mods.ctrl || mods.command;
-        let mouse_mode = self.modes.mouse_reporting && !mods.shift;
+        let mouse_mode = self.mouse_mode(mods.shift);
 
         self.ime_pos = pointer
             .and_then(|pos| Self::cell_at(pos, grid_rect, &metrics, (cols, rows)))
@@ -743,6 +1081,9 @@ impl TerminalView {
             snapshot.history_size,
             snapshot.display_offset,
         );
+        // The snapshot is already in hand, so the app's gate reads this
+        // instead of building a second one every frame.
+        self.record_scrollback(snapshot.history_size);
         let history = i32::try_from(snapshot.history_size).unwrap_or(i32::MAX);
         let display_offset = i32::try_from(snapshot.display_offset).unwrap_or(i32::MAX);
         let primary_pressed =
@@ -753,6 +1094,37 @@ impl TerminalView {
         let pointer_present = ui.input(|input| input.pointer.latest_pos());
         let any_down = ui.input(|input| input.pointer.any_down());
         let focused = ui.ctx().input(|input| input.focused);
+        self.observe_focus(focused);
+        let fallback_cell = pointer_present
+            .and_then(|pos| Self::cell_at_clamped(pos, grid_rect, &metrics, (cols, rows)))
+            .unwrap_or((0, 0));
+        let report_mods = Mods {
+            ctrl: mods.ctrl,
+            alt: mods.alt,
+            shift: mods.shift,
+        };
+        self.last_mods = report_mods;
+
+        // The host saw a real button release that egui never delivered (winit
+        // drops mouse events with no pointer position). Pay what the press
+        // owes and end it before anything else reads the latch. The bytes are
+        // owed bookkeeping, so they never count as user input.
+        for report in self.take_host_release(fallback_cell, report_mods, (cols, rows)) {
+            session.write(&report);
+        }
+
+        // A local selection has no reported press, so the hook above paid
+        // nothing for it and egui never delivered its release frame. The first
+        // frame in the normal (non-reporting) path finalizes it here.
+        if self.host_selection_release {
+            let selection = session.selection_to_string();
+            self.finalize_host_selection(
+                !mouse_mode,
+                selection,
+                config.copy_on_select,
+                &mut actions,
+            );
+        }
 
         // A grab is only valid while its button is down, and that is checked
         // before any delta is computed. A release that lands while another tab
@@ -762,8 +1134,32 @@ impl TerminalView {
         let drag_lost = scrollbar_drag_ended(any_down, pointer_present, focused) && !released;
         if drag_lost {
             self.scrollbar_grab = None;
-            self.press_owner = None;
-            self.selecting = false;
+            if defers_release(any_down, focused) {
+                // Pointer leave is not a release: keep the press and its
+                // dues until egui sees one or focus is lost.
+                self.defer_lost_press();
+            } else {
+                // A press that was reported and is now lost (focus lost or
+                // button up outside the window) still owes the child its
+                // mouse-up, or a 1002/1003 drag stays latched. The write is
+                // bookkeeping, not user action.
+                self.release_lost_press(session, fallback_cell, report_mods, (cols, rows));
+                // Only the press bookkeeping dies here. This branch runs on
+                // every idle frame (nothing is down), so clearing the motion
+                // dedupe would make a 1003 child re-report a stationary
+                // pointer once per frame.
+                self.lose_press();
+            }
+        }
+
+        // A new press supersedes a press whose release was never seen: pay the
+        // owed mouse-up first, or the child sees two downs in a row that it
+        // cannot match to ups. A frame that also carries a release pays too,
+        // and the cleared buttons keep its own release path from writing a
+        // second, orphan mouse-up.
+        if pays_deferred_release(any_pressed, self.deferred_release) {
+            self.release_lost_press(session, fallback_cell, report_mods, (cols, rows));
+            self.lose_press();
         }
 
         // Every fresh press records its owner before hit testing, even with no
@@ -808,6 +1204,7 @@ impl TerminalView {
                     // Sticky: the grid owns this press until release, so a
                     // selection crossing the strip does not lose the pointer.
                     self.press_owner = Some(PressOwner::Grid);
+                    self.begin_press(None, mods.shift);
                 }
             }
         }
@@ -885,7 +1282,7 @@ impl TerminalView {
             } else {
                 None
             };
-            if ctrl && !mouse_mode && hover_link.is_some() {
+            if self.link_hover_wanted(ctrl, mods.shift) && hover_link.is_some() {
                 ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
             }
 
@@ -899,6 +1296,7 @@ impl TerminalView {
         }
 
         let mut input_sent = false;
+        let mut motion_sent = false;
         let wheel = wheel_notches(ui, rows);
         if !ctrl && response.hovered() && wheel != 0.0 {
             self.wheel_accum += wheel;
@@ -926,6 +1324,7 @@ impl TerminalView {
                     KeyModes {
                         app_cursor: self.modes.app_cursor,
                         bracketed_paste: self.modes.bracketed_paste,
+                        shift_enter_newline: config.shift_enter_newline,
                     },
                 );
                 for _ in 0..count {
@@ -941,8 +1340,11 @@ impl TerminalView {
         }
 
         if let Some(pos) = pointer {
-            if !bar_owns_pointer && owes_grid_release(self.press_owner, any_pressed) {
-                input_sent |= self.handle_mouse(
+            // Hover motion also needs a call, so the grid runs whenever the
+            // child gets mouse reports even without a press.
+            let owes = owes_grid_release(self.press_owner, any_pressed) || mouse_mode;
+            if !bar_owns_pointer && owes {
+                let (sent, motion) = self.handle_mouse(
                     ui,
                     &response,
                     session,
@@ -953,11 +1355,29 @@ impl TerminalView {
                     (cols, rows),
                     pos,
                     &mods,
+                    focused,
                     config.copy_on_select,
                     &mut actions,
                 );
+                input_sent |= sent;
+                motion_sent |= motion;
             } else {
                 self.selecting = false;
+                if self.modes.mouse_reporting {
+                    self.clear_motion();
+                } else {
+                    self.end_press();
+                }
+            }
+        } else {
+            // Pointer gone is not a release. A reported press keeps its
+            // bookkeeping and owes its mouse-up when egui actually sees the
+            // release, on focus loss, or when a new press supersedes it.
+            if defers_release(any_down, focused) {
+                self.defer_lost_press();
+            } else {
+                self.release_lost_press(session, fallback_cell, report_mods, (cols, rows));
+                self.end_press();
             }
         }
 
@@ -977,8 +1397,25 @@ impl TerminalView {
         // Release ends the press's sticky ownership, whether it arrived inside
         // the window or was lost outside it. It stays set until after
         // `handle_mouse` above, which is what delivers the matching mouse-up.
-        if released || scrollbar_drag_ended(any_down, pointer_present, focused) {
-            self.press_owner = None;
+        // A matching release already cleared the tracked button there; this
+        // ends a press that never produced a report. The hover dedupe survives
+        // because this branch also runs on every frame with no button down.
+        // End the press only when no reported button is left down. A release
+        // of one button while another is still held keeps the drag alive and
+        // attributed to the held button; its mouse-up was written above.
+        if gesture_ended(
+            &self.reported,
+            released,
+            primary_released,
+            any_down,
+            focused,
+        ) {
+            if !any_down {
+                // Bookkeeping only: an owed mouse-up must not mark the tab as
+                // user-acted, so it never feeds `input_sent`.
+                self.release_lost_press(session, fallback_cell, report_mods, (cols, rows));
+            }
+            self.lose_press();
         }
 
         // A scrollbar drag applies its own full delta above; easing it again in
@@ -994,6 +1431,7 @@ impl TerminalView {
             cols,
             rows,
             input_sent,
+            motion_sent,
         }
     }
 
@@ -1164,6 +1602,344 @@ impl TerminalView {
         }
     }
 
+    /// Forgets the last reported motion cell, so the next move reports again.
+    /// Called on press, release, and whenever reporting stops.
+    fn clear_motion(&mut self) {
+        self.motion_cell = None;
+    }
+
+    /// Starts a grid press: latches the Shift override once per gesture and
+    /// records the button only once a press report reaches the child.
+    ///
+    /// A second press during the same gesture keeps the existing latch, so
+    /// Shift+Left selection followed by a Right press cannot flip a live
+    /// selection into reporting after Shift was released.
+    fn begin_press(&mut self, button: Option<MouseButton>, shift: bool) {
+        if let Some(button) = button {
+            self.reported.insert(button);
+        }
+        if !self.press_active {
+            self.press_shift_override = shift;
+        }
+        self.press_active = true;
+        self.clear_motion();
+    }
+
+    /// Ends a grid press after its matching release, after the pointer leaves,
+    /// or when mouse reporting stops. No drag can follow it.
+    fn end_press(&mut self) {
+        self.reported.clear();
+        self.press_active = false;
+        self.press_shift_override = false;
+        self.deferred_release = false;
+        self.clear_motion();
+    }
+
+    /// Drops the press bookkeeping when a press was lost (no button down,
+    /// pointer gone, or focus lost) without forgetting the motion dedupe.
+    ///
+    /// This runs on every idle frame, so it must not clear `motion_cell`: the
+    /// dedupe is only reset when reporting actually stops or the pointer leaves
+    /// its cell.
+    fn lose_press(&mut self) {
+        self.reported.clear();
+        self.press_active = false;
+        self.press_shift_override = false;
+        self.deferred_release = false;
+        self.selecting = false;
+        self.press_owner = None;
+    }
+
+    /// Keeps a press whose release egui never saw alive, and marks its
+    /// mouse-up as owed. The write waits for the real release, focus loss, or
+    /// a new press; it must not happen merely because the pointer left.
+    ///
+    /// Only the reported press is deferred here. A local selection drag that
+    /// crosses the window edge keeps `selecting`, so it can still extend when
+    /// the pointer returns and finalize on the real release.
+    fn defer_lost_press(&mut self) {
+        if !self.reported.is_empty() {
+            self.deferred_release = true;
+        }
+    }
+
+    /// Records that the host saw a real button release.
+    ///
+    /// egui-winit drops `MouseInput` events while it has no pointer position,
+    /// so a drag released off the window never reaches [`Self::show`] and the
+    /// press latch would stick: the next click would be swallowed as a
+    /// selection, or every later hover would be encoded as a drag. The next
+    /// painted frame pays the mouse-up this button owes, if its press was
+    /// reported, and ends the press once no reported button is left.
+    ///
+    /// A local selection is not finalized here: it has no reported button, so
+    /// there is no mouse-up to pay, but its release frame never arrived either.
+    /// The hook remembers it and the next normal (non-reporting) frame ends the
+    /// selection and queues its copy-on-select text.
+    ///
+    /// Idempotent: a release already paid, or one with nothing tracked, writes
+    /// nothing.
+    pub fn host_release(&mut self, button: MouseButton) {
+        self.host_release_pending.insert(button);
+    }
+
+    /// Consumes host-observed releases: the mouse-ups still owed to the child
+    /// for the buttons the host reported or this view stopped tracking, with
+    /// the press bookkeeping ended.
+    ///
+    /// These bytes are bookkeeping, not new input, so the caller must not count
+    /// them as user action. Only a button whose press this view reported is
+    /// paid; releasing one button of a multi-button press leaves the others
+    /// tracked and the press alive. A primary release is proof that button is
+    /// up, so it also drops a scrollbar grab and the pointer ownership that
+    /// came with it. A selection being dragged is only finalized later, by the
+    /// next normal frame.
+    fn take_host_release(
+        &mut self,
+        fallback: (usize, usize),
+        mods: Mods,
+        grid: (usize, usize),
+    ) -> Vec<Vec<u8>> {
+        let pending = std::mem::take(&mut self.host_release_pending);
+        let owed = std::mem::take(&mut self.host_owed);
+        let primary = pending.contains(MouseButton::Left);
+        // A live local selection has no reported press, so the loop below has
+        // nothing to pay. Its release frame never arrived either, so flag it for
+        // the next normal frame to finalize.
+        if primary && self.selecting {
+            self.host_selection_release = true;
+        }
+        // The button is physically up, so a grab that froze its geometry can
+        // no longer follow the pointer, and a stale ownership would swallow
+        // the next grid click.
+        if primary {
+            self.scrollbar_grab = None;
+            self.press_owner = None;
+        }
+        // A pending release pays only a press this view reported; an owed one
+        // already lost its tracking, so it always pays. Keep the first order
+        // and pay each button once.
+        let mut pay: Vec<MouseButton> = Vec::new();
+        for button in pending.iter().chain(owed.iter()) {
+            if pay.contains(&button) {
+                continue;
+            }
+            if !owed.contains(button) && !self.reported.contains(button) {
+                continue;
+            }
+            pay.push(button);
+        }
+        let mut reports = Vec::new();
+        let mut paid = false;
+        for button in pay {
+            self.reported.remove(button);
+            self.deferred_release = false;
+            paid = true;
+            if self.modes.mouse_reporting {
+                let (row, col) = self
+                    .last_report
+                    .map(|cell| clamp_cell(cell, grid))
+                    .unwrap_or(fallback);
+                reports.push(encode_mouse(
+                    MousePhase::Release,
+                    button,
+                    col,
+                    row,
+                    mods,
+                    self.modes.sgr_mouse,
+                ));
+            }
+        }
+        if paid && self.reported.is_empty() {
+            self.end_press();
+        }
+        reports
+    }
+
+    /// Forgets a press when the window loses focus, even if no frame painted
+    /// the unfocused state.
+    ///
+    /// egui's `any_down` stays set across that gap, so a 1002/1003 child would
+    /// otherwise receive button-held motion on every later hover, and a live
+    /// selection drag would keep the autoscroll repaint loop running. Tracked
+    /// buttons move to the owed set, so the next painted pass pays their
+    /// mouse-up at the last reported cell. A local selection is left alone: it
+    /// has no reported press, and a later release still finalizes it.
+    ///
+    /// Idempotent: a second call has no tracked press left to move.
+    pub fn host_focus_lost(&mut self) {
+        for button in self.reported.iter() {
+            self.host_owed.insert(button);
+        }
+        self.reported.clear();
+        self.press_active = false;
+        self.press_shift_override = false;
+        self.deferred_release = false;
+        self.scrollbar_grab = None;
+        self.press_owner = None;
+    }
+
+    /// Finalizes a local selection whose real release the host saw but egui
+    /// never delivered.
+    ///
+    /// Only the normal (non-reporting) path owns a local selection, so a
+    /// reporting frame leaves it pending. Returns whether it finalized; the
+    /// pending flag is cleared first, so a second frame copies nothing.
+    fn finalize_host_selection(
+        &mut self,
+        normal_path: bool,
+        selection: Option<String>,
+        copy_on_select: bool,
+        actions: &mut Vec<TerminalAction>,
+    ) -> bool {
+        if !self.host_selection_release || !normal_path {
+            return false;
+        }
+        self.host_selection_release = false;
+        self.end_selection(selection, copy_on_select, actions);
+        self.end_press();
+        self.press_owner = None;
+        true
+    }
+
+    /// Writes the mouse-up a press lost outside the window still owes the
+    /// child, then leaves ending the press to the caller.
+    ///
+    /// Returns nothing on purpose: the bytes are owed bookkeeping, not new
+    /// input, so no caller can fold them into `input_sent`.
+    fn release_lost_press(
+        &self,
+        session: &Session,
+        fallback: (usize, usize),
+        mods: Mods,
+        grid: (usize, usize),
+    ) {
+        for report in self.lost_release_reports(fallback, mods, grid) {
+            session.write(&report);
+        }
+    }
+
+    /// Release reports due for a lost press, at the last reported cell clamped
+    /// into the live grid so a shrink cannot encode a cell outside it.
+    fn lost_release_reports(
+        &self,
+        fallback: (usize, usize),
+        mods: Mods,
+        grid: (usize, usize),
+    ) -> Vec<Vec<u8>> {
+        let last_cell = self.last_report.map(|cell| clamp_cell(cell, grid));
+        lost_release_reports(
+            self.modes.mouse_reporting,
+            &self.reported,
+            last_cell,
+            fallback,
+            mods,
+            self.modes.sgr_mouse,
+        )
+    }
+
+    /// Drops the hover dedupe when the window gained or lost focus, so the
+    /// cell under the pointer is re-reported on return.
+    fn observe_focus(&mut self, focused: bool) {
+        if self.observed_focus.is_some_and(|last| last != focused) {
+            self.clear_motion();
+        }
+        self.observed_focus = Some(focused);
+    }
+
+    /// Drops the hover dedupe when mouse reporting modes changed, so turning
+    /// tracking back on re-reports the cell under the pointer.
+    fn observe_mouse_modes(&mut self, modes: TermModes) {
+        let current = MouseModes::from_modes(modes);
+        if self.observed_mouse.is_some_and(|last| last != current) {
+            self.clear_motion();
+        }
+        self.observed_mouse = Some(current);
+    }
+
+    /// Hover motion for a cell with no modifiers; the tests' entry point.
+    #[cfg(test)]
+    fn motion_report(
+        &mut self,
+        col: usize,
+        row: usize,
+        button: Option<MouseButton>,
+    ) -> Option<Vec<u8>> {
+        self.motion_report_with(col, row, button, Mods::default())
+    }
+
+    /// Encodes one xterm motion report, or `None` when the child did not ask
+    /// for motion on this cell.
+    ///
+    /// Mode 1003 reports every move, with or without a held button; mode 1002
+    /// reports only while a button is down. Click-only mode (1000) never gets
+    /// motion, and Shift suppresses it only while no press was reported. A cell
+    /// already reported with the same button and ctrl/alt/shift state is not
+    /// reported again until the pointer leaves it or those modifiers change.
+    fn motion_report_with(
+        &mut self,
+        col: usize,
+        row: usize,
+        button: Option<MouseButton>,
+        mods: Mods,
+    ) -> Option<Vec<u8>> {
+        let wanted = self.modes.mouse_motion || (self.modes.mouse_drag && button.is_some());
+        let held = !self.reported.is_empty();
+        let shift = shift_blocks_motion(mods.shift, self.press_shift_override, held);
+        if !self.modes.mouse_reporting || shift || !wanted {
+            self.motion_cell = None;
+            return None;
+        }
+        let button = button.unwrap_or(MouseButton::None);
+        let key = ((col, row), button, mods.ctrl, mods.alt, mods.shift);
+        if self.motion_cell == Some(key) {
+            return None;
+        }
+        self.motion_cell = Some(key);
+        self.last_report = Some((row, col));
+        Some(encode_mouse(
+            MousePhase::Motion,
+            button,
+            col,
+            row,
+            mods,
+            self.modes.sgr_mouse,
+        ))
+    }
+
+    /// Motion report for a pointer position.
+    ///
+    /// A tracked button means a drag: the pointer may leave the grid through
+    /// the padding gutter, so the position clamps to the nearest cell and the
+    /// report keeps flowing. Button-less hover uses the unclamped mapping,
+    /// because the gutter is not a cell and must write nothing instead of
+    /// reporting an edge cell.
+    fn motion_report_at(
+        &mut self,
+        pos: Pos2,
+        rect: Rect,
+        metrics: &CellMetrics,
+        grid: (usize, usize),
+        button: Option<MouseButton>,
+        mods: Mods,
+    ) -> Option<Vec<u8>> {
+        let mapped = if button.is_some() {
+            Self::cell_at_clamped(pos, rect, metrics, grid)
+        } else {
+            Self::cell_at(pos, rect, metrics, grid)
+        };
+        match mapped {
+            Some((row, col)) => self.motion_report_with(col, row, button, mods),
+            None => {
+                self.clear_motion();
+                None
+            }
+        }
+    }
+
+    /// Returns `(input_sent, motion_sent)`: non-motion bytes written to the
+    /// child (press, release, wheel), and whether a hover/drag motion report was
+    /// written. Motion must not count as user action.
     #[allow(clippy::too_many_arguments)]
     fn handle_mouse(
         &mut self,
@@ -1177,109 +1953,121 @@ impl TerminalView {
         grid: (usize, usize),
         pos: Pos2,
         mods: &Modifiers,
+        focused: bool,
         copy_on_select: bool,
         actions: &mut Vec<TerminalAction>,
-    ) -> bool {
+    ) -> (bool, bool) {
         let cell = Self::cell_at(pos, grid_rect, metrics, grid);
-        let mouse_mode = self.modes.mouse_reporting && !mods.shift;
+        // Shift latched at press time keeps a selection drag from flipping
+        // into reporting when Shift is released before the button, while a
+        // press that was already reported still delivers its release.
+        let mouse_mode = self.mouse_mode(mods.shift);
         let mouse_mods = Mods {
             ctrl: mods.ctrl,
             alt: mods.alt,
             shift: mods.shift,
         };
-        let mut wrote = false;
+        let pointer = ui.input(|input| {
+            let pointer = &input.pointer;
+            PointerFrame {
+                primary_pressed: pointer.button_pressed(PointerButton::Primary),
+                middle_pressed: pointer.button_pressed(PointerButton::Middle),
+                secondary_pressed: pointer.button_pressed(PointerButton::Secondary),
+                primary_released: pointer.button_released(PointerButton::Primary),
+                middle_released: pointer.button_released(PointerButton::Middle),
+                secondary_released: pointer.button_released(PointerButton::Secondary),
+                any_pressed: pointer.any_pressed(),
+                any_released: pointer.any_released(),
+                any_down: pointer.any_down(),
+            }
+        });
+        let mut input_sent = false;
+        let mut motion_sent = false;
 
         if mouse_mode {
+            // Click-only reporting has nothing to do on a frame without a
+            // press or release, so skip the coordinate work entirely.
+            if !self.modes.mouse_motion
+                && !self.modes.mouse_drag
+                && !pointer.any_pressed
+                && !pointer.any_released
+            {
+                self.clear_motion();
+                self.selecting = false;
+                return (false, false);
+            }
             // `encode_mouse` takes zero-based coordinates and emits xterm's
             // one-based `col;row` payload.
             let Some((row, col)) = Self::cell_at_clamped(pos, grid_rect, metrics, grid) else {
-                return false;
+                return (false, false);
             };
             let sgr = self.modes.sgr_mouse;
-            if ui.input(|input| input.pointer.button_pressed(PointerButton::Primary)) {
+            for button in mouse_presses(pointer) {
                 session.write(&encode_mouse(
                     MousePhase::Press,
-                    MouseButton::Left,
+                    button,
                     col,
                     row,
                     mouse_mods,
                     sgr,
                 ));
-                wrote = true;
+                self.begin_press(Some(button), mods.shift);
+                self.last_report = Some((row, col));
+                input_sent = true;
             }
-            if ui.input(|input| input.pointer.button_pressed(PointerButton::Middle)) {
-                session.write(&encode_mouse(
-                    MousePhase::Press,
-                    MouseButton::Middle,
-                    col,
-                    row,
-                    mouse_mods,
-                    sgr,
-                ));
-                wrote = true;
-            }
-            if ui.input(|input| input.pointer.button_pressed(PointerButton::Secondary)) {
-                session.write(&encode_mouse(
-                    MousePhase::Press,
-                    MouseButton::Right,
-                    col,
-                    row,
-                    mouse_mods,
-                    sgr,
-                ));
-                wrote = true;
-            }
-            if ui.input(|input| input.pointer.button_released(PointerButton::Primary)) {
+            // Each released button gets its own mouse-up, but only when this
+            // view reported its press: a release that egui owned elsewhere
+            // (scrollbar drag, another tab) must not reach the child. The
+            // press survives while another reported button is still down.
+            for button in tracked_releases(&mut self.reported, pointer) {
                 session.write(&encode_mouse(
                     MousePhase::Release,
-                    MouseButton::Left,
+                    button,
                     col,
                     row,
                     mouse_mods,
                     sgr,
                 ));
-                wrote = true;
+                self.last_report = Some((row, col));
+                input_sent = true;
             }
-            if ui.input(|input| input.pointer.button_released(PointerButton::Middle)) {
-                session.write(&encode_mouse(
-                    MousePhase::Release,
-                    MouseButton::Middle,
-                    col,
-                    row,
-                    mouse_mods,
-                    sgr,
-                ));
-                wrote = true;
+            if !self.reported.is_empty() && press_ended(&self.reported, pointer.any_down) {
+                self.end_press();
             }
-            if ui.input(|input| input.pointer.button_released(PointerButton::Secondary)) {
-                session.write(&encode_mouse(
-                    MousePhase::Release,
-                    MouseButton::Right,
-                    col,
-                    row,
+            // Press and release frames already carried the button state, so
+            // they must not also emit a motion report. Every other frame may
+            // move the pointer: 1003 reports hover, 1002 reports a drag.
+            if pointer.any_pressed || pointer.any_released {
+                self.clear_motion();
+            } else if motion_allowed(focused, !self.reported.is_empty())
+                && let Some(report) = self.motion_report_at(
+                    pos,
+                    grid_rect,
+                    metrics,
+                    grid,
+                    self.reported.latest(),
                     mouse_mods,
-                    sgr,
-                ));
-                wrote = true;
-            }
-            if response.dragged_by(PointerButton::Primary) {
-                session.write(&encode_mouse(
-                    MousePhase::Motion,
-                    MouseButton::Left,
-                    col,
-                    row,
-                    mouse_mods,
-                    sgr,
-                ));
-                wrote = true;
+                )
+            {
+                session.write(&report);
+                motion_sent = true;
             }
             self.selecting = false;
-            return wrote;
+            return (input_sent, motion_sent);
         }
 
-        let primary_pressed =
-            ui.input(|input| input.pointer.button_pressed(PointerButton::Primary));
+        // Selection and links take over whenever the child is not getting
+        // mouse reports; a remembered motion cell would be stale by the time
+        // reporting resumes. The press latch itself is cleared by `show` when
+        // the press ends.
+        self.clear_motion();
+        if !self.modes.mouse_reporting {
+            self.end_press();
+        }
+
+        let primary_pressed = pointer.primary_pressed;
         if primary_pressed {
+            self.begin_press(None, mods.shift);
             let ctrl = mods.ctrl || mods.command;
             let link = cell.and_then(|(row, col)| {
                 let text = row_texts.get(row)?;
@@ -1287,7 +2075,7 @@ impl TerminalView {
             });
             if ctrl && link.is_some() {
                 self.selecting = false;
-                return false;
+                return (false, false);
             }
             if let Some((row, col)) = cell {
                 let now = ui.input(|input| input.time);
@@ -1314,8 +2102,7 @@ impl TerminalView {
             session.selection_update(col, row, side);
         }
 
-        let primary_released =
-            ui.input(|input| input.pointer.button_released(PointerButton::Primary));
+        let primary_released = pointer.primary_released;
         if self.selecting && primary_released {
             if let Some(pos) = response.interact_pointer_pos()
                 && let Some((row, col)) = Self::cell_at_clamped(pos, grid_rect, metrics, grid)
@@ -1323,15 +2110,29 @@ impl TerminalView {
                 let cell_rect = cell_rect(grid_rect.min, metrics, row, col);
                 session.selection_update(col, row, side_at(pos, cell_rect, metrics));
             }
-            self.selecting = false;
-            if let Some(text) = session.selection_to_string() {
-                let text = trim_selection(&text);
-                if copy_on_select && !text.is_empty() {
-                    actions.push(TerminalAction::Copy(text));
-                }
+            self.end_selection(session.selection_to_string(), copy_on_select, actions);
+        }
+        (false, false)
+    }
+
+    /// Ends a live local selection after its release and queues the
+    /// copy-on-select action for its text.
+    ///
+    /// Split out of [`Self::handle_mouse`] so a test can finalize a drag that
+    /// the host repaired before egui saw its release.
+    fn end_selection(
+        &mut self,
+        selection: Option<String>,
+        copy_on_select: bool,
+        actions: &mut Vec<TerminalAction>,
+    ) {
+        self.selecting = false;
+        if let Some(text) = selection {
+            let text = trim_selection(&text);
+            if copy_on_select && !text.is_empty() {
+                actions.push(TerminalAction::Copy(text));
             }
         }
-        false
     }
 
     fn click_count(&mut self, now: f64, pos: Pos2) -> u8 {
@@ -1348,18 +2149,103 @@ impl TerminalView {
         self.modes.mouse_reporting
     }
 
+    /// Whether the child gets mouse reports this frame, given the raw Shift
+    /// state: Shift bypasses reporting unless a press this view reported is
+    /// still held, and the Shift latched at press time keeps a local selection
+    /// out of reporting after Shift is released.
+    fn mouse_mode(&self, shift: bool) -> bool {
+        reports_mouse(
+            self.modes.mouse_reporting,
+            shift || self.press_shift_override,
+            !self.reported.is_empty(),
+        )
+    }
+
+    /// Whether a Ctrl hover over a link should show the pointing hand.
+    ///
+    /// This is exactly the view's own condition, so the app's gate and the
+    /// painted cursor icon cannot disagree. The caller still has to check that
+    /// the pointer is over a link; this only answers the mouse-mode half.
+    pub fn link_hover_wanted(&self, ctrl: bool, shift: bool) -> bool {
+        ctrl && !self.mouse_mode(shift)
+    }
+
+    /// Whether the last painted frame had scrollback, i.e. whether a scrollbar
+    /// exists. The app's repaint gate uses this instead of building a second
+    /// snapshot every frame.
+    pub fn has_scrollback(&self) -> bool {
+        self.scrollback
+    }
+
+    /// Records the snapshot's history size for [`Self::has_scrollback`].
+    fn record_scrollback(&mut self, history: usize) {
+        self.scrollback = history > 0;
+    }
+
+    /// Whether the child asked for hover motion (DECSET 1003) in the most
+    /// recent frame.
+    ///
+    /// Drag-only mode (1002) writes nothing on a button-less move, so it must
+    /// not ask the app to repaint for cursor movement. Its reports during a
+    /// press are covered by the app's pointer-down escape hatch.
+    pub fn wants_motion(&self) -> bool {
+        self.modes.mouse_reporting && self.modes.mouse_motion
+    }
+
+    /// Whether a pointer move to `pos` could write a motion report this frame.
+    ///
+    /// The app's repaint gate uses this so a move that would be deduped, land
+    /// outside the grid, or hit a click-only child does not force a paint.
+    /// Geometry comes from the last painted frame; before any frame recorded
+    /// it, the caller paints.
+    pub fn motion_wanted_at(&self, pos: egui::Pos2) -> bool {
+        let (Some(rect), Some(metrics), Some(grid)) =
+            (self.grid_rect, self.grid_metrics, self.grid_cells)
+        else {
+            return true;
+        };
+        let held = !self.reported.is_empty();
+        let wanted = self.modes.mouse_reporting
+            && (self.modes.mouse_motion || (self.modes.mouse_drag && held));
+        if !wanted || shift_blocks_motion(self.last_mods.shift, self.press_shift_override, held) {
+            return false;
+        }
+        // A held reported button is a drag, and the report path clamps through
+        // the padding gutter, so the gate must clamp the same way or a repaint
+        // would be skipped even though a paint would write.
+        let mapped = if held {
+            Self::cell_at_clamped(pos, rect, &metrics, grid)
+        } else {
+            Self::cell_at(pos, rect, &metrics, grid)
+        };
+        let Some((row, col)) = mapped else {
+            return false;
+        };
+        let button = self.reported.latest().unwrap_or(MouseButton::None);
+        let key = (
+            (col, row),
+            button,
+            self.last_mods.ctrl,
+            self.last_mods.alt,
+            self.last_mods.shift,
+        );
+        self.motion_cell != Some(key)
+    }
+
     /// Encode keyboard, text, IME, and paste events into PTY bytes.
     ///
     /// `modes` must be read from the live session in the same frame
     /// ([`Session::term_modes`]): the app encodes input before it builds the
     /// snapshot, so a mode change in this frame is already visible here. The app
     /// filters its global shortcuts first and calls this only when no overlay
-    /// wants the keyboard.
+    /// wants the keyboard. `shift_enter_newline` comes from
+    /// [`Config::shift_enter_newline`]: when false, Shift+Enter sends a plain CR.
     pub fn encode_input(
         &self,
         events: &[Event],
         modifiers: Modifiers,
         modes: TermModes,
+        shift_enter_newline: bool,
     ) -> Option<Vec<u8>> {
         let has_text = events
             .iter()
@@ -1367,6 +2253,7 @@ impl TerminalView {
         let modes = KeyModes {
             app_cursor: modes.app_cursor,
             bracketed_paste: modes.bracketed_paste,
+            shift_enter_newline,
         };
         let mut bytes = Vec::new();
 
@@ -2680,6 +3567,1061 @@ mod tests {
         assert!(wheel_reports(0, 0, 0, mods, true).is_empty());
     }
 
+    fn motion_modes(motion: bool, drag: bool) -> TermModes {
+        TermModes {
+            mouse_reporting: true,
+            mouse_motion: motion,
+            mouse_drag: drag,
+            sgr_mouse: true,
+            ..TermModes::default()
+        }
+    }
+
+    #[test]
+    fn motion_reports_only_in_motion_mode() {
+        let mut view = TerminalView {
+            modes: TermModes {
+                mouse_reporting: true,
+                mouse_motion: true,
+                sgr_mouse: true,
+                ..TermModes::default()
+            },
+            ..TerminalView::default()
+        };
+        assert_eq!(
+            view.motion_report(3, 1, None).as_deref(),
+            Some(b"\x1b[<35;4;2M".as_slice())
+        );
+        assert_eq!(view.motion_report(3, 1, None), None);
+        view.modes = TermModes {
+            mouse_reporting: true,
+            sgr_mouse: true,
+            ..TermModes::default()
+        };
+        assert_eq!(view.motion_report(5, 1, None), None);
+    }
+
+    #[test]
+    fn drag_motion_needs_drag_mode() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, false),
+            ..TerminalView::default()
+        };
+        assert_eq!(view.motion_report(3, 1, Some(MouseButton::Left)), None);
+
+        view.modes = motion_modes(false, true);
+        assert_eq!(
+            view.motion_report(3, 1, Some(MouseButton::Left)).as_deref(),
+            Some(b"\x1b[<32;4;2M".as_slice())
+        );
+        // 1002 still has no button-less hover motion.
+        assert_eq!(view.motion_report(5, 1, None), None);
+    }
+
+    #[test]
+    fn motion_with_button_uses_that_button() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert_eq!(
+            view.motion_report(0, 0, Some(MouseButton::Left)).as_deref(),
+            Some(b"\x1b[<32;1;1M".as_slice())
+        );
+        assert_eq!(
+            view.motion_report(0, 0, Some(MouseButton::Middle))
+                .as_deref(),
+            Some(b"\x1b[<33;1;1M".as_slice())
+        );
+        assert_eq!(
+            view.motion_report(0, 0, Some(MouseButton::Right))
+                .as_deref(),
+            Some(b"\x1b[<34;1;1M".as_slice())
+        );
+    }
+
+    #[test]
+    fn motion_cleared_on_release_and_mode_off() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert!(view.motion_report(3, 1, None).is_some());
+        assert_eq!(view.motion_report(3, 1, None), None);
+        // A release forgets the cell, so the next move re-reports it.
+        view.clear_motion();
+        assert!(view.motion_report(3, 1, None).is_some());
+        // Reporting off clears the memory; turning it back on re-reports.
+        view.modes.mouse_reporting = false;
+        assert_eq!(view.motion_report(3, 1, None), None);
+        view.modes.mouse_reporting = true;
+        assert!(view.motion_report(3, 1, None).is_some());
+    }
+
+    #[test]
+    fn shift_overrides_reporting() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        assert_eq!(view.motion_report_with(3, 1, None, shift), None);
+        // The override did not remember the cell as reported.
+        assert!(view.motion_report(3, 1, None).is_some());
+    }
+
+    #[test]
+    fn wants_motion_needs_reporting_and_a_motion_mode() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert!(view.wants_motion());
+        // Drag-only mode writes nothing on a button-less hover.
+        view.modes = motion_modes(false, true);
+        assert!(!view.wants_motion());
+        view.modes = motion_modes(false, false);
+        assert!(!view.wants_motion());
+        view.modes = motion_modes(true, false);
+        view.modes.mouse_reporting = false;
+        assert!(!view.wants_motion());
+    }
+
+    #[test]
+    fn lost_press_keeps_the_motion_dedupe() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert!(view.motion_report(3, 1, None).is_some());
+        // State of a press that is still pending when the idle frame arrives.
+        view.reported.insert(MouseButton::Left);
+        view.press_shift_override = true;
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        // The press-loss path runs on every frame with no button down; it must
+        // drop the press but keep the reported cell.
+        view.lose_press();
+        assert!(view.reported.is_empty());
+        assert!(!view.press_shift_override);
+        assert!(!view.selecting);
+        assert_eq!(view.press_owner, None);
+        // A stationary pointer stays deduped instead of re-reporting per frame.
+        assert_eq!(view.motion_report(3, 1, None), None);
+        // Moving to another cell still reports.
+        assert!(view.motion_report(4, 1, None).is_some());
+    }
+
+    #[test]
+    fn shift_after_a_reported_press_still_releases() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        let reporting = view.modes.mouse_reporting;
+        // A press that starts without Shift is reported and tracked.
+        let presses = mouse_presses(PointerFrame {
+            primary_pressed: true,
+            any_pressed: true,
+            ..PointerFrame::default()
+        });
+        assert_eq!(presses, vec![MouseButton::Left]);
+        assert!(reports_mouse(reporting, false, !view.reported.is_empty()));
+        for button in presses {
+            view.begin_press(Some(button), false);
+        }
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+        // Shift goes down mid-drag: the press keeps owning reporting.
+        assert!(reports_mouse(reporting, true, !view.reported.is_empty()));
+        // Release with Shift still held: exactly one release, no leak.
+        let releases = mouse_releases(PointerFrame {
+            primary_released: true,
+            any_released: true,
+            ..PointerFrame::default()
+        });
+        assert_eq!(releases, vec![MouseButton::Left]);
+        for button in releases {
+            view.reported.remove(button);
+        }
+        if !view.reported.is_empty() && press_ended(&view.reported, false) {
+            view.end_press();
+        }
+        assert!(view.reported.is_empty());
+        // A leaked button would make this button-less hover look like a drag.
+        assert_eq!(view.motion_report(3, 1, None), None);
+        // A press that starts with Shift held never reports.
+        view.begin_press(None, true);
+        assert!(view.reported.is_empty());
+        assert!(!reports_mouse(reporting, true, !view.reported.is_empty()));
+    }
+
+    #[test]
+    fn drag_motion_clamps_through_the_gutter() {
+        let rect = Rect::from_min_size(pos2(8.0, 16.0), vec2(90.0, 36.0));
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        let mods = Mods::default();
+        // A drag that leaves the grid keeps reporting the nearest cell.
+        assert_eq!(
+            view.motion_report_at(
+                pos2(5.0, 20.0),
+                rect,
+                &metrics(),
+                (10, 2),
+                Some(MouseButton::Left),
+                mods
+            )
+            .as_deref(),
+            Some(b"\x1b[<32;1;1M".as_slice())
+        );
+        // Button-less hover in the same gutter is not a cell.
+        view.clear_motion();
+        assert_eq!(
+            view.motion_report_at(pos2(5.0, 20.0), rect, &metrics(), (10, 2), None, mods),
+            None
+        );
+    }
+
+    #[test]
+    fn unfocused_window_reports_drag_but_not_hover() {
+        assert!(motion_allowed(true, false));
+        assert!(motion_allowed(true, true));
+        assert!(motion_allowed(false, true));
+        assert!(!motion_allowed(false, false));
+    }
+
+    #[test]
+    fn pointer_loss_reports_one_release_and_clears_the_press() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        view.last_report = Some((4, 2));
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+        // PointerGone arrives with no release event; the press still owes one.
+        let reports = view.lost_release_reports((0, 0), Mods::default(), (10, 5));
+        assert_eq!(reports, vec![b"\x1b[<0;3;5m".to_vec()]);
+        view.lose_press();
+        assert!(view.reported.is_empty());
+        assert_eq!(view.reported.latest(), None);
+        // A second loss frame writes nothing.
+        assert!(
+            view.lost_release_reports((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn lost_release_falls_back_to_the_clamped_cell() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Right), false);
+        // Nothing was reported yet, so the clamped cell under the pointer wins.
+        assert_eq!(
+            view.lost_release_reports((3, 0), Mods::default(), (10, 4)),
+            vec![b"\x1b[<2;1;4m".to_vec()]
+        );
+        // Reporting off means the child is no longer listening.
+        view.modes.mouse_reporting = false;
+        assert!(
+            view.lost_release_reports((3, 0), Mods::default(), (10, 4))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn shift_latch_suppresses_until_the_press_ends() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // Press starts with Shift held: a selection, not a report.
+        view.begin_press(None, true);
+        let button = view.reported.latest();
+        // Shift is released while the same press continues.
+        assert_eq!(view.motion_report_with(3, 1, button, Mods::default()), None);
+        let button = view.reported.latest();
+        assert_eq!(view.motion_report_with(3, 1, button, Mods::default()), None);
+        view.end_press();
+        // A fresh press without Shift reports normally.
+        view.begin_press(Some(MouseButton::Left), false);
+        let button = view.reported.latest();
+        assert_eq!(
+            view.motion_report_with(3, 1, button, Mods::default())
+                .as_deref(),
+            Some(b"\x1b[<32;4;2M".as_slice())
+        );
+    }
+
+    #[test]
+    fn shift_after_a_reported_press_keeps_motion_flowing() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        // Shift went down after the press was reported: the drag must not stall.
+        assert_eq!(
+            view.motion_report_with(3, 1, view.reported.latest(), shift)
+                .as_deref(),
+            Some(b"\x1b[<36;4;2M".as_slice())
+        );
+        // The opposite direction: a press that started with Shift never reports,
+        // even after Shift is released.
+        view.end_press();
+        view.begin_press(None, true);
+        assert_eq!(view.motion_report_with(3, 1, None, Mods::default()), None);
+    }
+
+    #[test]
+    fn shift_blocks_motion_only_without_a_reported_press() {
+        // Shift held with no reported press blocks.
+        assert!(shift_blocks_motion(true, false, false));
+        // No Shift, no latch: motion flows.
+        assert!(!shift_blocks_motion(false, false, false));
+        // The latch blocks a press that began with Shift.
+        assert!(shift_blocks_motion(false, true, false));
+        // A reported press keeps reporting, with or without Shift.
+        assert!(!shift_blocks_motion(true, false, true));
+        assert!(!shift_blocks_motion(false, true, true));
+    }
+
+    #[test]
+    fn shift_release_mid_selection_keeps_reporting_off() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // The press began with Shift, so it is a local selection.
+        view.begin_press(None, true);
+        // Shift is now released; the latch keeps the shared predicate false.
+        let shift = false || view.press_shift_override;
+        assert!(!reports_mouse(
+            view.modes.mouse_reporting,
+            shift,
+            !view.reported.is_empty()
+        ));
+    }
+
+    #[test]
+    fn tracked_buttons_keep_a_press_alive_until_all_are_up() {
+        let mut reported = ReportedButtons::default();
+        reported.insert(MouseButton::Left);
+        reported.insert(MouseButton::Right);
+        // A repeated press does not duplicate the button.
+        reported.insert(MouseButton::Right);
+        // The newest press is the drag button.
+        assert_eq!(reported.latest(), Some(MouseButton::Right));
+        // The Right release leaves Left down: exactly one release, press alive.
+        let releases = mouse_releases(PointerFrame {
+            secondary_released: true,
+            any_released: true,
+            any_down: true,
+            ..PointerFrame::default()
+        });
+        assert_eq!(releases, vec![MouseButton::Right]);
+        assert!(reported.remove(releases[0]));
+        assert_eq!(reported.latest(), Some(MouseButton::Left));
+        assert!(!press_ended(&reported, true));
+        // The Left release ends it.
+        assert!(reported.remove(MouseButton::Left));
+        assert!(reported.is_empty());
+        assert!(press_ended(&reported, true));
+        // A stale per-button array cannot latch: any_down false ends it.
+        reported.insert(MouseButton::Left);
+        assert!(press_ended(&reported, false));
+        // Removing an untracked button changes nothing.
+        assert!(!reported.remove(MouseButton::Middle));
+        assert_eq!(reported.latest(), Some(MouseButton::Left));
+        reported.clear();
+        assert!(reported.is_empty());
+    }
+
+    #[test]
+    fn partial_release_keeps_the_drag_on_the_held_button() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        // Left then Right, both reported, newest last.
+        view.begin_press(Some(MouseButton::Left), false);
+        view.begin_press(Some(MouseButton::Right), false);
+        assert_eq!(view.reported.latest(), Some(MouseButton::Right));
+        // Right comes up while Left is still down: one release, press alive.
+        let releases = mouse_releases(PointerFrame {
+            secondary_released: true,
+            any_released: true,
+            any_down: true,
+            ..PointerFrame::default()
+        });
+        assert_eq!(releases, vec![MouseButton::Right]);
+        assert!(view.reported.remove(MouseButton::Right));
+        assert!(!press_ended(&view.reported, true));
+        // A partial release must not clear the press: drag motion is still
+        // attributed to the held Left button.
+        assert_eq!(
+            view.motion_report_with(2, 1, view.reported.latest(), Mods::default())
+                .as_deref(),
+            Some(b"\x1b[<32;3;2M".as_slice())
+        );
+        // Left coming up ends the press.
+        assert!(view.reported.remove(MouseButton::Left));
+        assert!(press_ended(&view.reported, true));
+        view.end_press();
+        assert!(view.reported.is_empty());
+        assert!(!view.press_active);
+    }
+
+    #[test]
+    fn pointer_loss_defers_the_release_to_the_real_one() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        view.last_report = Some((2, 3));
+        // The button is still down and the window is focused: defer the write.
+        assert!(defers_release(true, true));
+        view.defer_lost_press();
+        assert!(view.deferred_release);
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+        // Focus loss, or the button coming up, writes immediately instead.
+        assert!(!defers_release(true, false));
+        assert!(!defers_release(false, true));
+        // The pointer returns and the real release is seen once; nothing is
+        // left owed at the stale reported cell.
+        let releases = mouse_releases(PointerFrame {
+            primary_released: true,
+            any_released: true,
+            any_down: false,
+            ..PointerFrame::default()
+        });
+        assert_eq!(releases, vec![MouseButton::Left]);
+        for button in releases {
+            assert!(view.reported.remove(button));
+        }
+        assert!(
+            view.lost_release_reports((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        view.lose_press();
+        assert!(!view.deferred_release);
+        assert!(view.reported.is_empty());
+    }
+
+    #[test]
+    fn release_without_a_reported_press_writes_nothing() {
+        let mut reported = ReportedButtons::default();
+        let frame = PointerFrame {
+            primary_released: true,
+            any_released: true,
+            ..PointerFrame::default()
+        };
+        // Press owned by the scrollbar thumb, or by another tab: egui still
+        // reports the button coming up, but this view never told the child.
+        assert!(tracked_releases(&mut reported, frame).is_empty());
+        // A press this view did report gets exactly one matching mouse-up.
+        reported.insert(MouseButton::Left);
+        assert_eq!(
+            tracked_releases(&mut reported, frame),
+            vec![MouseButton::Left]
+        );
+        assert!(reported.is_empty());
+        // A duplicate release frame cannot write a second, orphan mouse-up.
+        assert!(tracked_releases(&mut reported, frame).is_empty());
+        // Two buttons down: only the one that comes up is written.
+        reported.insert(MouseButton::Left);
+        reported.insert(MouseButton::Right);
+        let frame = PointerFrame {
+            secondary_released: true,
+            any_released: true,
+            any_down: true,
+            ..PointerFrame::default()
+        };
+        assert_eq!(
+            tracked_releases(&mut reported, frame),
+            vec![MouseButton::Right]
+        );
+        assert_eq!(reported.latest(), Some(MouseButton::Left));
+    }
+
+    #[test]
+    fn host_release_pays_the_owed_mouse_up_once() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // Shift+drag that left the window: the press is reported and its
+        // release never arrived, so it is deferred and the latch is set.
+        view.begin_press(Some(MouseButton::Left), true);
+        view.last_report = Some((2, 3));
+        view.defer_lost_press();
+        view.scrollbar_grab = Some(ScrollbarGrab {
+            grab: 0.0,
+            track_top: 0.0,
+            track_height: 10.0,
+            thumb_height: 4.0,
+            history: 10,
+        });
+        assert!(view.deferred_release);
+        assert!(view.press_active);
+        assert!(view.press_shift_override);
+        view.press_owner = Some(PressOwner::Scrollbar);
+        // The host saw the release: the next painted pass pays one mouse-up at
+        // the last reported cell and ends the press.
+        view.host_release(MouseButton::Left);
+        let reports = view.take_host_release((0, 0), Mods::default(), (10, 5));
+        assert_eq!(reports, vec![b"\x1b[<0;4;3m".to_vec()]);
+        assert!(view.reported.is_empty());
+        assert!(!view.press_active);
+        assert!(!view.press_shift_override);
+        assert!(!view.deferred_release);
+        // A primary host release proves the button is up: the grab and its
+        // pointer ownership cannot outlive it.
+        assert!(view.scrollbar_grab.is_none());
+        assert_eq!(view.press_owner, None);
+        // Idempotent: a second release has nothing left to pay.
+        view.host_release(MouseButton::Left);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        assert!(view.reported.is_empty());
+        // A release with no host event pending writes nothing at all.
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_release_ends_a_press_that_was_never_deferred() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Right), false);
+        // Still reported, nothing deferred: the host release is the only sign
+        // the button came up, so the child still gets its mouse-up.
+        assert!(!view.deferred_release);
+        view.host_release(MouseButton::Right);
+        assert_eq!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5)),
+            vec![b"\x1b[<2;1;1m".to_vec()]
+        );
+        assert!(view.reported.is_empty());
+        assert!(!view.press_active);
+    }
+
+    #[test]
+    fn host_release_finalizes_a_live_selection_and_copies() {
+        let mut view = TerminalView::default();
+        // A local drag: press, then a selection that is still live. Nothing was
+        // reported, so the host hook has no mouse-up to pay.
+        view.begin_press(None, false);
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        view.host_release(MouseButton::Left);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        // The press hook must not kill the drag the release frame finalizes. The
+        // primary release does drop the pointer ownership it held.
+        assert!(view.selecting);
+        assert_eq!(view.press_owner, None);
+        let mut actions = Vec::new();
+        view.end_selection(Some("copied".to_owned()), true, &mut actions);
+        assert!(!view.selecting);
+        assert_eq!(actions, vec![TerminalAction::Copy("copied".to_owned())]);
+        // Copy-on-select off, or an empty selection, queues nothing.
+        let mut actions = Vec::new();
+        view.end_selection(Some("copied".to_owned()), false, &mut actions);
+        view.end_selection(Some("   ".to_owned()), true, &mut actions);
+        view.end_selection(None, true, &mut actions);
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn host_release_finalizes_a_selection_without_a_reported_press() {
+        let mut view = TerminalView::default();
+        // A plain drag-select: no press ever reached the child, so nothing is
+        // tracked and the host hook has no mouse-up to pay.
+        view.begin_press(None, false);
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        // A non-primary host release belongs to no selection.
+        view.host_release(MouseButton::Middle);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        assert!(!view.host_selection_release);
+        assert!(view.selecting);
+        view.host_release(MouseButton::Left);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        // The hook must not kill the drag that the next frame finalizes, but the
+        // primary release does end the ownership it held.
+        assert!(view.selecting);
+        assert_eq!(view.press_owner, None);
+        assert!(view.host_selection_release);
+        // A reporting frame does not own the selection and leaves it alone.
+        let mut actions = Vec::new();
+        assert!(!view.finalize_host_selection(
+            false,
+            Some("copied".to_owned()),
+            true,
+            &mut actions
+        ));
+        assert!(actions.is_empty());
+        assert!(view.selecting);
+        assert!(view.host_selection_release);
+        // The next normal frame finalizes the selection and copies it.
+        assert!(view.finalize_host_selection(true, Some("copied".to_owned()), true, &mut actions));
+        assert_eq!(actions, vec![TerminalAction::Copy("copied".to_owned())]);
+        assert!(!view.selecting);
+        assert!(view.press_owner.is_none());
+        assert!(!view.press_active);
+        assert!(!view.host_selection_release);
+        // Idempotent: a second frame has nothing left to finalize or copy.
+        assert!(!view.finalize_host_selection(true, Some("copied".to_owned()), true, &mut actions));
+        assert_eq!(actions, vec![TerminalAction::Copy("copied".to_owned())]);
+    }
+
+    #[test]
+    fn a_new_press_pays_a_deferred_release_first() {
+        // Nothing owed, or no press this frame: nothing is paid early.
+        assert!(!pays_deferred_release(false, true));
+        assert!(!pays_deferred_release(true, false));
+        // A frame that carries a press and a release still pays the owed
+        // mouse-up first, so the child never sees two downs in a row.
+        assert!(pays_deferred_release(true, true));
+    }
+
+    #[test]
+    fn scrollback_state_is_recorded_for_the_gate() {
+        let mut view = TerminalView::default();
+        assert!(!view.has_scrollback());
+        view.record_scrollback(0);
+        assert!(!view.has_scrollback());
+        view.record_scrollback(12);
+        assert!(view.has_scrollback());
+        // A session that drops its history clears the flag again.
+        view.record_scrollback(0);
+        assert!(!view.has_scrollback());
+    }
+
+    #[test]
+    fn host_release_spends_only_its_own_button() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // Left drag with a second Right press on top of it.
+        view.begin_press(Some(MouseButton::Left), false);
+        view.begin_press(Some(MouseButton::Right), false);
+        view.last_report = Some((1, 2));
+        // Releasing Right must not write the Left mouse-up too.
+        view.host_release(MouseButton::Right);
+        assert_eq!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5)),
+            vec![b"\x1b[<2;3;2m".to_vec()]
+        );
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+        assert!(view.press_active);
+        // A button the host released but this view never reported writes
+        // nothing and changes nothing.
+        view.host_release(MouseButton::Middle);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+    }
+
+    #[test]
+    fn host_release_without_reporting_drops_the_bookkeeping() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        // The child stopped listening: nothing is due, but the press must not
+        // latch forever.
+        view.modes.mouse_reporting = false;
+        view.host_release(MouseButton::Left);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        assert!(view.reported.is_empty());
+        assert!(!view.press_active);
+    }
+
+    #[test]
+    fn deferred_pointer_loss_keeps_the_selection_alive() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        view.defer_lost_press();
+        assert!(view.deferred_release);
+        assert_eq!(view.reported.latest(), Some(MouseButton::Left));
+        // A selection that crosses the window edge must still extend.
+        assert!(view.selecting);
+        assert_eq!(view.press_owner, Some(PressOwner::Grid));
+    }
+
+    #[test]
+    fn another_buttons_release_does_not_end_a_local_selection() {
+        let mut view = TerminalView::default();
+        // A local drag has no reported press, so the primary button owns it.
+        view.begin_press(None, false);
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        // A middle or right release arrives mid-drag: the gesture's own button
+        // is still down and focused, so nothing may end.
+        assert!(!gesture_released(&view.reported, true, false));
+        assert!(!gesture_ended(&view.reported, true, false, true, true));
+        assert!(view.selecting);
+        assert!(view.press_active);
+        assert_eq!(view.press_owner, Some(PressOwner::Grid));
+        // The primary release ends the gesture and the selection still copies.
+        assert!(gesture_released(&view.reported, true, true));
+        assert!(gesture_ended(&view.reported, true, true, false, true));
+        let mut actions = Vec::new();
+        view.end_selection(Some("copied".to_owned()), true, &mut actions);
+        assert_eq!(actions, vec![TerminalAction::Copy("copied".to_owned())]);
+        view.lose_press();
+        assert!(!view.selecting);
+        // A reported press keeps the shared release flag and still needs the
+        // tracked set to be empty before it ends.
+        view.begin_press(Some(MouseButton::Left), false);
+        assert!(gesture_released(&view.reported, true, false));
+        assert!(!gesture_ended(&view.reported, true, false, true, true));
+        assert!(gesture_ended(&view.reported, true, false, false, true));
+        // A local press ends on focus loss too, since it tracks no button.
+        assert!(gesture_ended(
+            &ReportedButtons::default(),
+            false,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn host_focus_lost_pays_the_reported_press() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        // Two reported buttons and a scrollbar grab, as after a thumb press
+        // that turned into a multi-button drag.
+        view.begin_press(Some(MouseButton::Left), false);
+        view.begin_press(Some(MouseButton::Right), false);
+        view.last_report = Some((10, 40));
+        view.deferred_release = true;
+        view.press_owner = Some(PressOwner::Scrollbar);
+        view.scrollbar_grab = Some(ScrollbarGrab {
+            grab: 0.0,
+            track_top: 0.0,
+            track_height: 10.0,
+            thumb_height: 4.0,
+            history: 10,
+        });
+        view.host_focus_lost();
+        assert!(view.reported.is_empty());
+        assert!(!view.press_active);
+        assert!(!view.press_shift_override);
+        assert!(!view.deferred_release);
+        assert!(view.scrollbar_grab.is_none());
+        assert_eq!(view.press_owner, None);
+        // No tracked button means a 1002 child gets no drag motion on hover.
+        assert_eq!(view.motion_report(3, 1, view.reported.latest()), None);
+        assert_eq!(view.reported.latest(), None);
+        // The next painted pass pays both owed mouse-ups at the last reported
+        // cell, clamped into the shrunken grid.
+        assert_eq!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5)),
+            vec![b"\x1b[<0;10;5m".to_vec(), b"\x1b[<2;10;5m".to_vec()]
+        );
+        // Idempotent: a second focus loss and a second pass pay nothing.
+        view.host_focus_lost();
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_focus_lost_keeps_a_live_local_selection() {
+        let mut view = TerminalView::default();
+        view.begin_press(None, true);
+        view.selecting = true;
+        view.press_owner = Some(PressOwner::Grid);
+        view.host_focus_lost();
+        // Nothing was reported, so nothing is owed, but the drag must survive.
+        assert!(view.selecting);
+        assert!(!view.press_active);
+        assert!(!view.press_shift_override);
+        assert_eq!(view.press_owner, None);
+        assert!(
+            view.take_host_release((0, 0), Mods::default(), (10, 5))
+                .is_empty()
+        );
+        assert!(view.selecting);
+        // Its later release still finalizes and copies it.
+        let mut actions = Vec::new();
+        view.end_selection(Some("copied".to_owned()), true, &mut actions);
+        assert_eq!(actions, vec![TerminalAction::Copy("copied".to_owned())]);
+    }
+
+    #[test]
+    fn link_hover_wanted_matches_the_pointing_hand_gate() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // A child that does not report: Ctrl alone shows the hand.
+        view.modes.mouse_reporting = false;
+        assert!(view.link_hover_wanted(true, false));
+        assert!(!view.link_hover_wanted(false, false));
+        // A reporting child owns the hover unless Shift takes it back.
+        view.modes.mouse_reporting = true;
+        assert!(!view.link_hover_wanted(true, false));
+        assert!(view.link_hover_wanted(true, true));
+        // The latch keeps Shift's answer after Shift is released.
+        view.begin_press(None, true);
+        assert!(view.link_hover_wanted(true, false));
+        view.end_press();
+        // A reported press holds reporting, so Shift cannot take it back.
+        view.begin_press(Some(MouseButton::Left), false);
+        assert!(!view.link_hover_wanted(true, true));
+    }
+
+    #[test]
+    fn second_press_keeps_the_shift_latch() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        // Shift+Left starts a local selection and latches Shift.
+        view.begin_press(None, true);
+        assert!(view.press_active);
+        assert!(view.press_shift_override);
+        // Shift is released, then Right is pressed during the same gesture.
+        view.begin_press(None, false);
+        assert!(view.press_shift_override);
+        assert!(!reports_mouse(
+            view.modes.mouse_reporting,
+            view.press_shift_override,
+            !view.reported.is_empty()
+        ));
+        assert_eq!(view.motion_report_with(3, 1, None, Mods::default()), None);
+        // A new gesture latches the current Shift state again.
+        view.end_press();
+        view.begin_press(Some(MouseButton::Left), false);
+        assert!(!view.press_shift_override);
+        assert!(
+            view.motion_report_with(3, 1, view.reported.latest(), Mods::default())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn motion_dedupe_includes_shift() {
+        let mut view = TerminalView {
+            modes: motion_modes(false, true),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        assert!(
+            view.motion_report_with(3, 1, view.reported.latest(), Mods::default())
+                .is_some()
+        );
+        // Shift going down over the same cell is a new report, not a duplicate.
+        let shift = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        assert_eq!(
+            view.motion_report_with(3, 1, view.reported.latest(), shift)
+                .as_deref(),
+            Some(b"\x1b[<36;4;2M".as_slice())
+        );
+        assert_eq!(
+            view.motion_report_with(3, 1, view.reported.latest(), shift),
+            None
+        );
+    }
+
+    #[test]
+    fn lost_release_clamps_to_the_shrunk_grid() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.begin_press(Some(MouseButton::Left), false);
+        // Reported in a large grid that has since shrunk to 10x5.
+        view.last_report = Some((10, 40));
+        assert_eq!(
+            view.lost_release_reports((0, 0), Mods::default(), (10, 5)),
+            vec![b"\x1b[<0;10;5m".to_vec()]
+        );
+    }
+
+    #[test]
+    fn motion_wanted_at_matches_the_report_path() {
+        let rect = Rect::from_min_size(pos2(8.0, 16.0), vec2(90.0, 36.0));
+        let cell = pos2(12.5, 25.0);
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            grid_rect: Some(rect),
+            grid_metrics: Some(metrics()),
+            grid_cells: Some((10, 2)),
+            ..TerminalView::default()
+        };
+        // Nothing reported yet: a move would write.
+        assert!(view.motion_wanted_at(cell));
+        view.motion_cell = Some(((0, 0), MouseButton::None, false, false, false));
+        assert!(!view.motion_wanted_at(cell));
+        assert!(view.motion_wanted_at(pos2(21.5, 25.0)));
+        // A modifier change over the same cell is a new report.
+        view.last_mods = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        assert!(view.motion_wanted_at(cell));
+        view.last_mods = Mods::default();
+        // The padding gutter is not a cell.
+        assert!(!view.motion_wanted_at(pos2(4.0, 25.0)));
+        // Shift with no reported press suppresses motion.
+        view.last_mods = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        assert!(!view.motion_wanted_at(pos2(21.5, 25.0)));
+        view.last_mods = Mods::default();
+        // Click-only mode never wants motion.
+        view.modes = motion_modes(false, false);
+        assert!(!view.motion_wanted_at(pos2(21.5, 25.0)));
+        // Drag-only mode needs a tracked button.
+        view.modes = motion_modes(false, true);
+        assert!(!view.motion_wanted_at(pos2(21.5, 25.0)));
+        view.reported.insert(MouseButton::Left);
+        assert!(view.motion_wanted_at(pos2(21.5, 25.0)));
+        // A held button clamps through the gutter exactly like the report path,
+        // so a drag that leaves the grid still needs a paint.
+        assert!(view.motion_wanted_at(pos2(4.0, 25.0)));
+        assert!(view.motion_wanted_at(pos2(120.0, 25.0)));
+        // No geometry recorded yet: the caller paints.
+        let bare = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert!(bare.motion_wanted_at(cell));
+    }
+
+    #[test]
+    fn focus_flip_clears_the_hover_dedupe() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.observe_focus(true);
+        assert!(view.motion_report(3, 1, None).is_some());
+        // Unchanged focus keeps the dedupe.
+        view.observe_focus(true);
+        assert_eq!(view.motion_report(3, 1, None), None);
+        // Losing focus drops it, so regaining it re-reports the same cell.
+        view.observe_focus(false);
+        assert!(view.motion_report(3, 1, None).is_some());
+    }
+
+    #[test]
+    fn mode_toggle_clears_the_hover_dedupe() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        view.observe_mouse_modes(view.modes);
+        assert!(view.motion_report(3, 1, None).is_some());
+        // A repaint with unchanged modes keeps the dedupe.
+        view.observe_mouse_modes(view.modes);
+        assert_eq!(view.motion_report(3, 1, None), None);
+        // Disabling and re-enabling tracking drops it, so hover re-reports.
+        view.observe_mouse_modes(motion_modes(false, false));
+        view.observe_mouse_modes(motion_modes(true, false));
+        assert!(view.motion_report(3, 1, None).is_some());
+    }
+
+    #[test]
+    fn motion_ignores_the_padding_gutter() {
+        let rect = Rect::from_min_size(pos2(8.0, 16.0), vec2(90.0, 36.0));
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        let cell = pos2(8.0 + 4.5, 16.0 + 9.0);
+        let mods = Mods::default();
+        assert!(
+            view.motion_report_at(cell, rect, &metrics(), (10, 2), None, mods)
+                .is_some()
+        );
+        // A stationary pointer is deduped.
+        assert_eq!(
+            view.motion_report_at(cell, rect, &metrics(), (10, 2), None, mods),
+            None
+        );
+        // The gutter left of the grid is not a cell and reports nothing.
+        assert_eq!(
+            view.motion_report_at(pos2(7.0, 20.0), rect, &metrics(), (10, 2), None, mods),
+            None
+        );
+        // Re-entering the cell reports again.
+        assert!(
+            view.motion_report_at(cell, rect, &metrics(), (10, 2), None, mods)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn motion_dedupe_includes_ctrl_and_alt() {
+        let mut view = TerminalView {
+            modes: motion_modes(true, false),
+            ..TerminalView::default()
+        };
+        assert!(view.motion_report(3, 1, None).is_some());
+        let ctrl = Mods {
+            ctrl: true,
+            ..Mods::default()
+        };
+        assert_eq!(
+            view.motion_report_with(3, 1, None, ctrl).as_deref(),
+            Some(b"\x1b[<51;4;2M".as_slice())
+        );
+        assert_eq!(view.motion_report_with(3, 1, None, ctrl), None);
+    }
+
     #[test]
     fn selection_autoscroll_moves_toward_the_drag() {
         assert_eq!(selection_autoscroll_delta(99.0, 0.0, 50.0), -1);
@@ -2735,6 +4677,7 @@ mod tests {
             &[key_event(EguiKey::ArrowUp, Modifiers::default())],
             Modifiers::default(),
             modes,
+            true,
         );
         assert_eq!(cursor, Some(b"\x1bOA".to_vec()));
         assert_ne!(cursor, Some(b"\x1b[A".to_vec()));
@@ -2743,8 +4686,28 @@ mod tests {
             &[Event::Paste("hello".to_string())],
             Modifiers::default(),
             modes,
+            true,
         );
         assert_eq!(pasted, Some(b"\x1b[200~hello\x1b[201~".to_vec()));
+    }
+
+    #[test]
+    fn shift_enter_follows_the_newline_setting() {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let view = TerminalView::default();
+        let enter = [key_event(EguiKey::Enter, shift)];
+
+        assert_eq!(
+            view.encode_input(&enter, Modifiers::default(), TermModes::default(), true),
+            Some(vec![0x1b, 0x0d])
+        );
+        assert_eq!(
+            view.encode_input(&enter, Modifiers::default(), TermModes::default(), false),
+            Some(vec![0x0d])
+        );
     }
 
     fn ctrl_mods() -> Modifiers {
@@ -2766,7 +4729,12 @@ mod tests {
     }
 
     fn encode_input_with(events: Vec<Event>) -> Option<Vec<u8>> {
-        TerminalView::default().encode_input(&events, Modifiers::default(), TermModes::default())
+        TerminalView::default().encode_input(
+            &events,
+            Modifiers::default(),
+            TermModes::default(),
+            true,
+        )
     }
 
     #[test]

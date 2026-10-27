@@ -64,6 +64,11 @@ pub struct Config {
     pub padding: f32,
     pub default_profile: String,
     pub copy_on_select: bool,
+    /// Shift+Enter sends ESC + CR so TUIs insert a newline instead of
+    /// submitting. `false` sends a plain CR, exactly like Enter. Missing in
+    /// older configs means enabled.
+    #[serde(default = "enabled_by_default")]
+    pub shift_enter_newline: bool,
     /// New tabs start in the active tab's shell folder. `false` uses the
     /// launch folder instead. Missing in older configs means enabled.
     #[serde(default = "enabled_by_default")]
@@ -98,6 +103,7 @@ impl Default for Config {
             padding: 8.0,
             default_profile: String::new(),
             copy_on_select: false,
+            shift_enter_newline: true,
             inherit_cwd: true,
             profiles: Vec::new(),
             hidden_profiles: Vec::new(),
@@ -403,6 +409,7 @@ mod tests {
         assert_eq!(config.padding, 8.0);
         assert!(config.default_profile.is_empty());
         assert!(!config.copy_on_select);
+        assert!(config.shift_enter_newline);
         assert!(config.inherit_cwd);
         assert!(config.profiles.is_empty());
         assert!(config.hidden_profiles.is_empty());
@@ -459,6 +466,21 @@ mod tests {
         let disabled: Config =
             toml::from_str("inherit_cwd = false\n").expect("parse explicit value");
         assert!(!disabled.inherit_cwd);
+    }
+
+    #[test]
+    fn shift_enter_newline_defaults_to_enabled() {
+        assert!(Config::default().shift_enter_newline);
+
+        let parsed: Config = toml::from_str("theme = \"Nord\"\n").expect("parse config");
+        assert!(
+            parsed.shift_enter_newline,
+            "older configs keep sending ESC + CR"
+        );
+
+        let disabled: Config =
+            toml::from_str("shift_enter_newline = false\n").expect("parse explicit value");
+        assert!(!disabled.shift_enter_newline);
     }
 
     #[test]

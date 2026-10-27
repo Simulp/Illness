@@ -1682,6 +1682,16 @@ fn terminal_section(ui: &mut Ui, tokens: &Tokens, config: &mut Config) -> bool {
     changed |= setting_card(
         ui,
         tokens,
+        "Shift+Enter Newline",
+        Some(
+            "Sends ESC CR so TUIs insert a line instead of submitting; off makes Shift+Enter behave like Enter",
+        ),
+        |ui| toggle(ui, tokens, &mut config.shift_enter_newline),
+    );
+
+    changed |= setting_card(
+        ui,
+        tokens,
         "Confirm on Close",
         Some("Ask before closing the window while multiple tabs are open"),
         |ui| toggle(ui, tokens, &mut config.confirm_close_with_tabs),

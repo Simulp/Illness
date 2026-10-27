@@ -80,10 +80,22 @@ impl KeyInput {
 }
 
 /// Terminal modes that change how input is encoded.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KeyModes {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
+    /// Send ESC + CR for Shift+Enter instead of a plain CR.
+    pub shift_enter_newline: bool,
+}
+
+impl Default for KeyModes {
+    fn default() -> Self {
+        Self {
+            app_cursor: false,
+            bracketed_paste: false,
+            shift_enter_newline: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +112,8 @@ pub enum MouseButton {
     Right,
     WheelUp,
     WheelDown,
+    /// No button is held; used for hover motion and button-less releases.
+    None,
 }
 
 /// Encode a key press for the PTY.
@@ -112,6 +126,11 @@ pub fn encode_key(input: KeyInput, modes: KeyModes) -> Vec<u8> {
     } = input;
 
     match key {
+        // Shift+Enter sends ESC + CR, the sequence terminal-setup helpers register for
+        // a newline in TUI clients. This is configurable because a plain shell prompt
+        // reads a leading ESC as RevertLine and clears the line. Ctrl+Shift+Enter
+        // always stays CR.
+        Key::Enter if mods.shift && !mods.ctrl && modes.shift_enter_newline => vec![ESC, 0x0d],
         Key::Enter => single(0x0d, mods.alt),
         Key::Tab if mods.shift => vec![ESC, b'[', b'Z'],
         Key::Tab => single(0x09, mods.alt),
@@ -212,6 +231,8 @@ pub fn encode_mouse(
         )
         .into_bytes()
     } else {
+        // X10 has no separate button-less motion code: a real release is button code 3,
+        // while motion reports carry the motion bit on top of the base button code.
         let code = if phase == MousePhase::Release {
             3 + bits
         } else {
@@ -312,6 +333,7 @@ fn mouse_button_code(button: MouseButton) -> u8 {
         MouseButton::Right => 2,
         MouseButton::WheelUp => 64,
         MouseButton::WheelDown => 65,
+        MouseButton::None => 3,
     }
 }
 
@@ -378,7 +400,7 @@ mod tests {
     fn app_cursor() -> KeyModes {
         KeyModes {
             app_cursor: true,
-            bracketed_paste: false,
+            ..KeyModes::default()
         }
     }
 
@@ -748,6 +770,148 @@ mod tests {
         for (phase, button, col, row, mods, expected) in cases {
             assert_eq!(encode_mouse(phase, button, col, row, mods, false), expected);
         }
+    }
+
+    #[test]
+    fn shift_enter_sends_esc_cr() {
+        let mods = Mods {
+            shift: true,
+            ..Mods::default()
+        };
+        let bytes = encode_key(KeyInput::new(Key::Enter, mods, None), KeyModes::default());
+        assert_eq!(bytes, vec![0x1b, 0x0d]);
+    }
+
+    #[test]
+    fn shift_enter_without_newline_setting_sends_plain_cr() {
+        let plain_cr = KeyModes {
+            shift_enter_newline: false,
+            ..KeyModes::default()
+        };
+        assert_eq!(encode_key(key(Key::Enter, SHIFT), plain_cr), vec![0x0d]);
+        assert_eq!(
+            encode_key(key(Key::Enter, SHIFT_ALT), plain_cr),
+            vec![0x1b, 0x0d],
+            "Alt still prefixes ESC when Shift+Enter is plain CR"
+        );
+        assert_eq!(
+            encode_key(key(Key::Enter, CTRL_SHIFT), KeyModes::default()),
+            vec![0x0d],
+            "Ctrl+Shift+Enter stays CR with the setting on"
+        );
+        assert_eq!(
+            encode_key(key(Key::Enter, CTRL_SHIFT), plain_cr),
+            vec![0x0d],
+            "Ctrl+Shift+Enter stays CR with the setting off"
+        );
+    }
+
+    #[test]
+    fn shift_alt_enter_sends_one_esc() {
+        let bytes = encode_key(key(Key::Enter, SHIFT_ALT), plain());
+        assert_eq!(bytes, vec![0x1b, 0x0d]);
+        assert_eq!(
+            bytes.iter().filter(|byte| **byte == ESC).count(),
+            1,
+            "Shift+Alt+Enter must not emit two ESCs"
+        );
+    }
+
+    #[test]
+    fn enter_still_sends_cr() {
+        assert_eq!(encode_key(key(Key::Enter, NONE), plain()), vec![0x0d]);
+        assert_eq!(encode_key(key(Key::Enter, ALT), plain()), vec![0x1b, 0x0d]);
+    }
+
+    #[test]
+    fn ctrl_enter_unchanged() {
+        assert_eq!(encode_key(key(Key::Enter, CTRL), plain()), vec![0x0d]);
+        assert_eq!(
+            encode_key(key(Key::Enter, CTRL_ALT), plain()),
+            vec![0x1b, 0x0d]
+        );
+        assert_eq!(
+            encode_key(key(Key::Enter, CTRL_SHIFT), plain()),
+            vec![0x0d],
+            "Ctrl+Shift+Enter must keep sending CR"
+        );
+        assert_eq!(
+            encode_key(
+                key(
+                    Key::Enter,
+                    Mods {
+                        alt: true,
+                        ..CTRL_SHIFT
+                    }
+                ),
+                plain()
+            ),
+            vec![0x1b, 0x0d],
+            "Ctrl+Shift+Alt+Enter must keep sending ESC + CR"
+        );
+    }
+
+    #[test]
+    fn motion_without_button_sgr_is_code_35() {
+        let bytes = encode_mouse(
+            MousePhase::Motion,
+            MouseButton::None,
+            4,
+            2,
+            Mods::default(),
+            true,
+        );
+        assert_eq!(bytes, b"\x1b[<35;5;3M");
+    }
+
+    #[test]
+    fn motion_without_button_legacy_sets_the_motion_bit() {
+        let bytes = encode_mouse(
+            MousePhase::Motion,
+            MouseButton::None,
+            4,
+            2,
+            Mods::default(),
+            false,
+        );
+        assert_eq!(bytes, vec![0x1b, b'[', b'M', 67, 37, 35]);
+    }
+
+    #[test]
+    fn release_without_button_emits_code_3_and_mods() {
+        assert_eq!(
+            encode_mouse(
+                MousePhase::Release,
+                MouseButton::None,
+                4,
+                2,
+                Mods::default(),
+                true
+            ),
+            b"\x1b[<3;5;3m"
+        );
+        assert_eq!(
+            encode_mouse(
+                MousePhase::Release,
+                MouseButton::None,
+                4,
+                2,
+                SHIFT_ALT,
+                true
+            ),
+            b"\x1b[<15;5;3m"
+        );
+        assert_eq!(
+            encode_mouse(
+                MousePhase::Release,
+                MouseButton::None,
+                4,
+                2,
+                Mods::default(),
+                false
+            ),
+            vec![0x1b, b'[', b'M', 35, 37, 35]
+        );
     }
 
     #[test]

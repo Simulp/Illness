@@ -74,6 +74,10 @@ pub struct TermModes {
     pub bracketed_paste: bool,
     pub mouse_reporting: bool,
     pub sgr_mouse: bool,
+    /// DECSET 1002: report motion while a button is held.
+    pub mouse_drag: bool,
+    /// DECSET 1003: report every motion, including hover with no button held.
+    pub mouse_motion: bool,
     pub alternate_screen: bool,
     pub focus_reporting: bool,
 }
@@ -613,6 +617,8 @@ fn modes_from(mode: TermMode) -> TermModes {
         bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         mouse_reporting: mode.intersects(TermMode::MOUSE_MODE),
         sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
+        mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
+        mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
         alternate_screen: mode.contains(TermMode::ALT_SCREEN),
         focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
     }
@@ -958,6 +964,28 @@ mod tests {
         session.feed_for_test(b"\x1b[?1h\x1b[?2004h\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?1049h");
 
         assert_eq!(session.term_modes(), session.snapshot().modes);
+    }
+
+    #[test]
+    fn modes_capture_drag_and_motion_flags() {
+        let session = session(20, 5);
+        session.feed_for_test(b"\x1b[?1002h");
+        let modes = session.term_modes();
+        assert!(modes.mouse_reporting);
+        assert!(modes.mouse_drag);
+        assert!(!modes.mouse_motion);
+
+        session.feed_for_test(b"\x1b[?1002l\x1b[?1003h");
+        let modes = session.term_modes();
+        assert!(modes.mouse_reporting);
+        assert!(!modes.mouse_drag);
+        assert!(modes.mouse_motion);
+
+        session.feed_for_test(b"\x1b[?1003l\x1b[?1000h");
+        let modes = session.term_modes();
+        assert!(modes.mouse_reporting);
+        assert!(!modes.mouse_drag);
+        assert!(!modes.mouse_motion);
     }
 
     #[test]

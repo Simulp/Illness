@@ -17,11 +17,12 @@ use egui_wgpu::{RendererOptions, WgpuConfiguration};
 #[cfg(target_os = "windows")]
 use egui_wgpu::{SurfaceConfig, WgpuSetup, WgpuSetupCreateNew};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use crate::app;
+use illness_term::MouseButton;
 
 const INITIAL_INNER_SIZE: [f32; 2] = [1180.0, 760.0];
 const MIN_INNER_SIZE: [f32; 2] = [720.0, 480.0];
@@ -85,6 +86,43 @@ fn wgpu_configuration(display_handle: winit::event_loop::OwnedDisplayHandle) -> 
     }
 }
 
+/// Buttons winit currently reports as down, one bit per terminal button.
+///
+/// The pointer gate needs physical state, not egui's: `egui_winit` drops button
+/// events while it has no pointer position, and egui keeps `any_down` latched
+/// after `PointerGone`. Every press and release winit delivers updates this set,
+/// so a drag that leaves the window and returns still reads as held.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DownButtons(u8);
+
+impl DownButtons {
+    /// Apply one press or release. Buttons the terminal encoder never reports
+    /// have no bit, so they cannot latch the gate.
+    fn set(&mut self, button: MouseButton, pressed: bool) {
+        let Some(bit) = button_bit(button) else {
+            return;
+        };
+        if pressed {
+            self.0 |= bit;
+        } else {
+            self.0 &= !bit;
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.0 != 0
+    }
+}
+
+fn button_bit(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(0b001),
+        MouseButton::Middle => Some(0b010),
+        MouseButton::Right => Some(0b100),
+        MouseButton::None | MouseButton::WheelUp | MouseButton::WheelDown => None,
+    }
+}
+
 struct Host {
     ctx: egui::Context,
     painter: egui_wgpu::winit::Painter,
@@ -122,6 +160,24 @@ struct Host {
     /// confirmation card. Kept in an atomic so a close arriving for a window
     /// that cannot paint still knows the app would guard it.
     close_guarded: Arc<AtomicBool>,
+    /// Pixels per point used for the last painted pass. A move is converted
+    /// with this rather than the live window scale, so a `ScaleFactorChanged`
+    /// cannot misclassify a move against a rect recorded in older points.
+    pointer_pass_ppp: Option<f32>,
+    /// Ctrl state from the last painted pass, so a move needs no extra
+    /// context-input lock. It is one pass old by design.
+    pointer_pass_ctrl: bool,
+    /// Shift state from the last painted pass, for the link-hover Shift
+    /// override. One pass old, like `pointer_pass_ctrl`.
+    pointer_pass_shift: bool,
+    /// Physical pointer presence, straight from winit. egui's pointer position
+    /// is only updated at `begin_pass`, so a release queued right after
+    /// `CursorLeft` still looks inside to egui.
+    pointer_inside: bool,
+    /// Buttons winit currently reports down. egui can drop a transition while
+    /// it has no pointer position, and its `any_down` latches after
+    /// `PointerGone`, so the gate reads this physical set instead.
+    buttons_down: DownButtons,
 }
 
 impl Host {
@@ -152,6 +208,11 @@ impl Host {
             restore_pending: false,
             first_frame: true,
             close_guarded: Arc::new(AtomicBool::new(false)),
+            pointer_pass_ppp: None,
+            pointer_pass_ctrl: false,
+            pointer_pass_shift: false,
+            pointer_inside: false,
+            buttons_down: DownButtons::default(),
         }
     }
 
@@ -339,6 +400,11 @@ impl Host {
         input.viewports.insert(ViewportId::ROOT, self.info.clone());
 
         let mut output = self.ctx.run_ui(input, |ui| app.ui(ui));
+        // Remember the scale this pass's rects were laid out in, and its Ctrl
+        // state, so the next move is classified with matching values.
+        self.pointer_pass_ppp = Some(output.pixels_per_point);
+        self.pointer_pass_ctrl = self.ctx.input(|input| input.modifiers.ctrl);
+        self.pointer_pass_shift = self.ctx.input(|input| input.modifiers.shift);
 
         let commands = output
             .viewport_output
@@ -555,6 +621,32 @@ impl ApplicationHandler<UserEvent> for Host {
                     CloseDecision::Finish => self.finish_close(event_loop),
                 }
             }
+            WindowEvent::MouseInput { state, button, .. } => {
+                // Whether egui-winit will see this transition: it drops button
+                // events while it has no pointer position, which is exactly the
+                // release of a drag that ended outside the window.
+                let seen_by_egui = self
+                    .state
+                    .as_ref()
+                    .is_some_and(egui_winit::State::is_pointer_in_window);
+                let button = terminal_button(button);
+                let pressed = state == ElementState::Pressed;
+                // Physical state first: the app folds the same transition into
+                // its gate and needs to know whether a button is still held.
+                self.buttons_down.set(button, pressed);
+                if let Some(state) = self.state.as_mut() {
+                    let _ = state.on_window_event(&window, &event);
+                }
+                // Windows still delivers the transition here, so the pointer
+                // gate must fold it in: an ignored press would leave a returned
+                // drag unpainted, and an ignored release would keep a selection
+                // latched. A release also repaints so the view can write the
+                // mouse-up it still owes the child.
+                if let Some(app) = self.app.as_mut() {
+                    app.pointer_button(button, pressed, seen_by_egui, self.pointer_inside);
+                }
+                window.request_redraw();
+            }
             WindowEvent::Occluded(occluded) => {
                 self.info.occluded = Some(occluded);
                 if let Some(state) = self.state.as_mut()
@@ -588,8 +680,72 @@ impl ApplicationHandler<UserEvent> for Host {
                     // content is unchanged. Hover/focus bookkeeping above still
                     // runs, but a repaint here would duplicate the last frame.
                     if response.repaint && event_needs_redraw(&event) {
+                        let pointer_paints = match &event {
+                            WindowEvent::CursorMoved { position, .. } => {
+                                // Cursor moves reach egui's input only on the
+                                // next pass, so convert this event's physical
+                                // position to the points the last pass used.
+                                // Reusing its ppp (rather than the live window
+                                // scale) keeps the comparison against a rect
+                                // from the same pass across a scale change.
+                                let scale = self.pointer_pass_ppp.unwrap_or_else(|| {
+                                    ((window.scale_factor() as f32) * self.ctx.zoom_factor())
+                                        .max(f32::EPSILON)
+                                });
+                                let pos = pointer_position_points(*position, f64::from(scale));
+                                // Ctrl/Shift from the last pass; no extra input
+                                // lock.
+                                let ctrl = self.pointer_pass_ctrl;
+                                let shift = self.pointer_pass_shift;
+                                self.app.as_mut().is_none_or(|app| {
+                                    app.pointer_needs_repaint(Some(pos), ctrl, shift)
+                                })
+                            }
+                            _ => true,
+                        };
+                        let skipped_move =
+                            !pointer_paints && matches!(event, WindowEvent::CursorMoved { .. });
+                        if pointer_event_needs_redraw(&event, pointer_paints) {
+                            window.request_redraw();
+                        } else if skipped_move {
+                            // A skipped move still sits in egui-winit's queue
+                            // until a paint drains it. Keep only the newest so a
+                            // long sweep cannot replay as a burst on the next
+                            // paint; nothing was painted, so no state is lost.
+                            coalesce_pointer_moves(&mut state.egui_input_mut().events);
+                        }
+                    }
+                }
+                // Presence and drag memory are tracked from winit, not from
+                // egui's one-pass-old pointer state. A button still held on
+                // re-entry keeps the drag alive; a gesture that ended outside
+                // stays latched so its stale `any_down` cannot paint forever.
+                match event {
+                    // A move also proves physical presence, which covers a
+                    // window that never delivered `CursorEntered`.
+                    WindowEvent::CursorEntered { .. } | WindowEvent::CursorMoved { .. } => {
+                        self.pointer_inside = true;
+                        if let Some(app) = self.app.as_mut() {
+                            app.pointer_entered_window(self.buttons_down.any());
+                        }
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        self.pointer_inside = false;
+                        if let Some(app) = self.app.as_mut() {
+                            app.pointer_left_window(self.buttons_down.any());
+                        }
+                    }
+                    WindowEvent::Focused(false) => {
+                        if let Some(app) = self.app.as_mut() {
+                            app.pointer_focus_lost();
+                        }
+                        // The views just dropped their press state; paint the
+                        // result even if egui-winit saw no repaint-worthy
+                        // change, so a latched button or autoscroll cannot
+                        // outlive the focus change.
                         window.request_redraw();
                     }
+                    _ => {}
                 }
             }
         }
@@ -683,6 +839,67 @@ fn take_repaint_deadline(deadline: &Mutex<Option<Instant>>) -> Option<Instant> {
 /// own arms).
 fn event_needs_redraw(event: &WindowEvent) -> bool {
     !matches!(event, WindowEvent::Moved(_))
+}
+
+/// Map a winit mouse button to the terminal's button identity.
+///
+/// The host only needs this to tell a view which button came up: a release is
+/// paid to the button whose press the child was told about. Buttons the
+/// terminal encoder never reports map to [`MouseButton::None`], which no view
+/// tracks.
+fn terminal_button(button: winit::event::MouseButton) -> MouseButton {
+    match button {
+        winit::event::MouseButton::Left => MouseButton::Left,
+        winit::event::MouseButton::Middle => MouseButton::Middle,
+        winit::event::MouseButton::Right => MouseButton::Right,
+        winit::event::MouseButton::Back
+        | winit::event::MouseButton::Forward
+        | winit::event::MouseButton::Other(_) => MouseButton::None,
+    }
+}
+
+/// Whether a generic window event that egui marked for a repaint actually
+/// needs one.
+///
+/// A `CursorMoved` is the only event here whose paint can be pointless: over a
+/// bare grid cell nothing on screen depends on the pointer. `pointer_paints`
+/// carries the app's decision for that move; every other event keeps painting.
+fn pointer_event_needs_redraw(event: &WindowEvent, pointer_paints: bool) -> bool {
+    if !event_needs_redraw(event) {
+        return false;
+    }
+    !matches!(event, WindowEvent::CursorMoved { .. }) || pointer_paints
+}
+
+/// Keep only the newest queued [`egui::Event::PointerMoved`], in place.
+///
+/// A pointer move that changes no pixels still sits in egui-winit's pending
+/// input until the next paint drains it, so a long sweep would otherwise replay
+/// as one burst. Dropping all but the last loses nothing: no pass ran for the
+/// skipped moves, and only the final position describes the pointer. Other
+/// events keep their order and count. Returns whether a move was queued.
+fn coalesce_pointer_moves(events: &mut Vec<egui::Event>) -> bool {
+    let Some(last) = events
+        .iter()
+        .rposition(|event| matches!(event, egui::Event::PointerMoved(_)))
+    else {
+        return false;
+    };
+    let mut index = 0;
+    events.retain(|event| {
+        let keep = !matches!(event, egui::Event::PointerMoved(_)) || index == last;
+        index += 1;
+        keep
+    });
+    true
+}
+
+/// Convert a physical winit cursor position to egui points with the scale a
+/// past pass used. A non-positive scale falls back to the smallest positive
+/// value so the result stays finite.
+fn pointer_position_points(position: winit::dpi::PhysicalPosition<f64>, scale: f64) -> egui::Pos2 {
+    let scale = scale.max(f64::from(f32::EPSILON));
+    egui::pos2((position.x / scale) as f32, (position.y / scale) as f32)
 }
 
 /// Interpret a pass's viewport commands. A `Close` always wins, so an app that
@@ -827,8 +1044,9 @@ fn log_gpu(window: &Arc<Window>, painter: &egui_wgpu::winit::Painter) -> (bool, 
 #[cfg(test)]
 mod tests {
     use super::{
-        CloseDecision, SurfaceResize, cancel_close_requested, close_decision, event_needs_redraw,
-        surface_resize,
+        CloseDecision, DownButtons, SurfaceResize, cancel_close_requested, close_decision,
+        coalesce_pointer_moves, event_needs_redraw, pointer_event_needs_redraw,
+        pointer_position_points, surface_resize, terminal_button,
     };
     use egui::ViewportCommand;
     use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -839,6 +1057,83 @@ mod tests {
             std::num::NonZeroU32::new(width).expect("width"),
             std::num::NonZeroU32::new(height).expect("height"),
         )
+    }
+
+    fn pointer_sample(pos: egui::Pos2, in_chrome: bool) -> crate::app::PointerSample {
+        crate::app::PointerSample {
+            pos: Some(pos),
+            in_chrome,
+            on_scrollbar: false,
+            scrollbar_changed: false,
+            entered_grid: false,
+            motion_wanted: false,
+            ime_preedit: false,
+            ctrl: false,
+            overlay_open: false,
+            pointing: false,
+        }
+    }
+
+    #[test]
+    fn winit_buttons_map_to_the_terminal_buttons() {
+        use illness_term::MouseButton;
+        use winit::event::MouseButton as WinitButton;
+
+        assert_eq!(terminal_button(WinitButton::Left), MouseButton::Left);
+        assert_eq!(terminal_button(WinitButton::Middle), MouseButton::Middle);
+        assert_eq!(terminal_button(WinitButton::Right), MouseButton::Right);
+        // Buttons the terminal encoder never reports stay untracked.
+        for other in [
+            WinitButton::Back,
+            WinitButton::Forward,
+            WinitButton::Other(7),
+        ] {
+            assert_eq!(terminal_button(other), MouseButton::None);
+        }
+    }
+
+    #[test]
+    fn cursor_moves_over_the_grid_skip_the_repaint() {
+        let moved = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(400.0, 400.0),
+        };
+        // A grid hover with no overlay, no Ctrl and no held button paints the
+        // same pixels, so the host must not request a redraw.
+        assert!(!pointer_event_needs_redraw(
+            &moved,
+            crate::app::pointer_repaints(&pointer_sample(egui::pos2(400.0, 400.0), false))
+        ));
+        // A titlebar hover has hover states and must paint.
+        assert!(pointer_event_needs_redraw(
+            &moved,
+            crate::app::pointer_repaints(&pointer_sample(egui::pos2(40.0, 12.0), true))
+        ));
+        // Non-pointer events keep their existing behavior.
+        assert!(pointer_event_needs_redraw(
+            &WindowEvent::Focused(false),
+            false
+        ));
+        assert!(!pointer_event_needs_redraw(
+            &WindowEvent::Moved(PhysicalPosition::new(10, 20)),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_motion_wanting_grid_still_requests_a_redraw() {
+        // DECSET 1002/1003 children receive motion reports during a paint, so
+        // the gate must not starve them.
+        let moved = WindowEvent::CursorMoved {
+            device_id: DeviceId::dummy(),
+            position: PhysicalPosition::new(400.0, 400.0),
+        };
+        let mut sample = pointer_sample(egui::pos2(400.0, 400.0), false);
+        sample.motion_wanted = true;
+        assert!(pointer_event_needs_redraw(
+            &moved,
+            crate::app::pointer_repaints(&sample)
+        ));
     }
 
     #[test]
@@ -856,6 +1151,148 @@ mod tests {
         // ScaleFactorChanged cannot be constructed outside winit (its
         // InnerSizeWriter is private), but it shares this default-true branch.
         assert!(event_needs_redraw(&WindowEvent::Focused(false)));
+    }
+
+    #[test]
+    fn leaving_the_window_or_losing_focus_clears_pointer_memory() {
+        // A move leaving the window still paints; the reset itself is not a
+        // reason to skip the clearing paint.
+        let left = WindowEvent::CursorLeft {
+            device_id: DeviceId::dummy(),
+        };
+        assert!(pointer_event_needs_redraw(&left, false));
+    }
+
+    #[test]
+    fn winit_reports_each_physical_button_independently() {
+        let mut buttons = DownButtons::default();
+        assert!(!buttons.any());
+        // A press anywhere in the window latches the drag, even one egui
+        // drops for want of a pointer position.
+        buttons.set(illness_term::MouseButton::Left, true);
+        assert!(buttons.any());
+        // A second button down keeps the drag alive after the first release.
+        buttons.set(illness_term::MouseButton::Right, true);
+        buttons.set(illness_term::MouseButton::Left, false);
+        assert!(buttons.any());
+        buttons.set(illness_term::MouseButton::Right, false);
+        assert!(!buttons.any());
+        // A release with no matching press cannot underflow the set.
+        buttons.set(illness_term::MouseButton::Middle, false);
+        assert!(!buttons.any());
+        // Buttons the terminal encoder never reports have no bit.
+        buttons.set(illness_term::MouseButton::None, true);
+        assert!(!buttons.any());
+    }
+
+    #[test]
+    fn skipped_moves_leave_only_the_newest_queued_move() {
+        use egui::Event;
+
+        // Nothing queued: nothing to coalesce.
+        assert!(!coalesce_pointer_moves(&mut Vec::new()));
+
+        // A sweep of skipped moves collapses to its final position, in place,
+        // and keeps every non-move event around it in order.
+        let mut events = vec![
+            Event::PointerMoved(egui::pos2(1.0, 1.0)),
+            Event::Text("a".to_string()),
+            Event::PointerMoved(egui::pos2(2.0, 2.0)),
+            Event::PointerMoved(egui::pos2(3.0, 3.0)),
+        ];
+        assert!(coalesce_pointer_moves(&mut events));
+        assert_eq!(
+            events,
+            vec![
+                Event::Text("a".to_string()),
+                Event::PointerMoved(egui::pos2(3.0, 3.0)),
+            ]
+        );
+
+        // A single move is already coalesced.
+        let mut one = vec![Event::PointerMoved(egui::pos2(4.0, 4.0))];
+        assert!(coalesce_pointer_moves(&mut one));
+        assert_eq!(one, vec![Event::PointerMoved(egui::pos2(4.0, 4.0))]);
+
+        // Events without a move are untouched.
+        let mut other = vec![
+            Event::PointerButton {
+                pos: egui::pos2(5.0, 5.0),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            Event::PointerMoved(egui::pos2(6.0, 6.0)),
+            Event::PointerGone,
+        ];
+        assert!(coalesce_pointer_moves(&mut other));
+        assert_eq!(
+            other,
+            vec![
+                Event::PointerButton {
+                    pos: egui::pos2(5.0, 5.0),
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                Event::PointerMoved(egui::pos2(6.0, 6.0)),
+                Event::PointerGone,
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_button_transitions_repair_the_stale_gate() {
+        // A drag whose pointer left the window keeps its stale latch until the
+        // host sees the next press, which proves the button is held again.
+        let mut stale = true;
+        let mut down = false;
+        assert!(!crate::app::host_button_transition(
+            &mut stale, &mut down, true, false
+        ));
+        assert!(!stale, "a raw press clears the stale latch");
+        assert!(down, "a raw press latches the drag");
+
+        // A release ends the gesture and asks for the paint that delivers the
+        // mouse-up. egui saw it, so its `any_down` is trustworthy again.
+        let mut stale = false;
+        let mut down = true;
+        assert!(crate::app::host_button_transition(
+            &mut stale, &mut down, false, true
+        ));
+        assert!(!stale);
+        assert!(!down, "a raw release ends the drag");
+
+        // A release egui-winit dropped (it had no pointer position) must keep
+        // the stale latch: its `any_down` would otherwise re-latch the gate.
+        let mut stale = false;
+        let mut down = true;
+        assert!(crate::app::host_button_transition(
+            &mut stale, &mut down, false, false
+        ));
+        assert!(stale, "a swallowed release stays distrusted");
+        assert!(!down);
+        // The next real press clears it again.
+        assert!(!crate::app::host_button_transition(
+            &mut stale, &mut down, true, false
+        ));
+        assert!(!stale);
+        assert!(down);
+    }
+
+    #[test]
+    fn cursor_positions_convert_with_the_recorded_scale() {
+        assert_eq!(
+            pointer_position_points(PhysicalPosition::new(200.0, 100.0), 2.0),
+            egui::pos2(100.0, 50.0)
+        );
+        let scaled = pointer_position_points(PhysicalPosition::new(300.0, 150.0), 1.5);
+        assert!((scaled.x - 200.0).abs() < 1.0e-4);
+        assert!((scaled.y - 100.0).abs() < 1.0e-4);
+        // A non-positive scale cannot divide by zero.
+        let clamped = pointer_position_points(PhysicalPosition::new(10.0, 10.0), 0.0);
+        assert!(clamped.x.is_finite() && clamped.y.is_finite());
+        assert!(clamped.x > 0.0 && clamped.y > 0.0);
     }
 
     #[test]

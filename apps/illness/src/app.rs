@@ -5,20 +5,21 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
 use egui::{
-    self, Color32, Event, Id, Key, Modifiers, Rect, Sense, Stroke, StrokeKind, Vec2,
+    self, Color32, Event, Id, Key, Modifiers, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand, pos2, vec2,
 };
 use illness_core::config::BackgroundMode;
 use illness_core::{Config, Material, Profile, Rgb, Theme, detect_profiles};
 use illness_term::{
-    GridSize, SelectionType, Session, SessionEvent, Side, SpawnSpec, encode_paste,
+    GridSize, MouseButton, SelectionType, Session, SessionEvent, Side, SpawnSpec, encode_paste,
     snapshot::CellFlags,
 };
 use illness_ui::chrome::{self, Action, ChromeState, TabInfo};
 use illness_ui::overlays::{self, OverlayKind, OverlayState, SearchRequest};
 use illness_ui::terminal::SearchState;
 use illness_ui::{
-    TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas, gpu::GpuText,
+    CellMetrics, TerminalAction, TerminalView, Tokens, design, fonts, glyph::GlyphAtlas,
+    gpu::GpuText,
 };
 use raw_window_handle::HasWindowHandle;
 use winit::window::Window;
@@ -77,7 +78,17 @@ const SPAWN_STARTING_CARD_DELAY: Duration = Duration::from_millis(750);
 const SPAWN_CANCEL_POLL: Duration = Duration::from_millis(25);
 /// Cap keys buffered while a shell is still starting, keeping the newest.
 const MAX_PENDING_INPUT_EVENTS: usize = 512;
-
+/// Width of the pointer-sensitive band at the right edge of the terminal,
+/// covering the padding gutter plus the scrollbar strip. Slightly
+/// over-inclusive on purpose: a false positive only paints, a false negative
+/// would leave the scrollbar hover highlight stale.
+const SCROLLBAR_HOVER_BAND: f32 = 12.0;
+/// Invisible window-resize hit bands, in points: [`RESIZE_EDGE`] deep on the
+/// straight edges and [`RESIZE_CORNER`] at the corners. Hovering one changes
+/// the cursor to a resize arrow, so the pointer-inert region subtracts exactly
+/// these zones instead of insetting every edge by the larger one.
+const RESIZE_EDGE: f32 = 5.0;
+const RESIZE_CORNER: f32 = 12.0;
 /// Pending delayed config write. A pointer release flushes immediately so a
 /// click never waits for the timer.
 #[derive(Debug, Default)]
@@ -586,6 +597,45 @@ pub struct IllnessApp {
     /// exiting. Refreshed from the setting plus the terminal-tab count every
     /// frame.
     close_guarded: Arc<AtomicBool>,
+    /// The part of the window whose paint does not depend on the pointer: the
+    /// painted terminal area (cells and their padding gutter) minus the
+    /// scrollbar strip and the window resize zones. `None` when no plain grid
+    /// was painted (settings, a starting or failed shell), so every move
+    /// repaints. Recorded from the last pass.
+    pointer_inert: Option<InertRegion>,
+    /// Whether a pointer button is held (a selection or scrollbar drag), which
+    /// makes every pointer move change pixels.
+    pointer_down: bool,
+    /// Set when the pointer leaves the window or focus is lost while a button
+    /// may still look down to egui. It stays set until a new press is seen
+    /// with a live pointer position, so a stale `any_down` cannot re-latch the
+    /// gate after re-entry.
+    pointer_stale_down: bool,
+    /// Whether the previous `CursorMoved` sample was inside `pointer_inert`.
+    /// Entering the inert grid from chrome must still paint once, so egui's
+    /// hover fade-out starts instead of freezing the last hovered widget.
+    pointer_prev_inert: bool,
+    /// The active grid's child may write hover motion reports (DECSET 1003, or
+    /// 1002 during a press) and the window is focused. The per-move answer still
+    /// needs [`TerminalView::motion_wanted_at`]: a move inside an already
+    /// reported cell writes nothing and must not paint.
+    pointer_motion: bool,
+    /// Whether an IME preedit is open. The candidate window is anchored at the
+    /// hovered cell, so hover must repaint while composing.
+    ime_preedit: bool,
+    /// Grid geometry of the last painted pass, so the Ctrl-hover gate can tell
+    /// whether a move crossed into another cell.
+    grid_geometry: Option<GridGeometry>,
+    /// Cell and link-hover state of the last move the link-hover gate sampled.
+    /// A move inside the same cell with the same answer changes no pixel.
+    ctrl_hover: Option<CtrlHoverKey>,
+    /// The right-hand scrollbar band painted last pass, when the bar exists.
+    /// The bar's hover is one boolean for the whole band, so a move inside it
+    /// changes nothing.
+    scrollbar_band: Option<Rect>,
+    /// Whether the previous pointer sample was inside `scrollbar_band`. Only a
+    /// transition paints: entering or leaving the band changes the bar's hover.
+    scrollbar_hover: bool,
 }
 
 impl IllnessApp {
@@ -708,6 +758,16 @@ impl IllnessApp {
             saved: false,
             close_confirmed: false,
             close_guarded,
+            pointer_inert: None,
+            pointer_down: false,
+            pointer_stale_down: false,
+            pointer_prev_inert: false,
+            pointer_motion: false,
+            ime_preedit: false,
+            grid_geometry: None,
+            ctrl_hover: None,
+            scrollbar_band: None,
+            scrollbar_hover: false,
         };
         app.applied_font_size = app.config.font_size;
         app.applied_ppp = app.ctx.pixels_per_point();
@@ -949,6 +1009,7 @@ impl IllnessApp {
     /// dropped, shutting its child down).
     fn apply_spawn_results(&mut self) {
         let modifiers = self.ctx.input(|input| input.modifiers);
+        let shift_enter_newline = self.config.shift_enter_newline;
         let mut cwd_updates = Vec::new();
         while let Ok(result) = self.spawn_rx.try_recv() {
             let Some(tab) = terminal_tab_mut(&mut self.tabs, result.tab_id) else {
@@ -969,10 +1030,12 @@ impl IllnessApp {
             if pending.is_empty() || session.is_exited() {
                 continue;
             }
-            if let Some(bytes) = tab
-                .view
-                .encode_input(&pending, modifiers, session.term_modes())
-            {
+            if let Some(bytes) = tab.view.encode_input(
+                &pending,
+                modifiers,
+                session.term_modes(),
+                shift_enter_newline,
+            ) {
                 session.write(&bytes);
                 tab.user_acted = true;
             }
@@ -1042,60 +1105,7 @@ impl IllnessApp {
 
     /// Invisible resize hit-testing for the frameless window.
     fn resize_edges(&self, ui: &mut egui::Ui) {
-        let screen = ui.ctx().content_rect();
-        let edge = 5.0;
-        let corner = 12.0;
-        let (left, top, right, bottom) =
-            (screen.left(), screen.top(), screen.right(), screen.bottom());
-
-        let zones = [
-            (
-                egui::ResizeDirection::North,
-                Rect::from_min_max(pos2(left + corner, top), pos2(right - corner, top + edge)),
-                egui::CursorIcon::ResizeVertical,
-            ),
-            (
-                egui::ResizeDirection::South,
-                Rect::from_min_max(
-                    pos2(left + corner, bottom - edge),
-                    pos2(right - corner, bottom),
-                ),
-                egui::CursorIcon::ResizeVertical,
-            ),
-            (
-                egui::ResizeDirection::West,
-                Rect::from_min_max(pos2(left, top + corner), pos2(left + edge, bottom - corner)),
-                egui::CursorIcon::ResizeHorizontal,
-            ),
-            (
-                egui::ResizeDirection::East,
-                Rect::from_min_max(
-                    pos2(right - edge, top + corner),
-                    pos2(right, bottom - corner),
-                ),
-                egui::CursorIcon::ResizeHorizontal,
-            ),
-            (
-                egui::ResizeDirection::NorthWest,
-                Rect::from_min_max(pos2(left, top), pos2(left + corner, top + corner)),
-                egui::CursorIcon::ResizeNwSe,
-            ),
-            (
-                egui::ResizeDirection::NorthEast,
-                Rect::from_min_max(pos2(right - corner, top), pos2(right, top + corner)),
-                egui::CursorIcon::ResizeNeSw,
-            ),
-            (
-                egui::ResizeDirection::SouthWest,
-                Rect::from_min_max(pos2(left, bottom - corner), pos2(left + corner, bottom)),
-                egui::CursorIcon::ResizeNeSw,
-            ),
-            (
-                egui::ResizeDirection::SouthEast,
-                Rect::from_min_max(pos2(right - corner, bottom - corner), pos2(right, bottom)),
-                egui::CursorIcon::ResizeNwSe,
-            ),
-        ];
+        let zones = resize_zones(ui.ctx().content_rect());
 
         for (index, (direction, zone, cursor)) in zones.into_iter().enumerate() {
             let response = ui.interact(
@@ -3031,6 +3041,11 @@ impl IllnessApp {
             self.revalidate_backdrop_now(Instant::now());
         }
         self.window_focused = focused;
+        // The IME candidate window is anchored at the hovered cell, so a gated
+        // grid hover must repaint while a preedit is open.
+        let preedit_open =
+            ctx.input(|input| ime_preedit_active(self.ime_preedit, &input.events, focused));
+        self.ime_preedit = preedit_open;
         self.update_window_title(&ctx);
 
         let tab_infos = self.tab_infos();
@@ -3101,7 +3116,12 @@ impl IllnessApp {
                 // Read modes from the live session so this frame's DECCKM /
                 // bracketed-paste transition already applies to this frame's keys.
                 let modes = session.term_modes();
-                if let Some(bytes) = tab.view.encode_input(&events, modifiers, modes) {
+                if let Some(bytes) = tab.view.encode_input(
+                    &events,
+                    modifiers,
+                    modes,
+                    self.config.shift_enter_newline,
+                ) {
                     session.write(&bytes);
                     // Only bytes actually delivered to this shell count as use.
                     tab.user_acted = true;
@@ -3119,6 +3139,13 @@ impl IllnessApp {
         let frame_now = ctx.input(|input| input.time);
         let mut terminal_actions = Vec::new();
         let mut terminal_rect = None;
+        let mut grid_inert = None;
+        let mut grid_scrollbar = None;
+        let mut grid_geometry = None;
+        let mut grid_motion = false;
+        // The active tab paints a recovery card over its grid, so the grid's
+        // hover does not describe the pointer.
+        let mut grid_recovery = false;
         let mut context_menu_pos = None;
         let mut recovery_action = None;
         let mut starting_action = None;
@@ -3162,6 +3189,7 @@ impl IllnessApp {
                     );
                     return;
                 };
+                grid_recovery = tab.recovery;
 
                 if let Some(session) = &tab.session {
                     let response = tab.view.show(
@@ -3175,11 +3203,36 @@ impl IllnessApp {
                         surface_material,
                     );
                     terminal_rect = Some(response.response.rect);
-                    let input_sent = response.input_sent && !session.is_exited();
-                    terminal_actions = response.actions;
-                    if input_sent {
+                    // Only a plain grid is pointer-inert. The scrollbar strip
+                    // at the right edge highlights on hover, and the resize
+                    // zones change the cursor icon, so both stay out. The
+                    // padding gutter and the cells themselves are inert.
+                    let rect = response.response.rect;
+                    // The scrollbar strip only highlights while a bar exists,
+                    // and the bar only exists with scrollback. An empty
+                    // history keeps the whole right band inert, so a plain
+                    // shell does not repaint at pointer rate over it. The
+                    // view caches this from its last snapshot; asking the
+                    // session would build a second full snapshot per frame.
+                    let has_history = tab.view.has_scrollback();
+                    let band = scrollbar_hover_band(config.padding, has_history);
+                    grid_inert = Some(inert_grid(rect, band, ui.ctx().content_rect()));
+                    // Only a real bar has a hover to dedupe. The recorded band
+                    // is the exact strip the inert region leaves out.
+                    grid_scrollbar = has_history.then(|| scrollbar_band_rect(rect, band));
+                    grid_geometry = Some(GridGeometry {
+                        rect,
+                        padding: config.padding,
+                        metrics: atlas.metrics(),
+                        cells: (response.cols, response.rows),
+                    });
+                    grid_motion = tab.view.wants_motion();
+                    // A hover motion report is input bytes, but not a user
+                    // action: it must not hide the startup recovery card.
+                    if counts_as_user_action(response.input_sent, session.is_exited()) {
                         tab.user_acted = true;
                     }
+                    terminal_actions = response.actions;
                     if response.response.secondary_clicked()
                         && (!tab.view.mouse_reporting() || ui.input(|input| input.modifiers.shift))
                     {
@@ -3232,6 +3285,23 @@ impl IllnessApp {
                 }
             });
         }
+
+        // Record which pixels the pointer can affect, as painted this pass: a
+        // bare grid cell repaints nothing, everything else (chrome, the
+        // scrollbar strip, cards, settings) may. A held button is a selection
+        // or scrollbar drag and always repaints.
+        self.pointer_inert = recorded_inert(grid_inert, grid_recovery);
+        self.pointer_motion = recorded_motion(grid_motion, self.window_focused);
+        self.grid_geometry = grid_geometry;
+        self.scrollbar_band = recorded_inert(grid_scrollbar, grid_recovery);
+        self.pointer_down = ctx.input(|input| {
+            pointer_down_latched(
+                &mut self.pointer_stale_down,
+                input.pointer.any_down(),
+                input.pointer.any_pressed(),
+                input.pointer.latest_pos().is_some(),
+            )
+        });
 
         if settings_outcome.changed {
             self.reapply_config();
@@ -3313,6 +3383,575 @@ impl IllnessApp {
             self.theme.bg,
         )
     }
+
+    /// Whether a pointer move to `pos` may change a pixel.
+    ///
+    /// Hovering a bare grid cell changes nothing, but chrome has hover states,
+    /// a Ctrl hover over a link shows the pointer cursor when the active view's
+    /// [`TerminalView::link_hover_wanted`] says so (Shift override included), an
+    /// open overlay or dropdown tracks the pointer, and a held button is a
+    /// selection or scrollbar drag. The scrollbar band repaints only when it is
+    /// entered or left, because the bar's hover is one boolean. Inside the grid,
+    /// the active view's [`TerminalView::motion_wanted_at`] decides per move
+    /// whether the child would receive a motion report at the last painted
+    /// geometry, and an open IME preedit also depends on the pointer. Entering
+    /// the inert grid must paint once so a stale chrome hover fades out.
+    /// Everything else (PTY output, animations, explicit `request_repaint`) is
+    /// scheduled independently of this gate.
+    pub fn pointer_needs_repaint(&mut self, pos: Option<Pos2>, ctrl: bool, shift: bool) -> bool {
+        let overlay_open =
+            !matches!(self.overlays.kind, OverlayKind::None) || self.chrome.dropdown_open;
+        let inert = self.pointer_inert;
+        // One containment test per move. No recorded grid (first pass,
+        // settings, a card) means the pointer may be over anything, so the
+        // move lands in chrome and paints.
+        let inside = pos.is_some_and(|pos| inert.is_some_and(|grid| grid.contains(pos)));
+        let entered = entered_inert(inside, &mut self.pointer_prev_inert);
+        let motion_wanted = inside
+            && self.pointer_motion
+            && pos.is_some_and(|pos| view_motion_wanted(self.active_view(), pos));
+        // The scrollbar band leaves the inert region out, but the bar's hover
+        // is one boolean for the whole band: a move along it changes nothing.
+        let on_scrollbar =
+            pos.is_some_and(|pos| self.scrollbar_band.is_some_and(|band| band.contains(pos)));
+        let scrollbar_changed = scrollbar_hover_changed(&mut self.scrollbar_hover, on_scrollbar);
+        // The pointing-hand cursor appears while the active view wants a link
+        // hover and disappears when Ctrl/Shift change or the pointer crosses
+        // into another cell, so a whole sweep must not repaint per move.
+        let cell = self
+            .grid_geometry
+            .and_then(|grid| pos.and_then(|pos| grid.cell_at(pos)));
+        let link_hover = self
+            .active_view()
+            .is_some_and(|view| view.link_hover_wanted(ctrl, shift));
+        let link_hover = ctrl_hover_changed(&mut self.ctrl_hover, cell, link_hover);
+        pointer_repaints(&PointerSample {
+            pos,
+            in_chrome: !inside && !on_scrollbar,
+            on_scrollbar,
+            scrollbar_changed,
+            entered_grid: entered,
+            motion_wanted,
+            ime_preedit: self.ime_preedit,
+            ctrl: link_hover,
+            overlay_open,
+            pointing: self.pointer_down,
+        })
+    }
+
+    /// The view of the active tab, when it has one.
+    fn active_view(&self) -> Option<&TerminalView> {
+        match self.tabs.get(self.active) {
+            Some(TabEntry::Terminal(tab)) => Some(&tab.view),
+            _ => None,
+        }
+    }
+
+    /// A raw `MouseInput` transition the host observed, folded into the pointer
+    /// gate before the next pass reads egui's pointer state.
+    ///
+    /// Windows delivers the transition even when `egui_winit` drops it for want
+    /// of a live pointer position, so this is the only place a drag that
+    /// crossed the window edge is repaired: a press clears the stale latch that
+    /// [`Self::pointer_left_window`] set, and a swallowed release ends the
+    /// press. Only a release egui never delivered reaches the views; the normal
+    /// case is already handled by the frame that reports it, and notifying
+    /// there would end the press before the selection finalizes. The repaint
+    /// that release requests delivers the owed mouse-up.
+    ///
+    /// `pointer_inside` is the host's winit-tracked presence, not
+    /// `pointer.latest_pos()`: egui only updates that at `begin_pass`, so a
+    /// release queued right after `CursorLeft` would still read inside.
+    pub fn pointer_button(
+        &mut self,
+        button: MouseButton,
+        pressed: bool,
+        seen_by_egui: bool,
+        pointer_inside: bool,
+    ) {
+        let released = host_button_transition(
+            &mut self.pointer_stale_down,
+            &mut self.pointer_down,
+            pressed,
+            seen_by_egui,
+        );
+        if swallowed_release(released, pointer_inside) {
+            for view in terminal_views(&mut self.tabs) {
+                view.host_release(button);
+            }
+        }
+    }
+
+    /// Fold a `CursorEntered` into the gate: a button that is still physically
+    /// down continues the drag, so no new press will arrive to clear the stale
+    /// latch a window exit set.
+    pub fn pointer_entered_window(&mut self, held: bool) {
+        enter_pointer_window(&mut self.pointer_stale_down, held);
+    }
+
+    /// Forget the pointer gate's per-pointer memory after the pointer leaves the
+    /// window.
+    ///
+    /// egui keeps `any_down` set after `PointerGone`, so a drag released outside
+    /// the window would otherwise keep [`Self::pointer_down`] latched and force
+    /// a repaint on every later move. The grid-entry memory is cleared too, so
+    /// re-entering directly onto the grid still paints once to clear a stale
+    /// hover. A button the host still sees down keeps the drag alive; only a
+    /// gesture that really ended latches the stale state.
+    pub fn pointer_left_window(&mut self, held: bool) {
+        leave_pointer_window(
+            &mut self.pointer_down,
+            &mut self.pointer_prev_inert,
+            &mut self.pointer_stale_down,
+            held,
+        );
+        self.scrollbar_hover = false;
+    }
+
+    /// Forget the pointer gate's per-pointer memory after the window loses
+    /// focus. A stale egui button must not keep every later move painting, so
+    /// the latch is set here regardless of the physical buttons: an unfocused
+    /// window may never be told about the release.
+    ///
+    /// The views are told too. `Focused(false)` and `Focused(true)` can both
+    /// arrive before the next pass, so a view would never observe an unfocused
+    /// paint and egui's stale `any_down` would keep a button latched and a
+    /// selection's autoscroll loop running.
+    pub fn pointer_focus_lost(&mut self) {
+        reset_pointer_memory(&mut self.pointer_down, &mut self.pointer_prev_inert);
+        self.pointer_stale_down = true;
+        self.scrollbar_hover = false;
+        notify_focus_lost(&mut self.tabs);
+    }
+}
+
+/// One `CursorMoved`, reduced to the facts the pointer gate needs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PointerSample {
+    /// Pointer position; `None` means it left the window.
+    pub pos: Option<Pos2>,
+    /// Over anything but an inert grid cell (titlebar, tabs, captions,
+    /// scrollbar strip, resize bands, a card, settings).
+    pub in_chrome: bool,
+    /// Over the scrollbar band of a grid that has scrollback. The bar's hover
+    /// is one boolean, so only `scrollbar_changed` matters here.
+    pub on_scrollbar: bool,
+    /// The sample moved into or out of the scrollbar band, which toggles the
+    /// bar's hover highlight.
+    pub scrollbar_changed: bool,
+    /// The pointer just moved into the inert grid from outside it.
+    pub entered_grid: bool,
+    /// The active view would write a hover motion report for this move, at the
+    /// grid geometry and dedupe key of the last painted frame.
+    pub motion_wanted: bool,
+    /// An IME preedit is open and anchored at the hovered cell.
+    pub ime_preedit: bool,
+    /// The active view's link-hover answer changed for this move (the
+    /// pointing hand may appear or disappear), so the cursor changes.
+    pub ctrl: bool,
+    /// A modal, menu, or dropdown is open and tracks the pointer.
+    pub overlay_open: bool,
+    /// A button is held (selection or scrollbar drag).
+    pub pointing: bool,
+}
+
+/// Whether a pointer move repaints, given what the last pass recorded.
+///
+/// Pure so the decision is testable without a window. A missing position means
+/// the pointer left the window, which must still clear the hover state, and
+/// every chrome hit repaints because chrome has hover states, except the
+/// scrollbar band, whose hover is one boolean: only entering or leaving it
+/// paints. Inside the inert grid the only pointer-dependent pixels are a move
+/// that would write a motion report at the last painted geometry, an open IME
+/// preedit, and the single frame that clears a stale chrome hover on entry.
+pub(crate) fn pointer_repaints(sample: &PointerSample) -> bool {
+    let Some(_) = sample.pos else {
+        return true;
+    };
+    if sample.on_scrollbar {
+        // The bar's hover is one boolean for the whole band, so a move inside
+        // it repaints only when the band is entered or left, or while an open
+        // overlay or a scrollbar drag still follows the pointer.
+        return sample.scrollbar_changed || sample.overlay_open || sample.pointing;
+    }
+    if sample.in_chrome || sample.ctrl || sample.overlay_open || sample.pointing {
+        return true;
+    }
+    sample.motion_wanted || sample.ime_preedit || sample.entered_grid
+}
+
+/// The frameless window's invisible resize hit zones: direction, hit rect, and
+/// the cursor each shows on hover. One geometry for the hit-testing and the
+/// pointer gate's inert region, so a zone can never hover without painting.
+pub(crate) fn resize_zones(screen: Rect) -> [(egui::ResizeDirection, Rect, egui::CursorIcon); 8] {
+    let edge = RESIZE_EDGE;
+    let corner = RESIZE_CORNER;
+    let (left, top, right, bottom) = (screen.left(), screen.top(), screen.right(), screen.bottom());
+    [
+        (
+            egui::ResizeDirection::North,
+            Rect::from_min_max(pos2(left + corner, top), pos2(right - corner, top + edge)),
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            egui::ResizeDirection::South,
+            Rect::from_min_max(
+                pos2(left + corner, bottom - edge),
+                pos2(right - corner, bottom),
+            ),
+            egui::CursorIcon::ResizeVertical,
+        ),
+        (
+            egui::ResizeDirection::West,
+            Rect::from_min_max(pos2(left, top + corner), pos2(left + edge, bottom - corner)),
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            egui::ResizeDirection::East,
+            Rect::from_min_max(
+                pos2(right - edge, top + corner),
+                pos2(right, bottom - corner),
+            ),
+            egui::CursorIcon::ResizeHorizontal,
+        ),
+        (
+            egui::ResizeDirection::NorthWest,
+            Rect::from_min_max(pos2(left, top), pos2(left + corner, top + corner)),
+            egui::CursorIcon::ResizeNwSe,
+        ),
+        (
+            egui::ResizeDirection::NorthEast,
+            Rect::from_min_max(pos2(right - corner, top), pos2(right, top + corner)),
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            egui::ResizeDirection::SouthWest,
+            Rect::from_min_max(pos2(left, bottom - corner), pos2(left + corner, bottom)),
+            egui::CursorIcon::ResizeNeSw,
+        ),
+        (
+            egui::ResizeDirection::SouthEast,
+            Rect::from_min_max(pos2(right - corner, bottom - corner), pos2(right, bottom)),
+            egui::CursorIcon::ResizeNwSe,
+        ),
+    ]
+}
+
+/// Grid geometry of the last painted pass, for the Ctrl-hover dedupe.
+///
+/// The view keeps its own copy private; this is the same mapping rebuilt from
+/// the painted response (`rect`, `cols`, `rows`), the padding used to inset the
+/// cells, and the atlas cell metrics, so a move can be reduced to a cell without
+/// a second full snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GridGeometry {
+    /// Painted terminal area, padding included.
+    rect: Rect,
+    padding: f32,
+    metrics: CellMetrics,
+    cells: (usize, usize),
+}
+
+impl GridGeometry {
+    /// The cell a pointer position maps to, or `None` outside the grid.
+    fn cell_at(&self, pos: Pos2) -> Option<(usize, usize)> {
+        let padding = self.padding.max(0.0);
+        let grid = Rect::from_min_size(
+            pos2(self.rect.min.x + padding, self.rect.min.y + padding),
+            vec2(
+                self.metrics.width * self.cells.0 as f32,
+                self.metrics.height * self.cells.1 as f32,
+            ),
+        );
+        TerminalView::cell_at(pos, grid, &self.metrics, self.cells)
+    }
+}
+
+/// The part of a painted terminal area whose pixels do not depend on the
+/// pointer: the area left of the scrollbar strip, minus the window resize zones
+/// whose hover changes the cursor icon.
+///
+/// A single uniform inset by the corner size would wrongly classify the padding
+/// gutter and the first/last cell rows as chrome: the straight bands are only
+/// [`RESIZE_EDGE`] deep and do not reach past the padding of a default theme.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct InertRegion {
+    /// Terminal area left of the scrollbar strip, padding gutter included.
+    area: Rect,
+    /// Resize hit zones, subtracted from `area`.
+    resize: [Rect; 8],
+}
+
+impl InertRegion {
+    /// One containment test per move: inside the area and outside every zone.
+    pub(crate) fn contains(&self, pos: Pos2) -> bool {
+        self.area.contains(pos) && !self.resize.iter().any(|zone| zone.contains(pos))
+    }
+}
+
+/// The pointer-inert part of a painted terminal area.
+///
+/// `scrollbar_band` covers the terminal padding plus the scrollbar strip at the
+/// right edge, where hover highlights the bar. The padding gutter on the other
+/// edges stays inert: a pointer parked there changes no pixels. The resize
+/// zones come from the same geometry [`IllnessApp::resize_edges`] hit-tests.
+/// Slightly over-inclusive on purpose: a false positive only paints.
+pub(crate) fn inert_grid(rect: Rect, scrollbar_band: f32, screen: Rect) -> InertRegion {
+    let band = scrollbar_band.max(0.0).min(rect.width());
+    let area = Rect::from_min_max(
+        rect.min,
+        pos2((rect.right() - band).max(rect.left()), rect.bottom()),
+    );
+    InertRegion {
+        area,
+        resize: resize_zones(screen).map(|(_, zone, _)| zone),
+    }
+}
+
+/// Whether a pointer move must repaint the scrollbar band.
+///
+/// The bar's hover is one boolean over the whole band, so a move that stays in
+/// the band changes no pixel. `memory` is the previous sample's answer; only a
+/// transition paints. A caller still paints for an open overlay or a held
+/// button, which follow the pointer along the band.
+pub(crate) fn scrollbar_hover_changed(memory: &mut bool, on_scrollbar: bool) -> bool {
+    std::mem::replace(memory, on_scrollbar) != on_scrollbar
+}
+
+/// The right-hand band a scrollbar reserves in a painted terminal area: the
+/// padding gutter plus the strip. Recorded only while the bar exists.
+pub(crate) fn scrollbar_band_rect(rect: Rect, band: f32) -> Rect {
+    let band = band.max(0.0).min(rect.width());
+    Rect::from_min_max(pos2(rect.right() - band, rect.top()), rect.max)
+}
+
+/// Cell and link-hover state of the last pointer sample the gate used.
+type CtrlHoverKey = (Option<(usize, usize)>, bool);
+
+/// Whether a pointer move can change what a Ctrl/link hover paints.
+///
+/// The pointing hand only appears or disappears when the pointer crosses into
+/// another cell or the view's answer changes, so a sweep across an inert grid
+/// must not repaint per move. `memory` holds the last sampled cell and answer;
+/// the result is `true` for the first hover sample, for a new cell while the
+/// hand is (or was) shown, and for the move that clears it. A plain button-less
+/// move with no hover involvement never forces a paint.
+pub(crate) fn ctrl_hover_changed(
+    memory: &mut Option<CtrlHoverKey>,
+    cell: Option<(usize, usize)>,
+    ctrl: bool,
+) -> bool {
+    let key = (cell, ctrl);
+    if *memory == Some(key) {
+        return false;
+    }
+    let was_ctrl = memory.is_some_and(|(_, previous)| previous);
+    *memory = Some(key);
+    ctrl || was_ctrl
+}
+
+/// The payload a pass records for the pointer gate.
+///
+/// A recovery card floats over the grid with hoverable buttons, so a recovering
+/// tab records no inert region and no scrollbar band at all: every move may
+/// change the card's hover feedback and must paint.
+pub(crate) fn recorded_inert<T>(grid: Option<T>, recovery: bool) -> Option<T> {
+    if recovery { None } else { grid }
+}
+
+/// Whether the active view would write a motion report for a move to `pos`.
+///
+/// The view keeps the last painted grid geometry, mouse modes, and motion
+/// dedupe key, so asking it here makes a move inside an already reported cell
+/// free while a move into a new cell paints. Without a view the caller is over
+/// chrome, which paints anyway.
+pub(crate) fn view_motion_wanted(view: Option<&TerminalView>, pos: Pos2) -> bool {
+    view.is_some_and(|view| view.motion_wanted_at(pos))
+}
+
+/// The hover-motion flag a pass records for the pointer gate.
+///
+/// The view drops hover reports while the window is unfocused, so recording the
+/// child's want then would make every background move repaint for nothing.
+pub(crate) fn recorded_motion(wants_motion: bool, focused: bool) -> bool {
+    wants_motion && focused
+}
+
+/// Fold one pointer move into the gate's "inside the inert grid" memory and
+/// report whether this move just entered it.
+///
+/// `inside` is computed once by the caller so a move costs a single
+/// containment test.
+pub(crate) fn entered_inert(inside: bool, prev_inert: &mut bool) -> bool {
+    let entered = inside && !*prev_inert;
+    *prev_inert = inside;
+    entered
+}
+
+/// Whether a held button is a real drag, and latch the stale-down memory.
+///
+/// egui keeps `any_down` set after `PointerGone`, so one drag released outside
+/// the window would otherwise latch the gate into painting forever. A press
+/// that began before the pointer left stays stale until a new press is seen
+/// with a live position; merely re-entering and moving must not revive it.
+pub(crate) fn pointer_down_latched(
+    stale_down: &mut bool,
+    any_down: bool,
+    any_pressed: bool,
+    has_pos: bool,
+) -> bool {
+    if any_pressed && has_pos {
+        *stale_down = false;
+    }
+    (any_down || any_pressed) && !*stale_down && has_pos
+}
+
+/// Fold a raw mouse-button transition into the gate's pointer memory.
+///
+/// A press always proves a button is now held, so it clears the stale latch a
+/// window exit set and latches the drag: a drag that crossed the window edge
+/// and came back must keep counting as a selection or scrollbar drag for the
+/// rest of the gesture. A release ends the gesture and reports `true` so the
+/// host repaints and the active view can pay a mouse-up the child is owed.
+///
+/// When `egui_winit` dropped the release (no live pointer position) its
+/// `any_down` stays latched, so the stale latch must stay set; otherwise the
+/// next pass would trust that stale state and paint every move again.
+pub(crate) fn host_button_transition(
+    stale_down: &mut bool,
+    down: &mut bool,
+    pressed: bool,
+    seen_by_egui: bool,
+) -> bool {
+    if pressed {
+        *stale_down = false;
+        *down = true;
+        false
+    } else {
+        *stale_down = !seen_by_egui;
+        *down = false;
+        true
+    }
+}
+
+/// Forget the pointer gate's per-pointer memory: a release outside the window
+/// (or a focus loss) ends any drag, and entering the grid afresh must paint.
+pub(crate) fn reset_pointer_memory(down: &mut bool, prev_inert: &mut bool) {
+    *down = false;
+    *prev_inert = false;
+}
+
+/// Fold a window exit into the gate's drag memory.
+///
+/// A button the host still sees physically down is a drag that merely crossed
+/// the window edge, so the stale latch stays clear and moving on re-entry keeps
+/// painting. Only a gesture that really ended latches the stale state, because
+/// egui's `any_down` can stay set after `PointerGone`.
+pub(crate) fn leave_pointer_window(
+    down: &mut bool,
+    prev_inert: &mut bool,
+    stale_down: &mut bool,
+    held: bool,
+) {
+    reset_pointer_memory(down, prev_inert);
+    *stale_down = !held;
+}
+
+/// Fold a window re-entry into the gate's drag memory.
+///
+/// A press that crossed the edge happened inside the window, so returning while
+/// the button is still held must clear the latch instead of waiting for a new
+/// press that will never come.
+pub(crate) fn enter_pointer_window(stale_down: &mut bool, held: bool) {
+    if held {
+        *stale_down = false;
+    }
+}
+
+/// Whether a host-observed release is one egui never delivered.
+///
+/// `egui_winit` drops button events while it has no pointer position, so a
+/// release outside the window reaches only the host. `pointer_inside` comes
+/// from winit's `CursorEntered`/`CursorLeft`, not from egui's latest position:
+/// that is only updated at `begin_pass`, so a release queued right after
+/// `CursorLeft` would still look inside. A live position means the frame's own
+/// handling already covers the release and the views must not be told twice.
+pub(crate) fn swallowed_release(released: bool, pointer_inside: bool) -> bool {
+    released && !pointer_inside
+}
+
+/// Every open terminal view, for a host-observed release.
+///
+/// The press may have started in one tab and the release may arrive while
+/// another is active, so the active tab alone would leave the first view's
+/// button latched until it is painted again. `host_release` is idempotent, so
+/// telling every view is safe.
+fn terminal_views(tabs: &mut [TabEntry]) -> impl Iterator<Item = &mut TerminalView> {
+    tabs.iter_mut().filter_map(|tab| match tab {
+        TabEntry::Terminal(tab) => Some(&mut tab.view),
+        TabEntry::Settings => None,
+    })
+}
+
+/// Tell every open terminal view that the window lost focus.
+///
+/// An unfocused pass is not guaranteed: `Focused(false)` and `Focused(true)`
+/// can both arrive before the next paint, so the views would keep egui's stale
+/// `any_down` latch and an autoscroll loop alive. `host_focus_lost` is
+/// idempotent, so every view is told, not just the active one. Returns how many
+/// views were notified.
+fn notify_focus_lost(tabs: &mut [TabEntry]) -> usize {
+    let mut notified = 0;
+    for view in terminal_views(tabs) {
+        view.host_focus_lost();
+        notified += 1;
+    }
+    notified
+}
+
+/// Width of the right-hand band the pointer gate leaves out of the inert grid
+/// so the scrollbar can highlight.
+///
+/// The bar only exists when the session has scrollback. With an empty history
+/// the band is plain padding and stays inert, so a shell with nothing to scroll
+/// does not repaint on every move across that strip.
+pub(crate) fn scrollbar_hover_band(padding: f32, has_history: bool) -> f32 {
+    let padding = padding.max(0.0);
+    if has_history {
+        padding + SCROLLBAR_HOVER_BAND
+    } else {
+        padding
+    }
+}
+
+/// Whether input written during a pass counts as use of the tab.
+///
+/// Hover motion reports now set only `motion_sent`, so a frame carrying real
+/// input (a key, paste, wheel notch, press or release) still counts even when a
+/// move report rides along. A motion-only pass leaves `input_sent` false.
+fn counts_as_user_action(input_sent: bool, exited: bool) -> bool {
+    input_sent && !exited
+}
+
+/// Fold this pass's IME events into the preedit flag.
+///
+/// A non-empty preedit opens composition; an empty preedit, a commit, or a
+/// disabled IME closes it, and focus loss closes it because no commit arrives
+/// for a candidate window abandoned by an alt-tab.
+#[allow(deprecated)] // `ImeEvent::Disabled` is deprecated but still delivered.
+fn ime_preedit_active(active: bool, events: &[Event], focused: bool) -> bool {
+    if !focused {
+        return false;
+    }
+    let mut active = active;
+    for event in events {
+        match event {
+            Event::Ime(egui::ImeEvent::Preedit { text, .. }) => active = !text.is_empty(),
+            Event::Ime(egui::ImeEvent::Commit(_) | egui::ImeEvent::Disabled) => active = false,
+            _ => {}
+        }
+    }
+    active
 }
 
 /// Surface painted behind a tab that has no grid yet (starting or failed).
@@ -5671,10 +6310,29 @@ mod tests {
             view.encode_input(
                 &exit,
                 Modifiers::default(),
-                illness_term::TermModes::default()
+                illness_term::TermModes::default(),
+                true,
             ),
             Some(b"exit\r".to_vec()),
             "buffered pre-attach typing is written once the session attaches"
+        );
+
+        let shift_enter = session_input_events(&[Event::Key {
+            key: Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: shift(),
+        }]);
+        assert_eq!(
+            view.encode_input(
+                &shift_enter,
+                shift(),
+                illness_term::TermModes::default(),
+                false,
+            ),
+            Some(b"\r".to_vec()),
+            "with the mapping disabled, Shift+Enter replays as a plain CR"
         );
     }
 
@@ -6007,5 +6665,608 @@ mod tests {
                 shell.display()
             );
         }
+    }
+
+    /// A pointer sample over a bare, inert grid cell, already inside it.
+    fn grid_hover() -> PointerSample {
+        PointerSample {
+            pos: Some(pos2(400.0, 400.0)),
+            in_chrome: false,
+            on_scrollbar: false,
+            scrollbar_changed: false,
+            entered_grid: false,
+            motion_wanted: false,
+            ime_preedit: false,
+            ctrl: false,
+            overlay_open: false,
+            pointing: false,
+        }
+    }
+
+    #[test]
+    fn pointer_gate_repaints_for_chrome_and_overlays_only() {
+        assert!(pointer_repaints(&PointerSample {
+            in_chrome: true,
+            pos: Some(pos2(40.0, 12.0)),
+            ..grid_hover()
+        }));
+        assert!(!pointer_repaints(&grid_hover()));
+        assert!(pointer_repaints(&PointerSample {
+            ctrl: true,
+            ..grid_hover()
+        }));
+        assert!(pointer_repaints(&PointerSample {
+            overlay_open: true,
+            ..grid_hover()
+        }));
+        assert!(pointer_repaints(&PointerSample {
+            pos: None,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn grid_hover_skips_repaint() {
+        assert!(!pointer_repaints(&grid_hover()));
+    }
+
+    #[test]
+    fn titlebar_hover_repaints() {
+        assert!(pointer_repaints(&PointerSample {
+            in_chrome: true,
+            pos: Some(pos2(40.0, 12.0)),
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn scrollbar_band_hover_paints_only_on_a_transition() {
+        // The bar's hover is one boolean for the whole band.
+        let inside = PointerSample {
+            pos: Some(pos2(1170.0, 400.0)),
+            on_scrollbar: true,
+            ..grid_hover()
+        };
+        assert!(pointer_repaints(&PointerSample {
+            scrollbar_changed: true,
+            ..inside
+        }));
+        assert!(!pointer_repaints(&inside));
+        // A drag or an open overlay still follows the pointer along the band.
+        assert!(pointer_repaints(&PointerSample {
+            pointing: true,
+            ..inside
+        }));
+        assert!(pointer_repaints(&PointerSample {
+            overlay_open: true,
+            ..inside
+        }));
+    }
+
+    #[test]
+    fn scrollbar_band_only_changes_on_entry_or_exit() {
+        let mut memory = false;
+        assert!(
+            scrollbar_hover_changed(&mut memory, true),
+            "entering the band paints"
+        );
+        assert!(
+            !scrollbar_hover_changed(&mut memory, true),
+            "a move along the band changes nothing"
+        );
+        assert!(
+            scrollbar_hover_changed(&mut memory, false),
+            "leaving the band clears the hover"
+        );
+        assert!(!scrollbar_hover_changed(&mut memory, false));
+    }
+
+    #[test]
+    fn the_scrollbar_band_rect_is_the_strip_the_grid_leaves_out() {
+        let (rect, _screen) = terminal_area();
+        let band = scrollbar_band_rect(rect, 18.0);
+        assert!(band.contains(pos2(rect.right() - 1.0, rect.top() + 1.0)));
+        assert!(!band.contains(pos2(rect.right() - 19.0, rect.center().y)));
+        // A band wider than the area cannot invert the strip.
+        assert_eq!(scrollbar_band_rect(rect, rect.width() + 10.0), rect);
+    }
+
+    #[test]
+    fn overlay_open_repaints() {
+        assert!(pointer_repaints(&PointerSample {
+            overlay_open: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn link_hover_sample_repaints() {
+        assert!(pointer_repaints(&PointerSample {
+            ctrl: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn a_link_hover_change_without_a_cell_change_repaints() {
+        // The gate keys on the view's answer, not on Ctrl itself, so a Shift
+        // override or a child that owns the pointer can flip the hand while
+        // the cell stays put.
+        let mut memory = None;
+        assert!(!ctrl_hover_changed(&mut memory, Some((3, 3)), false));
+        assert!(ctrl_hover_changed(&mut memory, Some((3, 3)), true));
+        assert!(!ctrl_hover_changed(&mut memory, Some((3, 3)), true));
+        assert!(ctrl_hover_changed(&mut memory, Some((3, 3)), false));
+    }
+
+    #[test]
+    fn a_focus_loss_reaches_every_terminal_view() {
+        let mut tabs = vec![
+            TabEntry::Terminal(Box::new(Tab::pending(1, &Profile::default(), None))),
+            TabEntry::Settings,
+            TabEntry::Terminal(Box::new(Tab::pending(2, &Profile::default(), None))),
+        ];
+        // `host_focus_lost` is idempotent; a view with no press writes nothing.
+        assert_eq!(notify_focus_lost(&mut tabs), 2);
+    }
+
+    #[test]
+    fn pointer_left_repaints() {
+        assert!(pointer_repaints(&PointerSample {
+            pos: None,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn selecting_repaints() {
+        assert!(pointer_repaints(&PointerSample {
+            pointing: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn entering_the_inert_grid_repaints_once() {
+        // Leaving a hover-lit widget for the grid must paint so egui starts its
+        // hover fade-out; staying on grid cells keeps skipping.
+        let entered = PointerSample {
+            entered_grid: true,
+            ..grid_hover()
+        };
+        assert!(pointer_repaints(&entered));
+        assert!(!pointer_repaints(&grid_hover()));
+    }
+
+    #[test]
+    fn a_move_into_a_new_cell_repaints_a_motion_grid() {
+        // DECSET 1003 children get a report written when the pointer reaches a
+        // different cell, so the paint is required.
+        assert!(pointer_repaints(&PointerSample {
+            motion_wanted: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn a_move_inside_an_already_reported_cell_skips_the_repaint() {
+        // The view's per-move answer is `false` for the last reported cell: a
+        // full paint would write no bytes.
+        assert!(!pointer_repaints(&grid_hover()));
+    }
+
+    /// A terminal area filling the window below a 40 pt titlebar.
+    fn terminal_area() -> (Rect, Rect) {
+        (
+            Rect::from_min_max(pos2(0.0, 40.0), pos2(1000.0, 700.0)),
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0)),
+        )
+    }
+
+    #[test]
+    fn a_move_in_the_grid_gutter_skips_the_repaint() {
+        // Padding between the cells and the inert rect edge is inside the inert
+        // rect yet maps to no cell, so the view writes nothing and only the
+        // per-move answer, not the mode, decides.
+        let (rect, screen) = terminal_area();
+        let inert = inert_grid(rect, 30.0, screen);
+        let pos = pos2(960.0, 400.0);
+        assert!(
+            inert.contains(pos),
+            "the gutter stays inside the inert rect"
+        );
+        assert!(!pointer_repaints(&PointerSample {
+            pos: Some(pos),
+            in_chrome: false,
+            motion_wanted: false,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn a_click_only_grid_skips_hover_repaints() {
+        // DECSET 1002 with no button down writes nothing on a move, so the
+        // recorded mode alone must not force a paint.
+        assert!(!pointer_repaints(&grid_hover()));
+    }
+
+    #[test]
+    fn a_view_without_grid_geometry_repaints_the_first_move() {
+        // Before any frame recorded geometry the cell cannot be mapped, so the
+        // move must paint.
+        let view = TerminalView::default();
+        assert!(view_motion_wanted(Some(&view), pos2(400.0, 400.0)));
+        assert!(pointer_repaints(&PointerSample {
+            motion_wanted: view_motion_wanted(Some(&view), pos2(400.0, 400.0)),
+            ..grid_hover()
+        }));
+        // No view at all is chrome, which paints through `in_chrome`.
+        assert!(!view_motion_wanted(None, pos2(400.0, 400.0)));
+    }
+
+    #[test]
+    fn ime_preedit_repaints_hover() {
+        // The candidate window is anchored at the hovered cell while composing.
+        assert!(pointer_repaints(&PointerSample {
+            ime_preedit: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn inert_grid_excludes_scrollbar_and_resize_bands() {
+        let (rect, screen) = terminal_area();
+        let grid = inert_grid(rect, 30.0, screen);
+        // A plain cell in the middle stays inert.
+        assert!(grid.contains(pos2(500.0, 400.0)));
+        // The scrollbar strip on the right is chrome.
+        assert!(!grid.contains(pos2(990.0, 400.0)));
+        // Every window resize band is chrome, so the cursor icon can change.
+        assert!(!grid.contains(pos2(2.0, 400.0)));
+        assert!(!grid.contains(pos2(998.0, 400.0)));
+        assert!(!grid.contains(pos2(500.0, 698.0)));
+        assert!(!grid.contains(pos2(2.0, 698.0)));
+        // Inside the straight bands only 5 pt deep, so the rest of the left
+        // padding gutter is inert.
+        assert!(grid.contains(pos2(6.0, 400.0)));
+        // Below the bottom band, the last row and its padding stay inert.
+        assert!(grid.contains(pos2(500.0, 693.0)));
+        // The titlebar sits above the terminal, so the first row is not chrome.
+        assert!(grid.contains(pos2(500.0, 42.0)));
+    }
+
+    #[test]
+    fn a_small_titlebar_still_keeps_the_top_resize_band_out_of_the_grid() {
+        let rect = Rect::from_min_max(pos2(0.0, 4.0), pos2(1000.0, 700.0));
+        let screen = Rect::from_min_max(pos2(0.0, 0.0), pos2(1000.0, 700.0));
+        let grid = inert_grid(rect, 30.0, screen);
+        assert!(!grid.contains(pos2(500.0, 4.5)), "top band is chrome");
+        assert!(grid.contains(pos2(500.0, 6.0)), "plain cells stay inert");
+    }
+
+    #[test]
+    fn the_padding_gutter_and_bottom_padding_stay_inert() {
+        let (rect, screen) = terminal_area();
+        // Padding (8 pt) plus the 30 pt scrollbar strip, as the paint pass
+        // records it.
+        let grid = inert_grid(rect, 38.0, screen);
+        // The left and right padding gutters are not resize bands, so a parked
+        // pointer there changes nothing: only the 5 pt bands paint.
+        for pos in [pos2(6.5, 400.0), pos2(960.0, 400.0), pos2(500.0, 694.0)] {
+            assert!(grid.contains(pos), "{pos:?} is inert padding");
+            assert!(!pointer_repaints(&PointerSample {
+                pos: Some(pos),
+                in_chrome: false,
+                ..grid_hover()
+            }));
+        }
+        // The bottom padding gutter is only chrome where the resize band
+        // actually is.
+        assert!(!grid.contains(pos2(500.0, 697.0)));
+        assert!(!grid.contains(pos2(4.0, 697.0)), "corner zone is chrome");
+        assert!(!grid.contains(pos2(4.0, 400.0)), "edge band is chrome");
+    }
+
+    #[test]
+    fn the_recovery_card_keeps_the_grid_out_of_the_inert_region() {
+        let (rect, screen) = terminal_area();
+        let grid = inert_grid(rect, 30.0, screen);
+        // Hovering the card's buttons over the grid must keep painting.
+        assert_eq!(recorded_inert(Some(grid), true), None);
+        // Without a card the plain grid is still inert.
+        assert_eq!(recorded_inert(Some(grid), false), Some(grid));
+        assert_eq!(recorded_inert(None::<InertRegion>, false), None);
+    }
+
+    #[test]
+    fn only_a_release_outside_the_window_is_swallowed() {
+        // A release outside the window leaves egui-winit with no pointer
+        // position, so the frame never reports it and only the host can end the
+        // press.
+        assert!(swallowed_release(true, false));
+        // A normal release inside has a live position: the frame handles it,
+        // and a second release would clear the press before the selection
+        // finalizes.
+        assert!(!swallowed_release(true, true));
+        // A press is never a swallowed release, wherever it happens.
+        assert!(!swallowed_release(false, false));
+        assert!(!swallowed_release(false, true));
+    }
+
+    #[test]
+    fn a_release_right_after_cursor_left_is_still_swallowed() {
+        // winit reports presence in event order; egui's latest position is one
+        // pass old. Leaving and releasing must be swallowed even if the last
+        // painted pass still saw the pointer inside.
+        let mut prev_inert = true;
+        let mut down = true;
+        let mut stale = false;
+        // Leave while the button is still held: the drag stays live.
+        leave_pointer_window(&mut down, &mut prev_inert, &mut stale, true);
+        assert!(!stale, "a held drag crossing the edge stays live");
+        assert!(!prev_inert, "the grid-entry memory is forgotten");
+        // Release outside, which egui-winit drops for want of a position.
+        let released = host_button_transition(&mut stale, &mut down, false, false);
+        assert!(swallowed_release(released, false));
+        assert!(stale, "the dropped release stays distrusted");
+        // Re-entering after the outside release must not revive a ghost button.
+        enter_pointer_window(&mut stale, false);
+        assert!(!pointer_down_latched(&mut stale, true, false, true));
+    }
+
+    #[test]
+    fn a_host_release_reaches_every_terminal_view() {
+        let mut tabs = vec![
+            TabEntry::Terminal(Box::new(Tab::pending(1, &Profile::default(), None))),
+            TabEntry::Settings,
+            TabEntry::Terminal(Box::new(Tab::pending(2, &Profile::default(), None))),
+        ];
+        let mut views = 0;
+        for view in terminal_views(&mut tabs) {
+            // Idempotent; a view without a press writes nothing.
+            view.host_release(MouseButton::Left);
+            views += 1;
+        }
+        assert_eq!(views, 2, "the settings tab has no terminal view");
+    }
+
+    #[test]
+    fn the_right_band_only_reserves_room_for_a_real_scrollbar() {
+        assert_eq!(scrollbar_hover_band(8.0, true), 8.0 + SCROLLBAR_HOVER_BAND);
+        assert_eq!(scrollbar_hover_band(8.0, false), 8.0);
+        // A negative padding cannot produce a negative band.
+        assert_eq!(scrollbar_hover_band(-4.0, true), SCROLLBAR_HOVER_BAND);
+        assert_eq!(scrollbar_hover_band(-4.0, false), 0.0);
+    }
+
+    #[test]
+    fn an_empty_history_keeps_the_scrollbar_strip_inert() {
+        let (rect, screen) = terminal_area();
+        let strip = pos2(985.0, 400.0);
+        // No scrollback: the bar does not exist, so the strip is padding and a
+        // move across it must not repaint.
+        let empty = inert_grid(rect, scrollbar_hover_band(8.0, false), screen);
+        assert!(empty.contains(strip));
+        assert!(!pointer_repaints(&PointerSample {
+            pos: Some(strip),
+            in_chrome: false,
+            ..grid_hover()
+        }));
+        // With scrollback the bar highlights on hover and must repaint.
+        let scrolled = inert_grid(rect, scrollbar_hover_band(8.0, true), screen);
+        assert!(!scrolled.contains(strip));
+        assert!(pointer_repaints(&PointerSample {
+            pos: Some(strip),
+            in_chrome: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn a_drag_ending_outside_the_window_does_not_latch_the_gate() {
+        let mut stale = false;
+        assert!(pointer_down_latched(&mut stale, true, false, true));
+        // egui keeps `any_down` set after `PointerGone`; without a position it
+        // is a stale latch, not a drag.
+        assert!(!pointer_down_latched(&mut stale, true, false, false));
+        assert!(!pointer_down_latched(&mut stale, false, false, true));
+        assert!(!pointer_down_latched(&mut stale, false, false, false));
+    }
+
+    #[test]
+    fn re_entering_after_a_press_released_outside_stays_skipped() {
+        let mut stale = false;
+        assert!(
+            pointer_down_latched(&mut stale, true, false, true),
+            "a real held button paints"
+        );
+        // `pointer_left_window` marks the stale latch; egui still reports the
+        // old button as down after re-entry.
+        stale = true;
+        assert!(!pointer_down_latched(&mut stale, true, false, true));
+        assert!(
+            !pointer_repaints(&PointerSample {
+                pointing: false,
+                ..grid_hover()
+            }),
+            "a re-entered move over the bare grid must not repaint"
+        );
+        // Only a fresh press with a live position clears the stale latch.
+        assert!(pointer_down_latched(&mut stale, false, true, true));
+        assert!(!stale);
+        // A press without a position cannot clear it.
+        stale = true;
+        assert!(!pointer_down_latched(&mut stale, false, true, false));
+        assert!(stale);
+    }
+
+    #[test]
+    fn leaving_the_window_clears_the_pointer_gate_memory() {
+        let (grid, screen) = terminal_area();
+        let inert = inert_grid(grid, 30.0, screen);
+        let pos = pos2(500.0, 400.0);
+        let mut down = true;
+        let mut prev_inert = true;
+
+        reset_pointer_memory(&mut down, &mut prev_inert);
+        assert!(!down, "a release outside the window must not stay latched");
+        assert!(!prev_inert, "the grid-entry memory must be forgotten");
+
+        // Re-entering directly onto the grid paints once to clear hover.
+        let inside = inert.contains(pos);
+        assert!(entered_inert(inside, &mut prev_inert));
+        assert!(!entered_inert(inside, &mut prev_inert));
+        // And the cleared latch no longer forces every move to paint.
+        assert!(!pointer_repaints(&PointerSample {
+            pos: Some(pos),
+            in_chrome: false,
+            on_scrollbar: false,
+            scrollbar_changed: false,
+            entered_grid: false,
+            motion_wanted: false,
+            ime_preedit: false,
+            ctrl: false,
+            overlay_open: false,
+            pointing: down,
+        }));
+    }
+
+    #[test]
+    fn a_drag_that_leaves_and_returns_still_paints() {
+        // Press on the grid, drag past the window edge, then come back with the
+        // button still held: no new press arrives, so the exit must not latch.
+        let mut down = false;
+        let mut prev_inert = true;
+        let mut stale = false;
+        assert!(!host_button_transition(&mut stale, &mut down, true, true));
+        leave_pointer_window(&mut down, &mut prev_inert, &mut stale, true);
+        assert!(!stale, "a held drag is not stale");
+        enter_pointer_window(&mut stale, true);
+        assert!(!stale);
+        // The next pass trusts egui's still-set `any_down` and keeps painting.
+        assert!(pointer_down_latched(&mut stale, true, false, true));
+        assert!(pointer_repaints(&PointerSample {
+            pointing: true,
+            ..grid_hover()
+        }));
+    }
+
+    #[test]
+    fn a_release_outside_then_re_entry_does_not_paint_forever() {
+        // Press, leave, release outside (dropped by egui-winit), re-enter.
+        let mut down = false;
+        let mut prev_inert = false;
+        let mut stale = false;
+        assert!(!host_button_transition(&mut stale, &mut down, true, true));
+        leave_pointer_window(&mut down, &mut prev_inert, &mut stale, true);
+        // The release is outside, so the host latches the stale state.
+        assert!(host_button_transition(&mut stale, &mut down, false, false));
+        enter_pointer_window(&mut stale, false);
+        assert!(stale);
+        // egui still claims the button is down; the gate must not trust it.
+        assert!(!pointer_down_latched(&mut stale, true, false, true));
+        assert!(!pointer_repaints(&grid_hover()));
+    }
+
+    #[test]
+    fn ctrl_hover_repaints_only_when_the_cell_or_ctrl_changes() {
+        let mut memory = None;
+        // A plain move with no Ctrl involvement never forces a paint, even when
+        // it crosses into another cell.
+        let mut plain = None;
+        assert!(!ctrl_hover_changed(&mut plain, Some((0, 0)), false));
+        assert!(!ctrl_hover_changed(&mut plain, Some((0, 1)), false));
+        // The first Ctrl move paints so the hand can appear.
+        assert!(ctrl_hover_changed(&mut memory, Some((1, 1)), true));
+        // Staying in the same cell changes no pixel.
+        assert!(!ctrl_hover_changed(&mut memory, Some((1, 1)), true));
+        // Crossing into another cell may cross a link.
+        assert!(ctrl_hover_changed(&mut memory, Some((1, 2)), true));
+        // Releasing Ctrl paints once to clear the hand.
+        assert!(ctrl_hover_changed(&mut memory, Some((1, 2)), false));
+        // Plain moves are never forced to paint.
+        assert!(!ctrl_hover_changed(&mut memory, Some((2, 2)), false));
+        assert!(!ctrl_hover_changed(&mut memory, Some((2, 2)), false));
+        // Pressing Ctrl again paints even on the unchanged cell.
+        assert!(ctrl_hover_changed(&mut memory, Some((2, 2)), true));
+        assert!(!ctrl_hover_changed(&mut memory, Some((2, 2)), true));
+        // A gutter move has no cell; the first sample still paints once.
+        assert!(ctrl_hover_changed(&mut memory, None, true));
+        assert!(!ctrl_hover_changed(&mut memory, None, true));
+    }
+
+    #[test]
+    fn a_ctrl_sweep_records_the_painted_cell() {
+        let geometry = GridGeometry {
+            rect: Rect::from_min_size(pos2(100.0, 50.0), vec2(160.0, 40.0)),
+            padding: 8.0,
+            metrics: CellMetrics {
+                width: 8.0,
+                height: 20.0,
+                ..CellMetrics::default()
+            },
+            cells: (20, 2),
+        };
+        // One cell is 8x20 points, starting one padding inside the rect.
+        assert_eq!(geometry.cell_at(pos2(108.0, 58.0)), Some((0, 0)));
+        assert_eq!(geometry.cell_at(pos2(116.0, 78.0)), Some((1, 1)));
+        // The padding gutter and everything outside map to no cell.
+        assert_eq!(geometry.cell_at(pos2(102.0, 60.0)), None);
+        assert_eq!(geometry.cell_at(pos2(300.0, 60.0)), None);
+        // Negative padding is clamped, so the cells start at the rect edge.
+        let unpadded = GridGeometry {
+            padding: -4.0,
+            ..geometry
+        };
+        assert_eq!(unpadded.cell_at(pos2(104.0, 54.0)), Some((0, 0)));
+    }
+
+    #[test]
+    fn motion_reports_do_not_count_as_user_action() {
+        // A motion-only frame writes only a hover report, so `input_sent` is
+        // false: no user action. A wheel notch or press sets it and counts.
+        assert!(!counts_as_user_action(false, false));
+        assert!(counts_as_user_action(true, false));
+        assert!(!counts_as_user_action(true, true));
+        assert!(!counts_as_user_action(false, true));
+    }
+
+    #[test]
+    fn unfocused_windows_do_not_record_a_motion_want() {
+        assert!(recorded_motion(true, true));
+        assert!(!recorded_motion(true, false));
+        assert!(!recorded_motion(false, true));
+        assert!(!recorded_motion(false, false));
+    }
+
+    #[test]
+    #[allow(deprecated)] // the `Disabled` variant is deprecated but still delivered
+    fn ime_preedit_tracks_composition_and_focus() {
+        let preedit = |text: &str| {
+            [Event::Ime(egui::ImeEvent::Preedit {
+                text: text.to_string(),
+                active_range_chars: None,
+            })]
+        };
+        assert!(ime_preedit_active(false, &preedit("ni"), true));
+        assert!(!ime_preedit_active(true, &preedit(""), true));
+        assert!(!ime_preedit_active(
+            true,
+            &[Event::Ime(egui::ImeEvent::Commit("你".to_string()))],
+            true
+        ));
+        assert!(!ime_preedit_active(
+            true,
+            &[Event::Ime(egui::ImeEvent::Disabled)],
+            true
+        ));
+        // Focus loss abandons the candidate window without a commit.
+        assert!(!ime_preedit_active(true, &[], false));
+        // Unrelated events leave the flag alone.
+        assert!(ime_preedit_active(
+            true,
+            &[Event::Text("x".to_string())],
+            true
+        ));
     }
 }
