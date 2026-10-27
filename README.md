@@ -186,11 +186,24 @@ deleted folder or an offline share falls back; a cold launch folder survives a p
 
 ### Explorer context menu
 
-The per-machine installer adds **Open with Illness** verbs for folder backgrounds, selected folders
-and drive roots (no file association) under `HKLM\Software\Classes`, so they work for every user
-without a first launch.
+There are two unrelated mechanisms, and the difference decides whether you see the entry without
+clicking anything.
 
-While those machine verbs are complete they are authoritative: a normal launch deletes the current
+**Registry verbs (legacy).** The per-machine installer writes **Open with Illness** verbs for folder
+backgrounds, selected folders and drive roots (no file association) under `HKLM\Software\Classes`,
+so they work for every user without a first launch. On Windows 11 these are the classic verbs, which
+Explorer files under *Show more options*.
+
+**Packaged entry (Windows 11 short menu).** The only way into the modern short menu is a sparse MSIX
+package (`Simulp.Illness`) that declares the context-menu verbs and a COM surrogate, backed by
+`illness_explorer_command_injector.dll` in the install directory. It ships inside the installer and
+is registered per user by the installer when the machine allows it: on Windows 11 (build 22000 or
+later) the installer tries the packed `.appx` first, and falls back to registering the loose manifest
+unpacked into `$INSTDIR\appx\manifest`. Packed registration needs a package whose signature Windows
+trusts; loose registration needs Windows Developer Mode. Neither is required for the app to work,
+and neither is fatal to the installer -- the registry verbs stay either way.
+
+While the machine verbs are complete they are authoritative: a normal launch deletes the current
 user's stale HKCU copy so an older portable install cannot shadow HKLM. If HKLM is missing, partial,
 or names a deleted executable, a launch from a stable installed location repairs the user's menu
 with a per-user HKCU copy. A normal launch only touches the menu when running from `%ProgramFiles%`,
@@ -208,19 +221,48 @@ mounted; its stale entry goes on that user's next launch once HKLM is complete.
 
 ### Windows installer
 
-Prefer not to build anything? The [Releases](../../releases) page carries both the standalone
-`illness.exe` and this installer. To build the installer yourself, use
-[cargo-packager](https://github.com/crabnebula-dev/cargo-packager) 0.11.8:
+**Run this:** `.\apps\illness\build-installer.ps1` -> `dist\illness_0.1.0_x64-setup.exe`, about 2-3
+minutes once the two prereqs are in place. Just want the binary? The
+[Releases](../../releases) page has the standalone `illness.exe` and this installer.
 
-```pwsh
-cargo install cargo-packager --version 0.11.8 --locked   # once
-.\apps\illness\build-installer.ps1                        # about 2 minutes
-```
+Five steps, roughly 4-5 minutes cold, 2-3 warm:
 
-The result is `dist\illness_0.1.0_x64-setup.exe`. It installs to `%ProgramFiles%\Illness` for all
-users (UAC prompt), creates an All Users Start Menu shortcut, and registers an uninstaller in
-Programs and Features. Settings stay per-user in `%APPDATA%\illness`; the uninstaller offers to
-remove them and keeps them by default.
+1. Install the packager once (about 1 min): `cargo install cargo-packager --version 0.11.8 --locked`
+2. Confirm the Windows SDK is installed, *Windows SDK for Desktop C++ x64 Apps* -- it supplies
+   `makeappx.exe`. No SDK and no `.appx` in `dist\`? Step 3 stops and names the missing component
+   (about 2 min to add via the Visual Studio installer).
+3. Build the installer (about 2-3 min): `.\apps\illness\build-installer.ps1`
+4. Run `dist\illness_0.1.0_x64-setup.exe` (UAC prompt, about 30 s).
+5. Verify: right-click any folder and look for **Open with Illness** in the short menu.
+
+Step 3 runs four phases, in this order:
+
+1. `packaging\msix\build.ps1` builds the COM server DLL.
+2. `makeappx pack` writes `dist\illness_explorer_command_injector.appx`.
+3. `cargo packager --release` builds the release app and renders the NSIS template.
+4. NSIS compiles the rendered script into the setup executable.
+
+**What you get:** per-machine install in `%ProgramFiles%\Illness`, an All Users Start Menu shortcut,
+a Programs and Features entry, and per-user settings in `%APPDATA%\illness`.
+
+**What lands in `appx\`:** `illness.exe` stays in the install root (the package resolves it as
+external content); the COM DLL and the `.appx` sit side by side in `appx\`; if signed registration
+fails, the installer unpacks the `.appx` into `$INSTDIR\appx\manifest` and registers it from there,
+because a registration pointing at `%TEMP%` dies with the folder.
+
+**If the entry is missing from the short menu**, in this order:
+
+1. Check *Show more options* -- the legacy registry verb is there and works.
+2. Restart Explorer once; a fresh package registration is not always picked up live.
+3. Confirm the package landed: `Get-AppxPackage -Name Simulp.Illness` should print `Status: Ok`.
+
+**Signing, short version:** an unsigned package is rejected (`0x800B0100`), so the installer falls back
+to loose registration, which needs Windows Developer Mode. Shipping the short-menu entry to other
+machines needs a code-signing certificate whose subject is `CN=Simulp`, or a Store listing that
+re-signs for you. Every switch and both trust errors are in `packaging/msix/README.md`.
+
+**Removing it:** the uninstaller unregisters the package, deletes the machine verbs and every loaded
+hive's copy, and removes the install directory. `%APPDATA%\illness` survives unless you tick the box.
 
 ### Uninstall
 
