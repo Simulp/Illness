@@ -27,7 +27,8 @@ Illness is a Windows-first terminal emulator: Alacritty's VT core plus an egui s
 - Terminal text is rendered by `GlyphAtlas` at physical pixels. Do not replace it with
   `Painter::text` for grid cells. Keep hinting on, subpixel binning off, nearest sampling.
 - Colors come from `Theme`/`Tokens`; do not hard-code UI hex values in widgets.
-- No `unsafe` outside `apps/illness/src/platform.rs`.
+- No `unsafe` outside `apps/illness/src/platform.rs` and
+  `crates/illness_explorer_command_injector/src/` (Win32 COM interop).
 - Keep `clipboard_shortcuts: false`: the terminal owns Ctrl+C/V; the app handles
   Ctrl+Shift+C/V itself.
 - Scrollback and cursor settings are captured in `SpawnSpec`; they apply to new tabs.

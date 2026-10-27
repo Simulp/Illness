@@ -20,11 +20,21 @@ formats = ["nsis"]
 
 # License and attribution files installed next to the executable. Apache-2.0,
 # MIT, MPL-2.0 and BSL-1.0 all require the text to travel with the binary.
+#
+# The two `appx/` entries are the sparse MSIX package that adds "Open with
+# Illness" to the Windows 11 Explorer context menu plus the COM server it
+# activates. Both live in an `appx` subfolder of the install directory: the
+# package is registered there with `-ExternalLocation`. cargo-packager turns a
+# nested target into a `CreateDirectory` for `appx` plus a `File /oname=...`
+# copy, so no extra installer step is needed. `packaging/msix/build.ps1` builds
+# both before the installer is packaged.
 resources = [
   { src = "../../LICENSE-APACHE", target = "LICENSE-APACHE" },
   { src = "../../LICENSE-MIT", target = "LICENSE-MIT" },
   { src = "../../NOTICE", target = "NOTICE" },
   { src = "../../THIRD-PARTY-LICENSES.md", target = "THIRD-PARTY-LICENSES.md" },
+  { src = "../../target/release/illness_explorer_command_injector.dll", target = "appx\\illness_explorer_command_injector.dll" },
+  { src = "../../dist/illness_explorer_command_injector.appx", target = "appx\\illness_explorer_command_injector.appx" },
 ]
 
 # cargo builds into the workspace target directory; installers go to dist/.

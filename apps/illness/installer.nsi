@@ -422,6 +422,56 @@ FunctionEnd
   illness_users_${SUFFIX}_done:
 !macroend
 
+; Sparse MSIX package registration. The packaged COM server adds "Open with
+; Illness" to the Windows 11 modern Explorer context menu; the registry verbs
+; above stay in place whatever happens here, so a machine where the package
+; cannot install (no sideloading, no Windows 11, older build) keeps a working
+; classic menu. Registration is attempted for the installing user, which is the
+; account Explorer runs as for an interactive install.
+;
+; Nothing in here may fail the installer: every path only logs and returns.
+; Add-AppxPackage -Path is tried first. If the package cannot be installed that
+; way (for example an unsigned development build), the manifest and logos are
+; unpacked from the same .appx into $INSTDIR\appx\manifest and registered
+; loosely with -Register, which is what `packaging/msix/build.ps1 -Install` does
+; by hand. The stage must live under $INSTDIR, not %TEMP%: the package's install
+; location is the manifest's folder, so a temp stage would break the COM server
+; and the context menu as soon as temp is cleaned. The stage is wiped before
+; every unpack so an upgrade can never re-register a stale manifest.
+Function RegisterExplorerPackage
+  ReadRegStr $R0 HKLM "SOFTWARE\Microsoft\Windows NT\CurrentVersion" "CurrentBuildNumber"
+  ${If} $R0 == ""
+    DetailPrint "Open with Illness package: Windows build unknown; keeping registry verbs only."
+    Return
+  ${EndIf}
+  ${If} $R0 < 22000
+    DetailPrint "Open with Illness package: needs Windows 11; keeping registry verbs only."
+    Return
+  ${EndIf}
+  ${IfNot} ${FileExists} "$INSTDIR\appx\illness_explorer_command_injector.appx"
+    DetailPrint "Open with Illness package: appx not shipped; keeping registry verbs only."
+    Return
+  ${EndIf}
+
+  DetailPrint "Registering the Open with Illness Explorer package..."
+  ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference=$\'Stop$\'; $$appx=$\'$INSTDIR\appx\illness_explorer_command_injector.appx$\'; $$ext=$\'$INSTDIR\appx$\'; $$stage=$\'$INSTDIR\appx\manifest$\'; try { Add-AppxPackage -Path $$appx -ExternalLocation $$ext -ErrorAction Stop; exit 0 } catch { try { if (Test-Path -LiteralPath $$stage) { Remove-Item -LiteralPath $$stage -Recurse -Force -ErrorAction Stop }; New-Item -ItemType Directory -Force -Path $$stage | Out-Null; Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory($$appx,$$stage); Add-AppxPackage -Register (Join-Path $$stage $\'AppxManifest.xml$\') -ExternalLocation $$ext -ErrorAction Stop; exit 0 } catch { exit 1 } }"' $R0
+  ${If} $R0 == 0
+    DetailPrint "Open with Illness package registered."
+  ${Else}
+    DetailPrint "Open with Illness package not registered (code $R0); registry verbs remain active."
+  ${EndIf}
+FunctionEnd
+
+; Remove the package before $INSTDIR (and the COM server inside it) disappears.
+; Tolerant: a machine that never registered it, or removed it by hand, is fine.
+Function un.RemoveExplorerPackage
+  DetailPrint "Removing the Open with Illness Explorer package (if registered)..."
+  ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$$ErrorActionPreference=$\'SilentlyContinue$\'; Get-AppxPackage -Name Simulp.Illness | Remove-AppxPackage -ErrorAction SilentlyContinue"' $R0
+  ${If} $R0 != 0
+    DetailPrint "Open with Illness package removal returned $R0; continuing."
+  ${EndIf}
+FunctionEnd
+
 Var PassiveMode
 Function .onInit
   ${GetOptions} $CMDLINE "/P" $PassiveMode
@@ -556,6 +606,10 @@ Section Install
     ${EndIf}
   !endif
 
+  ; Sparse MSIX package for the Windows 11 modern Explorer menu. Attempted on
+  ; top of the registry verbs; never fatal, so the classic menu stays either way.
+  Call RegisterExplorerPackage
+
   ; Create file associations
   {{#each file_associations as |association| ~}}
     {{#each association.extensions as |ext| ~}}
@@ -665,6 +719,7 @@ Section Uninstall
 
   ; Clean up per-user Explorer integration before $INSTDIR disappears.
   Call un.RemoveExplorerVerbs
+  Call un.RemoveExplorerPackage
 
   ; Delete the app directory and its content from disk
   ; Copy main executable
@@ -701,6 +756,11 @@ Section Uninstall
   {{#each resources_dirs}}
   RMDir /REBOOTOK "$INSTDIR\\{{this}}"
   {{/each}}
+
+  ; The loose registration staged AppxManifest.xml and logos inside $INSTDIR.
+  ; Remove-AppxPackage has already run above, so the stage is dead weight now.
+  RMDir /r /REBOOTOK "$INSTDIR\appx\manifest"
+
   RMDir "$INSTDIR"
 
   ; Remove start menu shortcut

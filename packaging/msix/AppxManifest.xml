@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Sparse MSIX package for Illness.
+
+  It packages no binaries of its own: uap10:AllowExternalContent lets the
+  package point at the normal install directory, so the Explorer command
+  injector and illness.exe stay where the installer put them. Build it with
+  build.ps1 and register it with `Add-AppxPackage -ExternalLocation`.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:desktop10="http://schemas.microsoft.com/appx/manifest/desktop/windows10/10"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  IgnorableNamespaces="uap uap10 rescap desktop4 desktop5 desktop6 desktop10 com">
+  <Identity
+    Name="Simulp.Illness"
+    Publisher="CN=Simulp"
+    Version="0.1.0.0" />
+  <Properties>
+    <DisplayName>Illness</DisplayName>
+    <PublisherDisplayName>Simulp</PublisherDisplayName>
+    <Logo>resources\logo_150x150.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+    <desktop6:RegistryWriteVirtualization>disabled</desktop6:RegistryWriteVirtualization>
+    <desktop6:FileSystemWriteVirtualization>disabled</desktop6:FileSystemWriteVirtualization>
+  </Properties>
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19000.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+    <rescap:Capability Name="unvirtualizedResources" />
+  </Capabilities>
+  <Applications>
+    <Application Id="Illness"
+      Executable="illness.exe"
+      uap10:TrustLevel="mediumIL"
+      uap10:RuntimeBehavior="win32App">
+      <uap:VisualElements
+        AppListEntry="none"
+        DisplayName="Illness"
+        Description="Illness explorer command injector"
+        BackgroundColor="transparent"
+        Square150x150Logo="resources\logo_150x150.png"
+        Square44x44Logo="resources\logo_70x70.png">
+      </uap:VisualElements>
+      <Extensions>
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="OpenWithIllness" Clsid="8c4f2b16-7d3a-4e58-9b71-2f6c9d0a5e43" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory\Background">
+              <desktop5:Verb Id="OpenWithIllness" Clsid="8c4f2b16-7d3a-4e58-9b71-2f6c9d0a5e43" />
+            </desktop5:ItemType>
+            <!-- desktop5:ItemType rejects Type="Drive"; desktop10 is the schema
+                 that permits it, so drives use the newer element. -->
+            <desktop10:ItemType Type="Drive">
+              <desktop10:Verb Id="OpenWithIllness" Clsid="8c4f2b16-7d3a-4e58-9b71-2f6c9d0a5e43" />
+            </desktop10:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="Illness">
+              <com:Class Id="8c4f2b16-7d3a-4e58-9b71-2f6c9d0a5e43" Path="illness_explorer_command_injector.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

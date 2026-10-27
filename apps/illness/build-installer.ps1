@@ -39,6 +39,38 @@ if ($env:RUSTFLAGS) {
     throw 'RUSTFLAGS is set; unset it so the path remap is the only flag set.'
 }
 
+# The sparse MSIX package that adds "Open with Illness" to the Windows 11
+# Explorer context menu rides along in <install dir>\appx, together with the COM
+# server DLL. Build both before packaging; Packager.toml copies them from
+# dist\ and target\release. The package needs makeappx.exe from the Windows
+# SDK, which not every build machine has: without it a previously built .appx
+# is reused and the installer simply keeps the classic registry verbs.
+$msixBuild = Join-Path $repoRoot 'packaging\msix\build.ps1'
+$appxPath = Join-Path $repoRoot 'dist\illness_explorer_command_injector.appx'
+$sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+$hasMakeAppx = (Test-Path -LiteralPath $sdkBin) -and [bool](
+    Get-ChildItem -LiteralPath $sdkBin -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'x64\makeappx.exe') }
+)
+if ($hasMakeAppx) {
+    # The MSIX build compiles the injector, so it inherits the remapped flags.
+    $shell = if (Get-Command pwsh -ErrorAction SilentlyContinue) { 'pwsh' } else { 'powershell' }
+    & $shell -NoProfile -File $msixBuild
+    if ($LASTEXITCODE -ne 0) {
+        throw "packaging/msix/build.ps1 failed with exit code $LASTEXITCODE; cannot package the Explorer context menu."
+    }
+}
+else {
+    Write-Warning "Windows SDK (makeappx.exe) not found; skipping packaging/msix/build.ps1. Reusing any existing .appx."
+}
+if (-not (Test-Path -LiteralPath $appxPath)) {
+    throw @"
+Missing Explorer context menu package: $appxPath
+Install the Windows 10/11 SDK (makeappx.exe) so packaging/msix/build.ps1 can create it, or build it first:
+  packaging/msix/build.ps1
+"@
+}
+
 # Run from this directory so cargo-packager discovers only this Packager.toml.
 Push-Location $PSScriptRoot
 try {

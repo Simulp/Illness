@@ -33,6 +33,8 @@ swash = "0.2.10"
 fontdb = { version = "0.24", default-features = false, features = ["std", "fs"] }
 window-vibrancy = "0.8.1"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_System_Diagnostics_Debug", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Kernel", "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_SystemInformation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_UI_Controls", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_Registry", "Wdk_System_Threading"] }
+windows = { version = "0.62", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_SystemServices", "Win32_UI_Shell", "Win32_Globalization"] }
+windows-core = "0.62"
 raw-window-handle = "0.6"
 rfd = { version = "0.17", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "ico", "jpeg", "bmp"] }
