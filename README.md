@@ -90,7 +90,8 @@ And yes, it's personal.
 ## Take one now
 
 Two ways in: grab a pre-built `illness.exe` or the installer from
-**[Releases](../../releases)** (no toolchain needed), or build from source below.
+**[Releases](https://github.com/Simulp/Illness/releases)** (no toolchain needed), or build from
+source below.
 
 From source. About 3 minutes the first time, almost all of it the initial build:
 
@@ -221,9 +222,11 @@ mounted; its stale entry goes on that user's next launch once HKLM is complete.
 
 ### Windows installer
 
-**Run this:** `.\apps\illness\build-installer.ps1` -> `dist\illness_0.1.0_x64-setup.exe`, about 2-3
-minutes once the two prereqs are in place. Just want the binary? The
-[Releases](../../releases) page has the standalone `illness.exe` and this installer.
+**Don't want to build?** Download the installer (or the standalone `illness.exe`) from
+**[Releases](https://github.com/Simulp/Illness/releases)** -- no toolchain, no SDK, no packager.
+
+**Or build it:** `.\apps\illness\build-installer.ps1` -> `dist\illness_0.1.0_x64-setup.exe`, about
+2-3 minutes once the two prereqs are in place.
 
 Five steps, roughly 4-5 minutes cold, 2-3 warm:
 
