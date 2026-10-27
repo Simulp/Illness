@@ -144,8 +144,8 @@ impl Tokens {
             caption_w: 48.0,
 
             font_small: 12.0,
-            font_body: 13.5,
-            font_title: 15.0,
+            font_body: 14.0,
+            font_title: 16.0,
             font_header: 22.0,
 
             bg,
@@ -239,6 +239,50 @@ fn style_widget(widget: &mut egui::style::WidgetVisuals, fill: Color32, tokens: 
     widget.fg_stroke = Stroke::new(1.0, tokens.text);
     widget.corner_radius = CornerRadius::same(tokens.radius_md as u8);
     widget.expansion = 0.0;
+}
+
+/// Track colour for a themed slider: a mid-tone between the sunken surface and
+/// the text colour, so the rail stays visible on dark and light cards without
+/// competing with the accent fill.
+pub fn slider_rail(tokens: &Tokens) -> Color32 {
+    mix(tokens.bg_sunken, tokens.text, 0.28)
+}
+
+/// Scoped style for an [`egui::Slider`]: a visible rail, an accent fill from the
+/// start of the range to the handle, and a handle that reads against the rail at
+/// rest, while hovered and while dragged.
+///
+/// Disabled sliders inherit the same style; egui mutes them with the UI's
+/// disabled alpha, so the rail stays discernible but dimmed.
+pub fn slider_style(tokens: &Tokens) -> egui::style::StyleModifier {
+    let tokens = *tokens;
+    egui::style::StyleModifier::new(move |style| {
+        let rail = slider_rail(&tokens);
+        let visuals = &mut style.visuals;
+
+        // Draw the filled portion from the start of the range to the handle.
+        visuals.slider_trailing_fill = true;
+        visuals.selection.bg_fill = tokens.accent;
+
+        // At rest the rail and the handle share `bg_fill` (egui paints the rail
+        // from `widgets.inactive` and the handle from the same state), so the
+        // handle is separated by a bright ring instead of a separate fill.
+        visuals.widgets.inactive.bg_fill = rail;
+        visuals.widgets.inactive.fg_stroke = Stroke::new(1.5, tokens.text);
+
+        // Hovered and dragged: the handle turns accent with a contrasting ring
+        // and grows slightly, so it still reads on top of the accent fill.
+        visuals.widgets.hovered.bg_fill = tokens.accent;
+        visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, tokens.bg);
+        visuals.widgets.hovered.expansion = 1.0;
+
+        visuals.widgets.active.bg_fill = tokens.accent;
+        visuals.widgets.active.fg_stroke = Stroke::new(2.0, tokens.bg);
+        visuals.widgets.active.expansion = 2.0;
+
+        visuals.widgets.open.bg_fill = tokens.accent;
+        visuals.widgets.open.fg_stroke = Stroke::new(1.5, tokens.bg);
+    })
 }
 
 pub fn install(ctx: &egui::Context, theme: &Theme, material: Material) {
@@ -356,6 +400,41 @@ mod tests {
         let tokens = Tokens::from_theme(Theme::by_name("nord"));
         assert_eq!(tokens.accent, Color32::from_rgb(0x88, 0xC0, 0xD0));
         assert_eq!(tokens.danger, Color32::from_rgb(0xE5, 0x53, 0x4B));
+    }
+
+    #[test]
+    fn test_slider_rail_reads_against_cards() {
+        for name in ["illness-dark", "light", "nord"] {
+            let tokens = Tokens::from_theme(Theme::by_name(name));
+            let rail = slider_rail(&tokens);
+            let rail_contrast = contrast_ratio(rail, tokens.bg_elev);
+            assert!(
+                rail_contrast >= 1.4,
+                "{name} rail {rail:?} on card: {rail_contrast}"
+            );
+            let handle_contrast = contrast_ratio(tokens.text, rail);
+            assert!(
+                handle_contrast >= 3.0,
+                "{name} handle ring on rail: {handle_contrast}"
+            );
+            let fill_contrast = contrast_ratio(tokens.accent, rail);
+            assert!(
+                fill_contrast >= 1.4,
+                "{name} accent fill {fill_contrast} on rail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_slider_style_sets_rail_fill_and_trailing_fill() {
+        let tokens = Tokens::from_theme(Theme::by_name("illness-dark"));
+        let mut style = egui::Style::default();
+        slider_style(&tokens).apply(&mut style);
+        assert!(style.visuals.slider_trailing_fill);
+        assert_eq!(style.visuals.widgets.inactive.bg_fill, slider_rail(&tokens));
+        assert_eq!(style.visuals.selection.bg_fill, tokens.accent);
+        assert_eq!(style.visuals.widgets.hovered.bg_fill, tokens.accent);
+        assert_eq!(style.visuals.widgets.active.bg_fill, tokens.accent);
     }
 
     #[test]

@@ -26,7 +26,8 @@ use winit::window::Window;
 
 use crate::{backdrop, platform};
 
-const DEFAULT_FONT_SIZE: f32 = 18.0;
+/// Keep in sync with `Config::default().font_size`; Ctrl+0 resets zoom to this.
+const DEFAULT_FONT_SIZE: f32 = 13.0;
 const INITIAL_COLS: usize = 120;
 const INITIAL_ROWS: usize = 30;
 const BELL_FLASH_SECS: f64 = 0.18;

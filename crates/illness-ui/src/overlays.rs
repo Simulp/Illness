@@ -896,7 +896,7 @@ fn menu_row(
         Pos2::new(rect.left() + 46.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(13.5),
+        FontId::proportional(tokens.font_body),
         tokens.text,
     );
 
@@ -1253,6 +1253,7 @@ fn appearance_section(
         Some("0% paints solid theme background; 100% keeps material strength"),
         |ui| {
             ui.add_enabled_ui(opacity_enabled, |ui| {
+                design::slider_style(tokens).apply(ui.style_mut());
                 ui.spacing_mut().slider_width = 150.0;
                 let mut opacity = config.background_opacity;
                 let response = ui.add(
